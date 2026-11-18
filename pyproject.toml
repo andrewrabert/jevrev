@@ -1,0 +1,31 @@
+[project]
+name = "jev-code-review"
+version = "0.1.0"
+description = "Run jev over a pull request or a local git dir, judge its findings, and post the confirmed ones as a review"
+requires-python = ">=3.14"
+dependencies = [
+  "annotated-types>=0.8,<0.9",
+  "bashkit>=0.21,<0.22",
+  "minijinja>=3.1,<4",
+  "pathspec>=1.1.1,<2",
+  "pydantic>=2.14.3,<3",
+  "pydantic-settings>=2.16.3,<3",
+  "pyyaml>=6.0.3,<7",
+  "tree-sitter>=0.26.1,<0.27",
+  "tree-sitter-bash>=0.25.1,<0.26",
+  "tree-sitter-python>=0.25,<0.26",
+  "tree-sitter-rust>=0.24.2,<0.25",
+  "typesafe-sdk>=0.7.5,<0.8",
+  "unidiff>=1.0.1,<2",
+  "yarl>=1.25.1,<2",
+]
+
+[project.scripts]
+jev-code-review = "jev_pr_review.review:cli"
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["github", "jev_pr_review", "jev_rules"]
