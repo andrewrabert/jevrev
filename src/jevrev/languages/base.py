@@ -44,10 +44,10 @@ class Unit:
     mergeable: bool = False
 
 
-def tile(units: typing.Iterable[Unit], line_count: int) -> list[LineRange]:
-    """The ranges of a text of line_count lines: each run of units, adjacent mergeable units
-    at most one line apart joined, and each run of lines between them, so the ranges cover
-    every line once."""
+def tile(units: typing.Iterable[Unit], lines: list[str]) -> list[LineRange]:
+    """The ranges of a text of lines: each run of units, adjacent mergeable units with at most
+    one blank line between joined, and each run of lines between them, so the ranges cover every
+    line once."""
     joined: list[Unit] = []
     for unit in sorted(units, key=lambda u: u.first):
         previous = joined[-1] if joined else None
@@ -56,6 +56,9 @@ def tile(units: typing.Iterable[Unit], line_count: int) -> list[LineRange]:
             and previous.mergeable
             and unit.mergeable
             and unit.first - previous.last <= 2
+            and not any(
+                line.strip() for line in lines[previous.last + 1 : unit.first]
+            )
         ):
             joined[-1] = Unit(previous.first, unit.last, mergeable=True)
         else:
@@ -67,8 +70,8 @@ def tile(units: typing.Iterable[Unit], line_count: int) -> list[LineRange]:
             ranges.append(LineRange(start=line + 1, end=unit.first))
         ranges.append(LineRange(start=unit.first + 1, end=unit.last + 1))
         line = unit.last + 1
-    if line < line_count:
-        ranges.append(LineRange(start=line + 1, end=line_count))
+    if line < len(lines):
+        ranges.append(LineRange(start=line + 1, end=len(lines)))
     return ranges
 
 
@@ -103,4 +106,4 @@ class Language:
     def states(cls, text: str) -> list[LineRange]:
         """The line ranges of text, which cover every line once, in order; ParseError when text
         is not valid in the language."""
-        return tile([], len(text.splitlines()))
+        return tile([], text.splitlines())

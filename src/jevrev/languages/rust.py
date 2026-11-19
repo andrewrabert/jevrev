@@ -87,4 +87,4 @@ class Rust(base.Language):
         root = _PARSER.parse(text.encode(errors="surrogateescape")).root_node
         if root.has_error:
             raise base.ParseError("not valid Rust")
-        return base.tile(_units(root.named_children), len(text.splitlines()))
+        return base.tile(_units(root.named_children), text.splitlines())
