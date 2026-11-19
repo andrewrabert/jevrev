@@ -240,7 +240,7 @@ async def _cmd_scan(args):
 
 
 async def _cmd_scan_git(args):
-    """Review DIR at --git-rev or --git-diff, resolved to object ids before jev runs. Never
+    """Review DIR at --rev or --diff, resolved to object ids before jev runs. Never
     writes to DIR, its repository or its HEAD."""
     metadata = _scan_metadata(args)
     root = _local_dir(args.dir)
@@ -248,12 +248,12 @@ async def _cmd_scan_git(args):
         raise UserError(f"{root} is not in a git repository")
     diff = None
     untracked: list[str] = []
-    if args.git_rev is not None:
-        selection = await jevrev.git.git.resolve_rev(root, args.git_rev)
+    if args.rev is not None:
+        selection = await jevrev.git.git.resolve_rev(root, args.rev)
         files = jevrev.git.CommitFiles(root, selection.commit)
         commit = selection.commit
     else:
-        selection = await jevrev.git.git.resolve_diff(root, args.git_diff)
+        selection = await jevrev.git.git.resolve_diff(root, args.diff)
         match selection:
             case jevrev.git.GitDiff(base=base, head=head):
                 files = jevrev.git.CommitFiles(root, head)
@@ -306,35 +306,33 @@ async def _github_selection(
     | jevrev.git.GitDiff
     | jevrev.github.pull_request.GithubPullRequest
 ):
-    if args.github_pr is not None:
-        pull_request = await client.pull_request(repo, args.github_pr)
+    if args.pr is not None:
+        pull_request = await client.pull_request(repo, args.pr)
         return jevrev.github.pull_request.GithubPullRequest(
             base=await client.merge_base(
                 repo, pull_request.target, pull_request.head
             ),
             head=pull_request.head,
-            number=args.github_pr,
+            number=args.pr,
         )
-    if args.git_diff is not None:
-        spec: jevrev.git.GitDiffSpec = args.git_diff
+    if args.diff is not None:
+        spec: jevrev.git.GitDiffSpec = args.diff
         base = await client.commit(repo, spec.base)
         head = await client.commit(repo, spec.head)
         if spec.merge_base:
             base = await client.merge_base(repo, base, head)
         return jevrev.git.GitDiff(base=base, head=head)
-    if args.git_rev is not None:
-        return jevrev.git.GitRev(
-            commit=await client.commit(repo, args.git_rev)
-        )
+    if args.rev is not None:
+        return jevrev.git.GitRev(commit=await client.commit(repo, args.rev))
     return jevrev.git.GitRev(commit=await client.default_branch_head(repo))
 
 
 async def _cmd_scan_github(args):
     """Review a GitHub repo through the GitHub API on the host GH_HOST names."""
     metadata = _scan_metadata(args)
-    if args.git_diff is not None and args.git_diff.head is None:
+    if args.diff is not None and args.diff.head is None:
         raise UserError(
-            "--git-diff: give A..B or A...B; a GitHub repo has no files on disk"
+            "--diff: give A..B or A...B; a GitHub repo has no files on disk"
         )
     repo: jevrev.github.repo.GithubRepo = args.github
     async with await _github_client(repo.host) as client:
@@ -896,13 +894,13 @@ def _parser():
     git_group = scan_git_parser.add_argument_group("git")
     selection = git_group.add_mutually_exclusive_group(required=True)
     selection.add_argument(
-        "--git-rev",
+        "--rev",
         type=_git_revision,
         metavar="REV",
         help="Scan the files at REV",
     )
     selection.add_argument(
-        "--git-diff",
+        "--diff",
         type=_git_diff_spec,
         metavar="DIFF",
         help="Scan a diff, in git diff's syntax: REV, the changes from REV "
@@ -928,20 +926,20 @@ def _parser():
     github_group = scan_github_parser.add_argument_group("github")
     github_selection = github_group.add_mutually_exclusive_group()
     github_selection.add_argument(
-        "--git-rev",
+        "--rev",
         type=_git_revision,
         metavar="REV",
         help="Scan the files at REV [default: the head of the default branch]",
     )
     github_selection.add_argument(
-        "--git-diff",
+        "--diff",
         type=_git_diff_spec,
         metavar="A..B",
         help="Scan a diff, in git diff's syntax: A..B, the changes from A to "
         "B; A...B, from merge-base(A, B) to B; an empty side is HEAD",
     )
     github_selection.add_argument(
-        "--github-pr",
+        "--pr",
         type=_positive_int,
         metavar="N",
         help="Scan pull request N's changes",

@@ -38,8 +38,8 @@ PATH                      File or directory to scan, symlinks followed; findings
 ## `jevrev scan-git`
 ```
 DIR                       Directory in a git repository to scan; findings are relative to it
---git-rev <REV>           Scan the files at REV; conflicts with --git-diff; one of the two is required
---git-diff <DIFF>         Scan a diff, in git diff's syntax: REV, the changes from REV to the files on disk; A..B, from A to B; A...B, from merge-base(A, B) to B; an empty side of A..B or A...B is HEAD
+--rev <REV>               Scan the files at REV; conflicts with --diff; one of the two is required
+--diff <DIFF>             Scan a diff, in git diff's syntax: REV, the changes from REV to the files on disk; A..B, from A to B; A...B, from merge-base(A, B) to B; an empty side of A..B or A...B is HEAD
 --rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
@@ -53,9 +53,9 @@ DIR                       Directory in a git repository to scan; findings are re
 ## `jevrev scan-github`
 ```
 ORG/NAME                  GitHub repo to scan; findings are relative to its top
---git-rev <REV>           Scan the files at REV [default: the head of the default branch]; conflicts with --git-diff and --github-pr
---git-diff <A..B>         Scan a diff, in git diff's syntax: A..B, the changes from A to B; A...B, from merge-base(A, B) to B; an empty side is HEAD; conflicts with --git-rev and --github-pr
---github-pr <N>           Scan pull request N's changes; conflicts with --git-rev and --git-diff
+--rev <REV>               Scan the files at REV [default: the head of the default branch]; conflicts with --diff and --pr
+--diff <A..B>             Scan a diff, in git diff's syntax: A..B, the changes from A to B; A...B, from merge-base(A, B) to B; an empty side is HEAD; conflicts with --rev and --pr
+--pr <N>                  Scan pull request N's changes; conflicts with --rev and --diff
 --rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
