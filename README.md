@@ -2,7 +2,9 @@
 
 A CLI that runs jev over a local file or directory, a local git directory or a GitHub repo and prints its findings, records a verdict on each finding, and prints the review or posts it on the pull request.
 
-Give the directories of rule sets to review against with `--rules`, repeated for each, and `JEV_RULES`, separated by `:`; both are used. [example_rules](example_rules) holds examples.
+Give the directories of rule sets to review against with `--rules`, repeated for each, or `JEV_RULES`, separated by `:`; `--rules` replaces `JEV_RULES`. [example_rules](example_rules) holds examples.
+
+Jev is reached through the TypeSafe API with the key in `--api-key` or `TYPESAFE_API_KEY`; `--base-url`, `--model` and `--timeout` (or `TYPESAFE_BASE_URL`, `TYPESAFE_DEFAULT_MODEL` and `TYPESAFE_TIMEOUT`) override the API's URL, the model and the seconds each connection and read may take. `TYPESAFE_ENV_FILE` names a dotenv file of these variables, read before the environment's own, which win.
 
 A scan prints its findings as a linter does, in color when stdout is a terminal, and exits 0 with no findings, 1 with findings (0 given `--exit-zero`), and 2 on any error:
 
