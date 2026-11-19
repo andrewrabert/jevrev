@@ -7,6 +7,7 @@ import asyncio
 import collections.abc
 import contextlib
 import enum
+import json
 import os
 import pathlib
 import sys
@@ -116,16 +117,8 @@ def _scan_metadata(args) -> dict[str, str]:
     if file is None and args.metadata:
         raise UserError("--metadata: give --review to store it in")
     _rules(args)
-    if any(key == "" for key, _ in args.metadata):
-        raise UserError("--metadata: a key is empty")
-    metadata = dict(args.metadata)
-    if len(metadata) != len(args.metadata):
-        keys = [key for key, _ in args.metadata]
-        raise UserError(
-            "--metadata: keys given more than once: "
-            + ", ".join(sorted({k for k in keys if keys.count(k) > 1}))
-        )
-    return metadata
+    # A later KEY wins; sorted by key, as the Rust version stores it.
+    return dict(sorted(dict(args.metadata).items()))
 
 
 def _local_dir(path: pathlib.Path) -> pathlib.Path:
@@ -730,6 +723,15 @@ def _pr_review(
     )
 
 
+def _metadata(value: str) -> tuple[str, str]:
+    key, sep, rest = value.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(
+            f"{json.dumps(value)} is not KEY=VALUE with a KEY"
+        )
+    return key, rest
+
+
 def _positive_int(value):
     number = int(value)
     if number <= 0:
@@ -816,12 +818,13 @@ def _add_scan_arguments(parser):
     )
     parser.add_argument(
         "--metadata",
-        nargs=2,
+        type=_metadata,
         action="append",
         default=[],
-        metavar=("KEY", "VALUE"),
+        metavar="KEY=VALUE",
         help="Metadata stored with the review and printed by show; repeat "
-        "for more keys; requires --review",
+        "for more keys, a later KEY winning; KEY is not empty; requires "
+        "--review",
     )
     parser.add_argument(
         "--exit-zero",
