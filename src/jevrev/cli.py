@@ -902,6 +902,61 @@ def _add_scan_arguments(parser):
     )
 
 
+_REVIEW_FLOW = """\
+review flow:
+  1. jevrev --review FILE scan|scan-git|scan-github ...
+     Scan, and save the findings to FILE, a new review file.
+  2. jevrev --review FILE pending
+     Print the findings without a verdict.
+  3. jevrev --review FILE confirm|reject INDEX REASON
+     Record one finding's verdict; repeat until pending prints nothing.
+  4. jevrev --review FILE show [--format json|md]
+     Print the review; or, for a scan-github --pr review:
+     jevrev --review FILE submit-github
+     Post the confirmed findings on the pull request.
+
+Run `jevrev COMMAND --help` for each command's options."""
+
+_SCAN_NOTES = (
+    "TYPESAFE_ENV_FILE may name a dotenv file of the TYPESAFE_ variables; "
+    "the environment's own values win. A scan fails once it has run "
+    f"{_JEV_SCAN_TIMEOUT // 60} minutes."
+)
+
+_GITHUB_SCAN_NOTES = (
+    f"{_SCAN_NOTES} The GitHub token is GH_TOKEN or GITHUB_TOKEN for "
+    "github.com, GH_ENTERPRISE_TOKEN or GITHUB_ENTERPRISE_TOKEN for another "
+    "host, or else `gh auth token`'s."
+)
+
+_PENDING_FIELDS = """\
+fields of each line:
+  index        the finding's INDEX for confirm and reject, from 1
+  file         the finding's file, relative to the scanned source
+  start, end   the finding's first and last lines
+  item         the definition, run of code, hunk or file the lines are in
+  rule         the rule's id: its rule set's file name and its position in
+               it, from 1, such as text.yaml#1
+  probability  how likely jev judges the rule broken, 0 to 1
+  flags        what the rule flags, as its rule set states it
+  violation    the rule's examples of what breaks it
+  accepted     the rule's examples of what keeps it
+  evaluated    what jev was given of a change: "hunk", one changed hunk, or
+               "file", all of a file's changed hunks; absent outside a change"""
+
+_JUDGE_NOTES = """\
+A finding's verdict cannot be changed. A command holds the review file's lock
+while it runs, and any other command on the file fails at once, so run confirm
+and reject one at a time."""
+
+_SUBMIT_NOTES = """\
+Findings in files the pull request changes become comments on their lines;
+the others are listed in the review's body. The review requests changes,
+except on a pull request by the token's own user, where it is a comment. With
+no confirmed findings, it posts nothing. It fails when the review is not of a
+pull request, such as one of a --rev or --diff scan."""
+
+
 def _add_judge_arguments(parser, reason_help):
     parser.add_argument(
         "index",
@@ -919,6 +974,8 @@ def _parser():
         "print its findings, confirm or reject each of them, and print the "
         "review or post it on the pull request. Exits 0 with no findings, 1 "
         "with findings, and 2 on any error.",
+        epilog=_REVIEW_FLOW,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     review_group = parser.add_argument_group("review")
     review_group.add_argument(
@@ -942,7 +999,10 @@ def _parser():
         "them to a new review file given --review"
     )
     scan_parser = subparsers.add_parser(
-        "scan", help=description, description=description
+        "scan",
+        help=description,
+        description=description,
+        epilog=_SCAN_NOTES,
     )
     scan_parser.add_argument(
         "path",
@@ -959,7 +1019,10 @@ def _parser():
         "its findings and summary, and save them to a new review file given --review"
     )
     scan_git_parser = subparsers.add_parser(
-        "scan-git", help=description, description=description
+        "scan-git",
+        help=description,
+        description=description,
+        epilog=_SCAN_NOTES,
     )
     scan_git_parser.add_argument(
         "dir",
@@ -992,7 +1055,10 @@ def _parser():
         "summary, and save them to a new review file given --review"
     )
     scan_github_parser = subparsers.add_parser(
-        "scan-github", help=description, description=description
+        "scan-github",
+        help=description,
+        description=description,
+        epilog=_GITHUB_SCAN_NOTES,
     )
     scan_github_parser.add_argument(
         "github",
@@ -1027,11 +1093,20 @@ def _parser():
         "Print each finding without a verdict as a line of JSON, its file "
         "relative to the source"
     )
-    subparsers.add_parser("pending", help=description, description=description)
+    subparsers.add_parser(
+        "pending",
+        help=description,
+        description=description,
+        epilog=_PENDING_FIELDS,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
     description = "Confirm one finding without a verdict"
     confirm_parser = subparsers.add_parser(
-        "confirm", help=description, description=description
+        "confirm",
+        help=description,
+        description=description,
+        epilog=_JUDGE_NOTES,
     )
     _add_judge_arguments(
         confirm_parser, "One sentence on how the lines match the violation"
@@ -1039,7 +1114,10 @@ def _parser():
 
     description = "Reject one finding without a verdict"
     reject_parser = subparsers.add_parser(
-        "reject", help=description, description=description
+        "reject",
+        help=description,
+        description=description,
+        epilog=_JUDGE_NOTES,
     )
     _add_judge_arguments(
         reject_parser, "One sentence on why the lines do not break the rule"
@@ -1067,7 +1145,10 @@ def _parser():
         "while any finding has none"
     )
     subparsers.add_parser(
-        "submit-github", help=description, description=description
+        "submit-github",
+        help=description,
+        description=description,
+        epilog=_SUBMIT_NOTES,
     )
     return parser
 
