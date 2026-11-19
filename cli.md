@@ -18,15 +18,15 @@ COMMAND:
 
 ## `jevrev scan`
 ```
---dir <DIR>             Directory to scan in place; findings are relative to it; requires --base or --full; conflicts with --repo
---repo <HOST/ORG/NAME>  GitHub repo of the pull request to clone and scan; requires --pr; conflicts with --dir
---pr <N>                Pull request number; requires --repo
---cache-dir <DIR>       Directory the pull request is cloned under, and left in [default: the temporary directory]
---base <REV>            Revision of the git dir to compare from; requires --dir; conflicts with --full
---full                  Scan every file, not the change from the base or the pull request's merge base
---rules <DIR>           Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
---extra-rules <DIRS>    More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
---metadata <JSON>       JSON value stored with the review and printed by show
+--dir <DIR>               Directory to scan in place; findings are relative to it; requires --base or --full; conflicts with --repo
+--repo <HOST/ORG/NAME>    GitHub repo of the pull request to clone and scan; requires --pr; conflicts with --dir
+--pr <N>                  Pull request number; requires --repo
+--cache-dir <DIR>         Directory the pull request is cloned under, and left in [default: the temporary directory]
+--base <REV>              Revision of the git dir to compare from; requires --dir; conflicts with --full
+--full                    Scan every file, not the change from the base or the pull request's merge base
+--rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
+--extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
+--metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys
 ```
 
 ## `jevrev confirm`

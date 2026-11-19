@@ -6,7 +6,7 @@ import pydantic
 # A GitHub host as gh takes it, such as github.com or a GitHub Enterprise
 # Server host, with an optional port. Never . or .., so it is one path
 # component.
-type GithubHost = typing.Annotated[
+type _GithubHost = typing.Annotated[
     str,
     pydantic.StringConstraints(
         pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?$"
@@ -14,24 +14,24 @@ type GithubHost = typing.Annotated[
 ]
 
 
-GITHUB_NAME_CHARS = frozenset(string.ascii_letters + string.digits + ".-_")
+_GITHUB_NAME_CHARS = frozenset(string.ascii_letters + string.digits + ".-_")
 # Path components, not names.
-GITHUB_NAME_INVALID = frozenset((".", ".."))
+_GITHUB_NAME_INVALID = frozenset((".", ".."))
 
 
 def _check_github_name(value: str) -> str:
-    if set(value) - GITHUB_NAME_CHARS or value in GITHUB_NAME_INVALID:
+    if set(value) - _GITHUB_NAME_CHARS or value in _GITHUB_NAME_INVALID:
         raise ValueError("invalid github name")
     return value
 
 
-type GithubOrgName = typing.Annotated[
+type _GithubOrgName = typing.Annotated[
     str,
     pydantic.StringConstraints(min_length=1),
     pydantic.AfterValidator(_check_github_name),
 ]
 
-type GithubRepoName = typing.Annotated[
+type _GithubRepoName = typing.Annotated[
     str,
     pydantic.StringConstraints(min_length=1),
     pydantic.AfterValidator(_check_github_name),
@@ -41,8 +41,8 @@ type GithubRepoName = typing.Annotated[
 class GithubRepo(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    host: GithubHost = pydantic.Field(description="GitHub host")
-    org: GithubOrgName = pydantic.Field(
+    host: _GithubHost = pydantic.Field(description="GitHub host")
+    org: _GithubOrgName = pydantic.Field(
         description="Organization or user that owns the repo"
     )
-    name: GithubRepoName = pydantic.Field(description="Repository name")
+    name: _GithubRepoName = pydantic.Field(description="Repository name")

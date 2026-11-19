@@ -1,4 +1,4 @@
-import asyncio
+import collections.abc
 import contextlib
 import enum
 import logging
@@ -8,17 +8,18 @@ import yarl
 
 import jevrev.github.pull_request
 import jevrev.github.repo
+import jevrev.process
 
-PULL_REQUEST_FIELDS = "author,baseRefName"
+_PULL_REQUEST_FIELDS = "author,baseRefName"
 # gh's pull request JSON as a jevrev.github.pull_request.PullRequest.
-PULL_REQUEST_JQ = (
+_PULL_REQUEST_JQ = (
     "{author: {login: .author.login}, base_ref_name: .baseRefName}"
 )
 
 
 # Adds a file comment to a pending review; the REST API that creates a
 # review takes only line comments.
-ADD_FILE_THREAD = """
+_ADD_FILE_THREAD = """
 mutation($review: ID!, $path: String!, $body: String!) {
   addPullRequestReviewThread(input: {
     pullRequestReviewId: $review, path: $path, body: $body, subjectType: FILE
@@ -27,7 +28,7 @@ mutation($review: ID!, $path: String!, $body: String!) {
 """
 
 
-LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class HttpMethod(enum.StrEnum):
@@ -42,28 +43,31 @@ class GithubError(Exception):
 
 class gh:
     @staticmethod
+    async def _run(argv: list[str]) -> bytes:
+        try:
+            return await jevrev.process.run(argv)
+        except jevrev.process.ProcessError as e:
+            raise GithubError(str(e)) from e
+
+    @staticmethod
     async def pull_request(
         repo: jevrev.github.repo.GithubRepo,
         pr: jevrev.github.pull_request.GithubPRNumber,
     ) -> jevrev.github.pull_request.PullRequest:
-        proc = await asyncio.create_subprocess_exec(
-            "gh",
-            "pr",
-            "view",
-            str(pr),
-            "--repo",
-            f"{repo.host}/{repo.org}/{repo.name}",
-            "--json",
-            PULL_REQUEST_FIELDS,
-            "--jq",
-            PULL_REQUEST_JQ,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        stdout = await gh._run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                f"{repo.host}/{repo.org}/{repo.name}",
+                "--json",
+                _PULL_REQUEST_FIELDS,
+                "--jq",
+                _PULL_REQUEST_JQ,
+            ]
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise GithubError(f"gh pr view {pr}: {stderr.decode().strip()}")
         return jevrev.github.pull_request.PullRequest.model_validate_json(
             stdout
         )
@@ -74,7 +78,7 @@ class gh:
     ) -> bytes:
         """Call the API with gh: its response body, or GithubError. GitHub's
         error body, which gh prints on stdout, goes only to the log."""
-        proc = await asyncio.create_subprocess_exec(
+        argv = [
             "gh",
             "api",
             "--hostname",
@@ -83,25 +87,12 @@ class gh:
             method,
             *(("--input", "-") if payload is not None else ()),
             path,
-            stdin=asyncio.subprocess.DEVNULL
-            if payload is None
-            else asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate(payload)
-        if proc.returncode != 0:
-            LOGGER.error(
-                "gh api %s %s: %s %s",
-                method,
-                path,
-                stderr.decode().strip(),
-                stdout.decode().strip(),
-            )
-            raise GithubError(
-                f"gh api {method} {path} failed with exit {proc.returncode}"
-            )
-        return stdout
+        ]
+        try:
+            return await jevrev.process.run(argv=argv, stdin=payload)
+        except jevrev.process.ProcessError as e:
+            _LOGGER.error(f"{e}\n{e.stdout.decode().strip()}")
+            raise GithubError(str(e)) from e
 
     @staticmethod
     async def current_user(host: str) -> jevrev.github.pull_request.User:
@@ -151,7 +142,7 @@ class gh:
                             method=HttpMethod.POST,
                             path="graphql",
                             payload=jevrev.github.pull_request.GraphqlRequest(
-                                query=ADD_FILE_THREAD,
+                                query=_ADD_FILE_THREAD,
                                 variables=jevrev.github.pull_request.AddFileThreadVariables(
                                     review=pending.node_id,
                                     path=comment.path,
@@ -188,22 +179,18 @@ class gh:
     async def clone(
         repo: jevrev.github.repo.GithubRepo,
         dest: pathlib.Path,
-        *git_args: str,
+        git_args: collections.abc.Sequence[str] = (),
     ) -> None:
         """Clone repo to dest, passing git_args to git clone."""
-        proc = await asyncio.create_subprocess_exec(
-            "gh",
-            "repo",
-            "clone",
-            f"{repo.host}/{repo.org}/{repo.name}",
-            str(dest),
-            "--",
-            "--quiet",
-            *git_args,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await gh._run(
+            [
+                "gh",
+                "repo",
+                "clone",
+                f"{repo.host}/{repo.org}/{repo.name}",
+                str(dest),
+                "--",
+                "--quiet",
+                *git_args,
+            ]
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise GithubError(f"gh repo clone: {stderr.decode().strip()}")

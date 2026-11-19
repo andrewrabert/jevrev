@@ -4,12 +4,11 @@ verdict."""
 
 import argparse
 import asyncio
+import collections.abc
 import contextlib
 import enum
-import json
 import os
 import pathlib
-import sqlite3
 import sys
 import tempfile
 
@@ -18,77 +17,32 @@ import pydantic
 import unidiff
 import yaml
 
+import jevrev.db
 import jevrev.github.gh
 import jevrev.github.pull_request
 import jevrev.github.repo
-import jevrev.jev_ask
-import jevrev.jev_scan
+import jevrev.jev.api
+import jevrev.jev.ask
+import jevrev.jev.scan
+import jevrev.process
+import jevrev.settings
 import jevrev.templates
 
 # Seconds a jev scan may run.
-JEV_SCAN_TIMEOUT = 600
+_JEV_SCAN_TIMEOUT = 600
 # Requests to jev a scan has open at once.
-JEV_SCAN_CONCURRENCY = 8
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS review (
-    id INTEGER PRIMARY KEY CHECK (id = 0),
-    data TEXT NOT NULL
-);
-"""
+_JEV_SCAN_CONCURRENCY = 8
 
 # Lines of context around each change in a pull request's diff on GitHub,
 # and the most lines between two changes it shows as one hunk.
-GITHUB_DIFF_CONTEXT = 3
-GITHUB_INTER_HUNK_CONTEXT = 1
+_GITHUB_DIFF_CONTEXT = 3
+_GITHUB_INTER_HUNK_CONTEXT = 1
 # The most characters GitHub takes in a review's body.
-GITHUB_BODY_LIMIT = 65536
+_GITHUB_BODY_LIMIT = 65536
 
 
 class UserError(Exception):
     pass
-
-
-class Verdict(enum.StrEnum):
-    CONFIRMED = "confirmed"
-    REJECTED = "rejected"
-
-
-class Finding(jevrev.jev_scan.Finding):
-    """A jev_scan finding, its file relative to the review's dir, with its
-    index in the scan's findings, from 1, and its verdict once it has one."""
-
-    index: int
-    verdict: Verdict | None = None
-    reason: str | None = None
-
-
-class PullRequestSource(pydantic.BaseModel):
-    """The pull request a review's dir is a clone of, at its head."""
-
-    repo: jevrev.github.repo.GithubRepo
-    pr: jevrev.github.pull_request.GithubPRNumber
-    head_sha: jevrev.github.pull_request.GitSha
-    target: str
-    target_sha: jevrev.github.pull_request.GitSha
-    merge_base: jevrev.github.pull_request.GitSha
-
-
-class Review(pydantic.BaseModel):
-    """One scan of a directory and the verdicts on its findings."""
-
-    model_config = pydantic.ConfigDict(extra="forbid")
-
-    dir: pathlib.Path
-    # The revision the change is from; None when full.
-    base: str | None = None
-    # Whether jev scanned every file of the dir, not the change from base.
-    full: bool = False
-    # Set when the dir is a clone of a pull request.
-    pull_request: PullRequestSource | None = None
-    metadata: pydantic.JsonValue = None
-    # jev_scan's findings, in its order.
-    findings: list[Finding]
 
 
 class Format(enum.StrEnum):
@@ -96,51 +50,25 @@ class Format(enum.StrEnum):
     MD = "md"
 
 
-class Store:
-    """A review in its db."""
-
-    def __init__(self, db: sqlite3.Connection):
-        self.db = db
-        self.db.executescript(SCHEMA)
-
-    def load(self) -> Review:
-        row = self.db.execute("SELECT data FROM review").fetchone()
-        if row is None:
-            raise UserError("The db holds no review.")
-        return Review.model_validate_json(row[0])
-
-    def save(self, review: Review):
-        self.db.execute(
-            "INSERT OR REPLACE INTO review (id, data) VALUES (0, ?)",
-            (review.model_dump_json(),),
-        )
+def _load_review(store: jevrev.db.Store) -> jevrev.db.Review:
+    review = store.load()
+    if review is None:
+        raise UserError("The db holds no review.")
+    return review
 
 
 @contextlib.contextmanager
-def open_db(path: pathlib.Path, lock_timeout: float):
-    """The db at path, holding its write lock until exit."""
-    with contextlib.closing(
-        sqlite3.connect(path, timeout=lock_timeout, autocommit=True)
-    ) as db:
-        db.execute("BEGIN IMMEDIATE")
-        try:
-            yield Store(db)
-        finally:
-            db.execute("COMMIT")
-
-
-@contextlib.contextmanager
-def open_review(path: pathlib.Path, lock_timeout: float):
+def _open_review(path: pathlib.Path, lock_timeout: float):
     if not path.is_file():
         raise UserError(f"{path}: no such db file")
-    with open_db(path, lock_timeout) as store:
+    with jevrev.db.open_db(path, lock_timeout) as store:
         yield store
 
 
-def judged_review(args) -> Review:
+def _judged_review(args) -> jevrev.db.Review:
     """The review in the db. Fails while any finding has no verdict."""
-    with open_review(args.db, args.lock_timeout) as store:
-        review = store.load()
+    with _open_review(args.db, args.lock_timeout) as store:
+        review = _load_review(store)
     if unjudged := [
         str(finding.index)
         for finding in review.findings
@@ -150,49 +78,81 @@ def judged_review(args) -> Review:
     return review
 
 
-async def git(root: pathlib.Path, *argv) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "--no-pager",
-        "-C",
-        str(root),
-        *argv,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise UserError(f"git {argv[0]}: {stderr.decode().strip()}")
-    return stdout.decode()
+class git:
+    @staticmethod
+    async def _run(root: pathlib.Path, argv: list[str]) -> str:
+        """The stdout of git, in root, with argv."""
+        try:
+            stdout = await jevrev.process.run(
+                ["git", "--no-pager", "-C", str(root), *argv]
+            )
+        except jevrev.process.ProcessError as e:
+            raise UserError(str(e)) from e
+        return stdout.decode()
+
+    @staticmethod
+    async def fetch(root: pathlib.Path, refspec: str):
+        """Fetch refspec from origin."""
+        await git._run(root, ["fetch", "--quiet", "origin", refspec])
+
+    @staticmethod
+    async def rev_parse(
+        root: pathlib.Path, revisions: collections.abc.Sequence[str]
+    ) -> list[str]:
+        """The commit each of revisions names, in order."""
+        return (await git._run(root, ["rev-parse", *revisions])).split()
+
+    @staticmethod
+    async def merge_base(root: pathlib.Path, first: str, second: str) -> str:
+        return (await git._run(root, ["merge-base", first, second])).strip()
+
+    @staticmethod
+    async def checkout_detached(root: pathlib.Path, revision: str):
+        await git._run(root, ["checkout", "--quiet", "--detach", revision])
+
+    @staticmethod
+    async def diff(
+        root: pathlib.Path,
+        base: str,
+        head: str,
+        context: int,
+        inter_hunk_context: int,
+    ) -> str:
+        """The diff from base to head, with context lines around each change,
+        and changes at most inter_hunk_context lines apart in one hunk."""
+        return await git._run(
+            root,
+            [
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                f"-U{context}",
+                f"--inter-hunk-context={inter_hunk_context}",
+                base,
+                head,
+            ],
+        )
 
 
-async def clone_pull_request(
+async def _clone_pull_request(
     repo: jevrev.github.repo.GithubRepo,
     pr: jevrev.github.pull_request.GithubPRNumber,
     dest: pathlib.Path,
-) -> PullRequestSource:
+) -> jevrev.db.PullRequestSource:
     """Clone the pull request to dest, its head checked out."""
     target = (await jevrev.github.gh.gh.pull_request(repo, pr)).base_ref_name
-    await jevrev.github.gh.gh.clone(repo, dest, "--no-checkout")
-    await git(
-        dest,
-        "fetch",
-        "--quiet",
-        "origin",
-        f"+refs/pull/{pr}/head:refs/pr/{pr}/head",
+    await jevrev.github.gh.gh.clone(
+        repo=repo, dest=dest, git_args=["--no-checkout"]
     )
-    head_sha, target_sha = (
-        await git(
-            dest,
-            "rev-parse",
-            f"refs/pr/{pr}/head",
-            f"refs/remotes/origin/{target}",
-        )
-    ).split()
-    merge_base = (await git(dest, "merge-base", head_sha, target_sha)).strip()
-    await git(dest, "checkout", "--quiet", "--detach", head_sha)
-    return PullRequestSource(
+    await git.fetch(dest, f"+refs/pull/{pr}/head:refs/pr/{pr}/head")
+    head_sha, target_sha = await git.rev_parse(
+        dest, [f"refs/pr/{pr}/head", f"refs/remotes/origin/{target}"]
+    )
+    merge_base = await git.merge_base(
+        root=dest, first=head_sha, second=target_sha
+    )
+    await git.checkout_detached(dest, head_sha)
+    return jevrev.db.PullRequestSource(
         repo=repo,
         pr=pr,
         head_sha=head_sha,
@@ -202,12 +162,19 @@ async def clone_pull_request(
     )
 
 
-async def cmd_scan(args):
+async def _cmd_scan(args):
     db: pathlib.Path = args.db
     if db.exists():
         raise UserError(f"{db} already exists")
     if args.rules is None:
         raise UserError("Give --rules or set JEV_RULES_DIR.")
+    metadata = dict(args.metadata)
+    if len(metadata) != len(args.metadata):
+        keys = [key for key, _ in args.metadata]
+        raise UserError(
+            "--metadata: keys given more than once: "
+            + ", ".join(sorted({k for k in keys if keys.count(k) > 1}))
+        )
     pull_request = None
     if args.repo is not None:
         if args.pr is None:
@@ -219,7 +186,9 @@ async def cmd_scan(args):
         root = pathlib.Path(
             tempfile.mkdtemp(prefix="jevrev-", dir=args.cache_dir)
         ).resolve()
-        pull_request = await clone_pull_request(args.repo, args.pr, root)
+        pull_request = await _clone_pull_request(
+            repo=args.repo, pr=args.pr, dest=root
+        )
         base = None if args.full else pull_request.merge_base
     else:
         if args.pr is not None:
@@ -231,24 +200,24 @@ async def cmd_scan(args):
     evaluate = None
     if base is not None:
         evaluate = [
-            jevrev.jev_scan.Evaluation.HUNK,
-            jevrev.jev_scan.Evaluation.FILE,
+            jevrev.jev.scan.Evaluation.HUNK,
+            jevrev.jev.scan.Evaluation.FILE,
         ]
-    found, summary = await run_jev_scan(
+    found, summary = await _run_jev_scan(
         root=root,
         rules=args.rules,
         extra_rules=args.extra_rules,
         base=base,
         evaluate=evaluate,
     )
-    review = Review(
+    review = jevrev.db.Review(
         dir=root,
         base=base,
         full=args.full,
         pull_request=pull_request,
-        metadata=args.metadata,
+        metadata=metadata,
         findings=[
-            Finding(
+            jevrev.db.Finding(
                 **finding.model_dump(exclude={"file"}),
                 file=str(pathlib.Path(finding.file).relative_to(root)),
                 index=index,
@@ -257,7 +226,7 @@ async def cmd_scan(args):
         ],
     )
     try:
-        with open_db(db, args.lock_timeout) as store:
+        with jevrev.db.open_db(db, args.lock_timeout) as store:
             store.save(review)
     except BaseException:
         db.unlink(missing_ok=True)
@@ -265,30 +234,45 @@ async def cmd_scan(args):
     print(summary)
 
 
-async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
+async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     """Run jev-scan on root against the rule sets under rules and each of
     extra_rules: its findings, and its summary line. Fails if any jev
     request fails."""
+    settings = jevrev.settings.load_settings()
+    if settings.api_key is None:
+        raise UserError(
+            "TYPESAFE_API_KEY is not set in the environment or TYPESAFE_ENV_FILE"
+        )
+    client = jevrev.jev.api.Client(
+        api_key=settings.api_key.get_secret_value(),
+        base_url=settings.base_url,
+        timeout=settings.timeout,
+    )
     try:
-        async with asyncio.timeout(JEV_SCAN_TIMEOUT):
-            root, scanned = await jevrev.jev_scan.scan_items(
+        async with asyncio.timeout(_JEV_SCAN_TIMEOUT):
+            root, scanned = await jevrev.jev.scan.scan_items(
                 rules,
                 root=root,
                 extra_rules=extra_rules,
                 base=base,
                 evaluate=evaluate,
             )
-            found, failures = await jevrev.jev_scan.review(
+            found, failures = await jevrev.jev.scan.review(
                 scanned=scanned,
                 root=root,
-                concurrency=JEV_SCAN_CONCURRENCY,
+                concurrency=_JEV_SCAN_CONCURRENCY,
                 verbose=False,
+                client=client,
+                model=settings.default_model,
             )
     except TimeoutError:
-        raise UserError(f"jev-scan ran longer than {JEV_SCAN_TIMEOUT} seconds")
+        raise UserError(
+            f"jev-scan ran longer than {_JEV_SCAN_TIMEOUT} seconds"
+        )
     except (
-        jevrev.jev_scan.UserError,
-        jevrev.jev_ask.UserError,
+        jevrev.jev.scan.UserError,
+        jevrev.jev.ask.UserError,
+        jevrev.jev.api.UserError,
     ) as e:
         raise UserError(f"jev-scan: {e}")
     if failures:
@@ -296,18 +280,18 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
             f"jev-scan: {len(failures)} jev requests failed:\n"
             + "\n".join(failures)
         )
-    summary = jevrev.jev_scan.summary_line(
+    summary = jevrev.jev.scan.summary_line(
         scanned=scanned, root=root, found=found, failures=failures
     )
     return found, summary
 
 
-async def cmd_pending(args):
-    with open_review(args.db, args.lock_timeout) as store:
-        review = store.load()
+async def _cmd_pending(args):
+    with _open_review(args.db, args.lock_timeout) as store:
+        review = _load_review(store)
     sys.stdout.write(
         "".join(
-            jevrev.jev_scan.json_dumps(
+            jevrev.jev.scan.json_dumps(
                 finding.model_dump(
                     mode="json",
                     exclude={"verdict", "reason"},
@@ -321,18 +305,18 @@ async def cmd_pending(args):
     )
 
 
-async def cmd_confirm(args):
-    await judge(args, Verdict.CONFIRMED)
+async def _cmd_confirm(args):
+    await _judge(args, jevrev.db.Verdict.CONFIRMED)
 
 
-async def cmd_reject(args):
-    await judge(args, Verdict.REJECTED)
+async def _cmd_reject(args):
+    await _judge(args, jevrev.db.Verdict.REJECTED)
 
 
-async def judge(args, verdict: Verdict):
+async def _judge(args, verdict: jevrev.db.Verdict):
     index = args.index
-    with open_review(args.db, args.lock_timeout) as store:
-        review = store.load()
+    with _open_review(args.db, args.lock_timeout) as store:
+        review = _load_review(store)
         count = len(review.findings)
         if not 1 <= index <= count:
             raise UserError(f"index: {index} is not in 1..{count}")
@@ -347,21 +331,21 @@ async def judge(args, verdict: Verdict):
     print(f"Finding {index} {verdict}")
 
 
-async def cmd_show(args):
-    review = judged_review(args)
+async def _cmd_show(args):
+    review = _judged_review(args)
     match args.format:
         case Format.JSON:
             print(review.model_dump_json())
         case Format.MD:
-            print(review_text(review))
+            print(_review_text(review))
 
 
-async def cmd_post(args):
-    review = judged_review(args)
+async def _cmd_post(args):
+    review = _judged_review(args)
     source = review.pull_request
     if source is None:
         raise UserError("The review is not of a pull request.")
-    if not confirmed(review.findings):
+    if not _confirmed(review.findings):
         print("No confirmed findings; no GitHub review submitted.")
         return
     gh = jevrev.github.gh.gh
@@ -370,10 +354,10 @@ async def cmd_post(args):
     url = await gh.post_review(
         repo=source.repo,
         pr=source.pr,
-        review=pr_review(
+        review=_pr_review(
             source=source,
             findings=review.findings,
-            hunks=await github_hunks(review.dir, source),
+            hunks=await _github_hunks(review.dir, source),
             # GitHub refuses a request for changes on one's own pull
             # request.
             event=jevrev.github.pull_request.ReviewEvent.COMMENT
@@ -391,7 +375,7 @@ class Template(enum.StrEnum):
 
 
 # keep_trailing_newline: every comment's trailer ends with one.
-TEMPLATES = minijinja.Environment(
+_TEMPLATES = minijinja.Environment(
     keep_trailing_newline=True,
     templates={
         Template.REVIEW: jevrev.templates.REVIEW,
@@ -401,15 +385,15 @@ TEMPLATES = minijinja.Environment(
 )
 
 
-def render(template: Template, model: pydantic.BaseModel) -> str:
-    return TEMPLATES.render_template(template, model=model)
+def _render(template: Template, model: pydantic.BaseModel) -> str:
+    return _TEMPLATES.render_template(template, model=model)
 
 
 class ReportRule(pydantic.BaseModel):
     """A rule's confirmed findings."""
 
     flags: str
-    findings: list[Finding]
+    findings: list[jevrev.db.Finding]
 
 
 class ReviewText(pydantic.BaseModel):
@@ -435,27 +419,32 @@ class PrComment(pydantic.BaseModel):
     flags: str
 
 
-def confirmed(findings: list[Finding]) -> list[Finding]:
-    return [f for f in findings if f.verdict == Verdict.CONFIRMED]
+def _confirmed(findings: list[jevrev.db.Finding]) -> list[jevrev.db.Finding]:
+    return [f for f in findings if f.verdict == jevrev.db.Verdict.CONFIRMED]
 
 
-def by_rule(findings: list[Finding]) -> dict[str, list[Finding]]:
+def _by_rule(
+    findings: list[jevrev.db.Finding],
+) -> dict[str, list[jevrev.db.Finding]]:
     """findings grouped by rule, each group in order of file and line."""
-    grouped: dict[str, list[Finding]] = {}
+    grouped: dict[str, list[jevrev.db.Finding]] = {}
     for f in sorted(findings, key=lambda f: (f.file, f.start)):
         grouped.setdefault(f.flags, []).append(f)
     return grouped
 
 
-def front_matter(review: Review) -> str:
+def _front_matter(review: jevrev.db.Review) -> str:
     front = {
         **review.model_dump(
-            mode="json", exclude={"findings"}, exclude_none=True
+            mode="json",
+            exclude={"findings"}
+            | (set() if review.metadata else {"metadata"}),
+            exclude_none=True,
         ),
         "findings": len(review.findings),
-        "confirmed": len(confirmed(review.findings)),
+        "confirmed": len(_confirmed(review.findings)),
         "rejected": sum(
-            f.verdict == Verdict.REJECTED for f in review.findings
+            f.verdict == jevrev.db.Verdict.REJECTED for f in review.findings
         ),
     }
     return yaml.safe_dump(front, allow_unicode=True, sort_keys=True).rstrip(
@@ -463,33 +452,32 @@ def front_matter(review: Review) -> str:
     )
 
 
-def review_text(review: Review) -> str:
-    return render(
+def _review_text(review: jevrev.db.Review) -> str:
+    return _render(
         Template.REVIEW,
         ReviewText(
-            front_matter=front_matter(review),
+            front_matter=_front_matter(review),
             rules=[
                 ReportRule(flags=flags, findings=found)
-                for flags, found in by_rule(confirmed(review.findings)).items()
+                for flags, found in _by_rule(
+                    _confirmed(review.findings)
+                ).items()
             ],
         ),
     )
 
 
-async def github_hunks(
-    root: pathlib.Path, source: PullRequestSource
+async def _github_hunks(
+    root: pathlib.Path, source: jevrev.db.PullRequestSource
 ) -> dict[str, list[range]]:
     """The head's lines of each hunk of the pull request's diff as GitHub
     shows it, by path: the lines a review comment can be left on."""
-    diff = await git(
-        root,
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        f"-U{GITHUB_DIFF_CONTEXT}",
-        f"--inter-hunk-context={GITHUB_INTER_HUNK_CONTEXT}",
-        source.merge_base,
-        source.head_sha,
+    diff = await git.diff(
+        root=root,
+        base=source.merge_base,
+        head=source.head_sha,
+        context=_GITHUB_DIFF_CONTEXT,
+        inter_hunk_context=_GITHUB_INTER_HUNK_CONTEXT,
     )
     return {
         file.path: [
@@ -501,15 +489,15 @@ async def github_hunks(
     }
 
 
-def pr_comment(
-    f: Finding, hunks: dict[str, list[range]]
+def _pr_comment(
+    f: jevrev.db.Finding, hunks: dict[str, list[range]]
 ) -> jevrev.github.pull_request.ReviewComment:
     """A comment on f's lines within the first GitHub hunk they overlap, or
     on its file when f is a file finding or overlaps none."""
-    body = render(
+    body = _render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
     )
-    if f.evaluated != jevrev.jev_scan.Evaluation.FILE:
+    if f.evaluated != jevrev.jev.scan.Evaluation.FILE:
         for hunk in hunks.get(f.file, []):
             start, end = max(f.start, hunk.start), min(f.end, hunk.stop - 1)
             if start <= end:
@@ -522,28 +510,30 @@ def pr_comment(
     return jevrev.github.pull_request.FileReviewComment(path=f.file, body=body)
 
 
-def pr_review_body(found: list[Finding], outside: list[Finding]) -> str:
+def _pr_review_body(
+    found: list[jevrev.db.Finding], outside: list[jevrev.db.Finding]
+) -> str:
     """The body of the review of found, whose findings in outside, which
     are in files the pull request did not change, are listed grouped by
     rule in as many as GitHub's limit has room for."""
     body = PrReviewBody(found=len(found))
     if not outside:
-        return render(Template.PR_REVIEW, body)
+        return _render(Template.PR_REVIEW, body)
 
     def size(rules: list[ReportRule], left_out: int = 0) -> int:
         update = {"outside": rules, "left_out": left_out}
-        return len(render(Template.PR_REVIEW, body.model_copy(update=update)))
+        return len(_render(Template.PR_REVIEW, body.model_copy(update=update)))
 
     base = size([])
     used = base
     # Room for the longest note of findings left out.
-    room = GITHUB_BODY_LIMIT - (size([], len(outside)) - base)
+    room = _GITHUB_BODY_LIMIT - (size([], len(outside)) - base)
     rules: list[ReportRule] = []
     left_out = 0
-    for flags, group in by_rule(outside).items():
+    for flags, group in _by_rule(outside).items():
         empty = size([ReportRule(flags=flags, findings=[])])
         heading = empty - base
-        kept: list[Finding] = []
+        kept: list[jevrev.db.Finding] = []
         for f in group:
             item = size([ReportRule(flags=flags, findings=[f])]) - empty
             if used + heading + item > room:
@@ -554,19 +544,19 @@ def pr_review_body(found: list[Finding], outside: list[Finding]) -> str:
         if kept:
             rules.append(ReportRule(flags=flags, findings=kept))
             used += heading
-    return render(
+    return _render(
         Template.PR_REVIEW,
         body.model_copy(update={"outside": rules, "left_out": left_out}),
     )
 
 
-def pr_review(
-    source: PullRequestSource,
-    findings: list[Finding],
+def _pr_review(
+    source: jevrev.db.PullRequestSource,
+    findings: list[jevrev.db.Finding],
     hunks: dict[str, list[range]],
     event: jevrev.github.pull_request.ReviewEvent,
 ) -> jevrev.github.pull_request.NewReview:
-    found = confirmed(findings)
+    found = _confirmed(findings)
     # GitHub refuses a review comment on a file the pull request does not
     # change, which a full review's findings can be in.
     inside = [f for f in found if f.file in hunks]
@@ -574,33 +564,26 @@ def pr_review(
     return jevrev.github.pull_request.NewReview(
         commit_id=source.head_sha,
         event=event,
-        body=pr_review_body(found, outside),
-        comments=[pr_comment(f, hunks) for f in inside],
+        body=_pr_review_body(found, outside),
+        comments=[_pr_comment(f, hunks) for f in inside],
     )
 
 
-def positive_float(value):
+def _positive_float(value):
     number = float(value)
     if number <= 0:
         raise argparse.ArgumentTypeError(f"{value} is not positive")
     return number
 
 
-def positive_int(value):
+def _positive_int(value):
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError(f"{value} is not positive")
     return number
 
 
-def json_value(value):
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"{value}: {e}") from e
-
-
-def github_repo(value) -> jevrev.github.repo.GithubRepo:
+def _github_repo(value) -> jevrev.github.repo.GithubRepo:
     host, *rest = value.split("/")
     if len(rest) != 2:
         raise argparse.ArgumentTypeError(f"{value}: expected HOST/ORG/NAME")
@@ -615,24 +598,25 @@ def github_repo(value) -> jevrev.github.repo.GithubRepo:
         raise argparse.ArgumentTypeError(f"{value}: {problems}") from e
 
 
-def add_judge_arguments(parser, reason_help):
+def _add_judge_arguments(parser, reason_help):
     parser.add_argument(
         "index",
-        type=positive_int,
+        type=_positive_int,
         metavar="INDEX",
         help="Index of the finding in the scan's findings, from 1",
     )
     parser.add_argument("reason", metavar="REASON", help=reason_help)
 
 
-def parser():
+def _parser():
     parser = argparse.ArgumentParser(
         prog="jevrev",
         description="Run jev over a directory or a GitHub pull request, "
         "confirm or reject each of its findings, and print the review or "
         "post it on the pull request.",
     )
-    parser.add_argument(
+    db_group = parser.add_argument_group("db")
+    db_group.add_argument(
         "--db",
         type=pathlib.Path,
         required=True,
@@ -640,9 +624,9 @@ def parser():
         help="SQLite file holding one review: its dir, base, pull request, "
         "metadata, findings, and verdicts",
     )
-    parser.add_argument(
+    db_group.add_argument(
         "--lock-timeout",
-        type=positive_float,
+        type=_positive_float,
         default=3600,
         metavar="SECONDS",
         help="Seconds to wait for another command to release the db "
@@ -660,58 +644,61 @@ def parser():
     scan_parser = subparsers.add_parser(
         "scan", help=description, description=description
     )
-    source_group = scan_parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument(
+    source_group = scan_parser.add_argument_group("source")
+    dir_or_repo = source_group.add_mutually_exclusive_group(required=True)
+    dir_or_repo.add_argument(
         "--dir",
         type=pathlib.Path,
         metavar="DIR",
         help="Directory to scan in place; findings are relative to it; "
         "requires --base or --full; conflicts with --repo",
     )
-    source_group.add_argument(
+    dir_or_repo.add_argument(
         "--repo",
-        type=github_repo,
+        type=_github_repo,
         metavar="HOST/ORG/NAME",
         help="GitHub repo of the pull request to clone and scan; requires "
         "--pr; conflicts with --dir",
     )
-    scan_parser.add_argument(
+    source_group.add_argument(
         "--pr",
-        type=positive_int,
+        type=_positive_int,
         metavar="N",
         help="Pull request number; requires --repo",
     )
-    scan_parser.add_argument(
+    source_group.add_argument(
         "--cache-dir",
         type=pathlib.Path,
         metavar="DIR",
         help="Directory the pull request is cloned under, and left in "
         "[default: the temporary directory]",
     )
-    scan_parser.add_argument(
+    change_group = scan_parser.add_argument_group("change")
+    change_group.add_argument(
         "--base",
         metavar="REV",
         help="Revision of the git dir to compare from; requires --dir; "
         "conflicts with --full",
     )
-    scan_parser.add_argument(
+    change_group.add_argument(
         "--full",
         action="store_true",
         help="Scan every file, not the change from the base or the pull "
         "request's merge base",
     )
-    scan_parser.add_argument(
+    rules_group = scan_parser.add_argument_group("rules")
+    rules_group.add_argument(
         "--rules",
         type=pathlib.Path,
-        default=jevrev.jev_scan.env_path("JEV_RULES_DIR"),
+        default=jevrev.jev.scan.env_path("JEV_RULES_DIR"),
         metavar="DIR",
         help="Directory of rule sets jev-scan reviews against "
         "[default: $JEV_RULES_DIR]; required",
     )
-    scan_parser.add_argument(
+    rules_group.add_argument(
         "--extra-rules",
-        type=jevrev.jev_scan.path_list,
-        default=jevrev.jev_scan.path_list(
+        type=jevrev.jev.scan.path_list,
+        default=jevrev.jev.scan.path_list(
             os.environ.get("JEV_RULES_EXTRA", "")
         ),
         metavar="DIRS",
@@ -720,9 +707,11 @@ def parser():
     )
     scan_parser.add_argument(
         "--metadata",
-        type=json_value,
-        metavar="JSON",
-        help="JSON value stored with the review and printed by show",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("KEY", "VALUE"),
+        help="Metadata stored with the review and printed by show; repeat for more keys",
     )
 
     description = (
@@ -735,7 +724,7 @@ def parser():
     confirm_parser = subparsers.add_parser(
         "confirm", help=description, description=description
     )
-    add_judge_arguments(
+    _add_judge_arguments(
         confirm_parser, "One sentence on how the lines match the violation"
     )
 
@@ -743,7 +732,7 @@ def parser():
     reject_parser = subparsers.add_parser(
         "reject", help=description, description=description
     )
-    add_judge_arguments(
+    _add_judge_arguments(
         reject_parser, "One sentence on why the lines do not break the rule"
     )
 
@@ -772,30 +761,31 @@ def parser():
     return parser
 
 
-async def main():
-    args = parser().parse_args()
+async def _main():
+    args = _parser().parse_args()
     match args.command:
         case "scan":
-            await cmd_scan(args)
+            await _cmd_scan(args)
         case "pending":
-            await cmd_pending(args)
+            await _cmd_pending(args)
         case "confirm":
-            await cmd_confirm(args)
+            await _cmd_confirm(args)
         case "reject":
-            await cmd_reject(args)
+            await _cmd_reject(args)
         case "show":
-            await cmd_show(args)
+            await _cmd_show(args)
         case "post":
-            await cmd_post(args)
+            await _cmd_post(args)
 
 
 def cli():
     try:
-        sys.exit(asyncio.run(main()))
+        sys.exit(asyncio.run(_main()))
     except (
         UserError,
+        jevrev.settings.UserError,
         jevrev.github.gh.GithubError,
-        sqlite3.OperationalError,
+        jevrev.db.OperationalError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -6,7 +6,7 @@ import typing
 import pathspec.patterns.gitignore.spec
 import pydantic
 
-type GitIgnorePattern = typing.Annotated[
+type _GitIgnorePattern = typing.Annotated[
     pathspec.patterns.gitignore.spec.GitIgnoreSpecPattern,
     pydantic.PlainValidator(
         pathspec.patterns.gitignore.spec.GitIgnoreSpecPattern
@@ -27,8 +27,8 @@ class When(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
 
     language: tuple[Language, ...] = ()
-    matches: tuple[GitIgnorePattern, ...] = ()
-    exists: tuple[GitIgnorePattern, ...] = ()
+    matches: tuple[_GitIgnorePattern, ...] = ()
+    exists: tuple[_GitIgnorePattern, ...] = ()
 
 
 class Rule(pydantic.BaseModel):

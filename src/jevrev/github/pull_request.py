@@ -10,7 +10,7 @@ type GitSha = typing.Annotated[
     str, pydantic.StringConstraints(pattern=r"^[0-9a-f]{40}$")
 ]
 
-type Url = typing.Annotated[
+type _Url = typing.Annotated[
     yarl.URL,
     pydantic.PlainValidator(yarl.URL),
     pydantic.PlainSerializer(str),
@@ -111,4 +111,4 @@ class ReviewEventInput(pydantic.BaseModel):
 
 
 class Review(pydantic.BaseModel):
-    html_url: Url
+    html_url: _Url
