@@ -1,10 +1,16 @@
 # jevrev
 
-A CLI that runs jev over a local directory, a local git directory or a GitHub repo, records a verdict on each finding, and prints the review or posts it on the pull request.
+A CLI that runs jev over a local directory, a local git directory or a GitHub repo and prints its findings, records a verdict on each finding, and prints the review or posts it on the pull request.
 
 Give the directory of rule sets to review against with `--rules` or `JEV_RULES_DIR`. [example_rules](example_rules) holds examples.
 
-A review is one SQLite file given by `--db`. No scan writes anything else: a git directory's files are read from its repository, and a GitHub repo's through the GitHub API. [cli.md](cli.md) is the CLI's surface.
+A scan prints its findings as a linter does, in color when stdout is a terminal, and exits 0 with no findings, 1 with findings (0 given `--exit-zero`), and 2 on any error:
+
+```sh
+jevrev scan src --rules example_rules
+```
+
+A review is one SQLite file given by `--db`; a scan given `--db` saves its findings to it, and every other command requires it. No scan writes anything else: a git directory's files are read from its repository, and a GitHub repo's through the GitHub API. [cli.md](cli.md) is the CLI's surface.
 
 ```sh
 jevrev --db review.db scan-github ORG/NAME --github-pr 12 --rules example_rules

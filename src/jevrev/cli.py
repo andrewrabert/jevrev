@@ -1,6 +1,6 @@
-"""Run jev over a directory or a GitHub pull request into a review's db, confirm or reject each of
-its findings, and print the review or post it on the pull request once every finding has a
-verdict."""
+"""Run jev over a directory or a GitHub pull request and print its findings, optionally into a
+review's db; confirm or reject each of its findings, and print the review or post it on the pull
+request once every finding has a verdict."""
 
 import argparse
 import asyncio
@@ -10,9 +10,12 @@ import enum
 import os
 import pathlib
 import sys
+import traceback
 
 import minijinja
 import pydantic
+import rich.console
+import rich.text
 import yaml
 
 import jevrev.db
@@ -40,6 +43,11 @@ _GITHUB_INTER_HUNK_CONTEXT = 1
 # The most characters GitHub takes in a review's body.
 _GITHUB_BODY_LIMIT = 65536
 
+# Exit statuses, as mypy's: no findings, findings, and any error.
+_EXIT_CLEAN = 0
+_EXIT_FINDINGS = 1
+_EXIT_ERROR = 2
+
 
 class UserError(Exception):
     pass
@@ -57,6 +65,12 @@ def _load_review(store: jevrev.db.Store) -> jevrev.db.Review:
     return review
 
 
+def _db(args) -> pathlib.Path:
+    if args.db is None:
+        raise UserError(f"{args.command}: give --db")
+    return args.db
+
+
 @contextlib.contextmanager
 def _open_review(path: pathlib.Path):
     if not path.is_file():
@@ -66,7 +80,7 @@ def _open_review(path: pathlib.Path):
 
 
 def _judged_review(args) -> jevrev.db.Review:
-    with _open_review(args.db) as store:
+    with _open_review(_db(args)) as store:
         review = _load_review(store)
     if unjudged := [
         str(finding.index)
@@ -78,9 +92,11 @@ def _judged_review(args) -> jevrev.db.Review:
 
 
 def _scan_metadata(args) -> dict[str, str]:
-    db: pathlib.Path = args.db
-    if db.exists():
+    db: pathlib.Path | None = args.db
+    if db is not None and db.exists():
         raise UserError(f"{db} already exists")
+    if db is None and args.metadata:
+        raise UserError("--metadata: give --db to store it in")
     if args.rules is None:
         raise UserError("Give --rules or set JEV_RULES_DIR.")
     if any(key == "" for key, _ in args.metadata):
@@ -146,14 +162,51 @@ async def _scan_and_save(
             for index, finding in enumerate(found, 1)
         ],
     )
-    db: pathlib.Path = args.db
-    try:
-        with jevrev.db.open_db(db) as store:
-            store.save(review)
-    except BaseException:
-        db.unlink(missing_ok=True)
-        raise
-    print(summary)
+    db: pathlib.Path | None = args.db
+    if db is not None:
+        try:
+            with jevrev.db.open_db(db) as store:
+                store.save(review)
+        except BaseException:
+            db.unlink(missing_ok=True)
+            raise
+    _print_findings(review.findings, summary)
+    if review.findings and not args.exit_zero:
+        return _EXIT_FINDINGS
+    return _EXIT_CLEAN
+
+
+def _probability_style(probability: float) -> str:
+    if probability >= 0.9:
+        return "bold red"
+    if probability >= 0.7:
+        return "yellow"
+    return "default"
+
+
+def _print_findings(findings: list[jevrev.db.Finding], summary: str):
+    """Print findings as a linter does, in order of file and line, then summary; in color only
+    when stdout is a terminal."""
+    console = rich.console.Console(soft_wrap=True, highlight=False)
+    for f in sorted(findings, key=lambda f: (f.file, f.start, f.index)):
+        lines = f"{f.start}" if f.start == f.end else f"{f.start}-{f.end}"
+        console.print(
+            rich.text.Text.assemble(
+                (f"{f.file}:{lines}", "bold"),
+                " ",
+                (f"[{f.index}]", "dim"),
+                " ",
+                (f.rule, "yellow"),
+                " ",
+                (f"{f.probability:.2f}", _probability_style(f.probability)),
+                " ",
+                (f.item, "cyan"),
+            )
+        )
+        console.print(rich.text.Text(f"    {f.flags}"))
+    if findings:
+        console.print()
+    console.print(rich.text.Text(summary))
 
 
 async def _cmd_scan(args):
@@ -161,7 +214,7 @@ async def _cmd_scan(args):
     metadata = _scan_metadata(args)
     root = _local_dir(args.dir)
     files = jevrev.files.OnDisk(root)
-    await _scan_and_save(
+    return await _scan_and_save(
         args,
         metadata=metadata,
         source=jevrev.db.LocalDir(path=root),
@@ -209,7 +262,7 @@ async def _cmd_scan_git(args):
                 untracked = await jevrev.git.git.untracked_files(
                     root, ["."], ignored=not args.ignore
                 )
-    await _scan_and_save(
+    return await _scan_and_save(
         args,
         metadata=metadata,
         source=jevrev.db.LocalGitDir(path=root, git=selection),
@@ -288,7 +341,7 @@ async def _cmd_scan_github(args):
             ignore = await jevrev.files.Ignore.load(
                 files, excludes=await jevrev.git.git.global_excludes()
             )
-        await _scan_and_save(
+        return await _scan_and_save(
             args,
             metadata=metadata,
             source=jevrev.db.GithubRepo(**repo.model_dump(), git=selection),
@@ -365,7 +418,7 @@ async def _run_jev_scan(
 
 
 async def _cmd_pending(args):
-    with _open_review(args.db) as store:
+    with _open_review(_db(args)) as store:
         review = _load_review(store)
     sys.stdout.write(
         "".join(
@@ -393,7 +446,7 @@ async def _cmd_reject(args):
 
 async def _judge(args, verdict: jevrev.db.Verdict):
     index = args.index
-    with _open_review(args.db) as store:
+    with _open_review(_db(args)) as store:
         review = _load_review(store)
         count = len(review.findings)
         if not 1 <= index <= count:
@@ -728,7 +781,12 @@ def _add_scan_arguments(parser):
         default=[],
         metavar=("KEY", "VALUE"),
         help="Metadata stored with the review and printed by show; repeat "
-        "for more keys",
+        "for more keys; requires --db",
+    )
+    parser.add_argument(
+        "--exit-zero",
+        action="store_true",
+        help="Exit 0 even when the scan has findings",
     )
 
 
@@ -745,26 +803,28 @@ def _add_judge_arguments(parser, reason_help):
 def _parser():
     parser = argparse.ArgumentParser(
         prog="jevrev",
-        description="Run jev over a directory or a GitHub pull request, "
-        "confirm or reject each of its findings, and print the review or "
-        "post it on the pull request.",
+        description="Run jev over a directory or a GitHub pull request and "
+        "print its findings, confirm or reject each of them, and print the "
+        "review or post it on the pull request. Exits 0 with no findings, 1 "
+        "with findings, and 2 on any error.",
     )
     db_group = parser.add_argument_group("db")
     db_group.add_argument(
         "--db",
         type=pathlib.Path,
-        required=True,
         metavar="FILE",
         help="SQLite file holding one review: its source, the version of it "
-        "scanned, metadata, findings, and verdicts",
+        "scanned, metadata, findings, and verdicts; a scan saves its review "
+        "to it when given, every other command requires it",
     )
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"
     )
 
     description = (
-        "Run jev over a directory's files on disk into a new db, whether or "
-        "not it is in a git repository; print the scan's summary"
+        "Run jev over a directory's files on disk, whether or not it is in a "
+        "git repository; print its findings and summary, and save them to a "
+        "new db given --db"
     )
     scan_parser = subparsers.add_parser(
         "scan", help=description, description=description
@@ -778,8 +838,8 @@ def _parser():
     _add_scan_arguments(scan_parser)
 
     description = (
-        "Run jev over a git directory at a revision, or over a diff, into a "
-        "new db; print the scan's summary"
+        "Run jev over a git directory at a revision, or over a diff; print "
+        "its findings and summary, and save them to a new db given --db"
     )
     scan_git_parser = subparsers.add_parser(
         "scan-git", help=description, description=description
@@ -811,8 +871,8 @@ def _parser():
 
     description = (
         "Run jev over a GitHub repo, through the GitHub API on the host "
-        "GH_HOST names (github.com when unset), into a new db; print the "
-        "scan's summary"
+        "GH_HOST names (github.com when unset); print its findings and "
+        "summary, and save them to a new db given --db"
     )
     scan_github_parser = subparsers.add_parser(
         "scan-github", help=description, description=description
@@ -899,11 +959,11 @@ async def _main():
     args = _parser().parse_args()
     match args.command:
         case "scan":
-            await _cmd_scan(args)
+            return await _cmd_scan(args)
         case "scan-git":
-            await _cmd_scan_git(args)
+            return await _cmd_scan_git(args)
         case "scan-github":
-            await _cmd_scan_github(args)
+            return await _cmd_scan_github(args)
         case "pending":
             await _cmd_pending(args)
         case "confirm":
@@ -914,11 +974,12 @@ async def _main():
             await _cmd_show(args)
         case "submit-github":
             await _cmd_submit_github(args)
+    return _EXIT_CLEAN
 
 
 def cli():
     try:
-        sys.exit(asyncio.run(_main()))
+        status = asyncio.run(_main())
     except (
         UserError,
         jevrev.settings.UserError,
@@ -927,7 +988,11 @@ def cli():
         jevrev.db.OperationalError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(_EXIT_ERROR)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(_EXIT_ERROR)
+    sys.exit(status)
 
 
 if __name__ == "__main__":

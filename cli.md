@@ -4,12 +4,17 @@ exists exactly as written.
 
 ## `jevrev`
 ```
---db <FILE>  SQLite file holding one review: its source, the version of it scanned, metadata, findings, and verdicts
+--db <FILE>  SQLite file holding one review: its source, the version of it scanned, metadata, findings, and verdicts; a scan saves its review to it when given, every other command requires it
+
+EXIT STATUS:
+  0  No findings, or --exit-zero
+  1  Findings
+  2  Any error, including an unexpected exception
 
 COMMAND:
-  scan           Run jev over a directory's files on disk into a new db, whether or not it is in a git repository; print the scan's summary
-  scan-git       Run jev over a git directory at a revision, or over a diff, into a new db; print the scan's summary
-  scan-github    Run jev over a GitHub repo, through the GitHub API on the host GH_HOST names (github.com when unset), into a new db; print the scan's summary
+  scan           Run jev over a directory's files on disk, whether or not it is in a git repository; print its findings and summary, and save them to a new db given --db
+  scan-git       Run jev over a git directory at a revision, or over a diff; print its findings and summary, and save them to a new db given --db
+  scan-github    Run jev over a GitHub repo, through the GitHub API on the host GH_HOST names (github.com when unset); print its findings and summary, and save them to a new db given --db
   pending        Print each finding without a verdict as a line of JSON, its file relative to the source
   confirm        Confirm one finding without a verdict
   reject         Reject one finding without a verdict
@@ -24,7 +29,8 @@ DIR                       Directory to scan; findings are relative to it
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
---metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys
+--metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
+--exit-zero               Exit 0 even when the scan has findings
 ```
 
 ## `jevrev scan-git`
@@ -36,7 +42,8 @@ DIR                       Directory in a git repository to scan; findings are re
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
---metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys
+--metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
+--exit-zero               Exit 0 even when the scan has findings
 ```
 
 ## `jevrev scan-github`
@@ -49,7 +56,8 @@ ORG/NAME                  GitHub repo to scan; findings are relative to its top
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
---metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys
+--metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
+--exit-zero               Exit 0 even when the scan has findings
 ```
 
 ## `jevrev confirm`
