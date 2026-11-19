@@ -46,9 +46,17 @@ type MetadataKey = typing.Annotated[
 # A --metadata value given to scan; may be empty.
 type MetadataValue = str
 
+# An --include or --exclude pattern given to scan, in gitignore syntax.
+type Pattern = str
+
+
+class PatternKind(enum.StrEnum):
+    INCLUDE = "include"
+    EXCLUDE = "exclude"
+
 
 class LocalDir(pydantic.BaseModel):
-    """A directory reviewed as its files on disk."""
+    """A directory, or one file, reviewed as its files on disk."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
@@ -82,6 +90,9 @@ class Review(pydantic.BaseModel):
 
     source: LocalDir | LocalGitDir | GithubRepo
     metadata: dict[MetadataKey, MetadataValue] = {}
+    # The --include and --exclude patterns, in the order given.
+    include: list[Pattern] = []
+    exclude: list[Pattern] = []
     # jevrev.jev.scan's findings, in its order.
     findings: list[Finding]
 
@@ -138,6 +149,12 @@ CREATE TABLE IF NOT EXISTS github_pull_request (
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS pattern (
+    position INTEGER PRIMARY KEY CHECK (position >= 1),
+    kind TEXT NOT NULL CHECK ({_one_of("kind", PatternKind)}),
+    pattern TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS finding (
@@ -218,6 +235,15 @@ class _MetadataRow(_Row):
     value: MetadataValue
 
 
+class _PatternRow(_Row):
+    table = "pattern"
+
+    # The pattern's position among the review's patterns, from 1.
+    position: typing.Annotated[int, pydantic.Field(ge=1)]
+    kind: PatternKind
+    pattern: Pattern
+
+
 class _FindingRow(_Row, Finding):
     table = "finding"
 
@@ -225,6 +251,7 @@ class _FindingRow(_Row, Finding):
 # Child tables first, so a delete never leaves a row its parent's delete would orphan.
 _ROWS: tuple[type[_Row], ...] = (
     _FindingRow,
+    _PatternRow,
     _MetadataRow,
     _GithubPullRequestRow,
     _GitDiffToDiskRow,
@@ -340,12 +367,23 @@ class Store:
             raise OperationalError(
                 f"the db holds an invalid source: {e}"
             ) from e
+        patterns = self._rows(_PatternRow, order="position")
         return Review(
             source=source,
             metadata={
                 row.key: row.value
                 for row in self._rows(_MetadataRow, order="key")
             },
+            include=[
+                row.pattern
+                for row in patterns
+                if row.kind == PatternKind.INCLUDE
+            ],
+            exclude=[
+                row.pattern
+                for row in patterns
+                if row.kind == PatternKind.EXCLUDE
+            ],
             findings=[
                 Finding.model_validate(row.model_dump())
                 for row in self._rows(_FindingRow, order="index")
@@ -388,6 +426,13 @@ class Store:
                 self._save_selection(selection)
         for key, value in review.metadata.items():
             self._insert(_MetadataRow(key=key, value=value))
+        patterns = [(PatternKind.INCLUDE, p) for p in review.include] + [
+            (PatternKind.EXCLUDE, p) for p in review.exclude
+        ]
+        for position, (kind, pattern) in enumerate(patterns, 1):
+            self._insert(
+                _PatternRow(position=position, kind=kind, pattern=pattern)
+            )
         for finding in review.findings:
             self._insert(_FindingRow.model_validate(finding.model_dump()))
 

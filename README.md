@@ -1,6 +1,6 @@
 # jevrev
 
-A CLI that runs jev over a local directory, a local git directory or a GitHub repo and prints its findings, records a verdict on each finding, and prints the review or posts it on the pull request.
+A CLI that runs jev over a local file or directory, a local git directory or a GitHub repo and prints its findings, records a verdict on each finding, and prints the review or posts it on the pull request.
 
 Give the directory of rule sets to review against with `--rules` or `JEV_RULES_DIR`. [example_rules](example_rules) holds examples.
 
@@ -23,7 +23,7 @@ jevrev --db review.db submit-github
 
 | command | reviews |
 |---|---|
-| `scan DIR` | DIR's files on disk |
+| `scan PATH` | the file PATH, or the directory PATH's files, on disk |
 | `scan-git DIR --git-rev REV` | DIR's files at REV |
 | `scan-git DIR --git-diff REV` | the changes from REV to the files on disk, as `git diff REV` shows them |
 | `scan-git DIR --git-diff A..B` / `A...B` | the changes from A, or merge-base(A, B), to B |
@@ -32,6 +32,6 @@ jevrev --db review.db submit-github
 | `scan-github ORG/NAME --git-diff A..B` / `A...B` | the changes from A, or merge-base(A, B), to B |
 | `scan-github ORG/NAME --github-pr N` | pull request N's changes |
 
-Every scan leaves out files `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` matches, unless given `--no-ignore`.
+Every scan leaves out files `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` matches, unless given `--no-ignore`; `scan` given a file scans it regardless. `-i`/`--include` and `-e`/`--exclude` narrow any scan to the files their gitignore patterns match, or don't.
 
 GitHub is reached on the host `GH_HOST` names, `github.com` when unset, with the token in `GH_TOKEN` or `GITHUB_TOKEN` (`GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` on another host), or else the one `gh auth token` prints when `gh` is installed. A review records its host; `submit-github` posts there.

@@ -12,7 +12,7 @@ EXIT STATUS:
   2  Any error, including an unexpected exception
 
 COMMAND:
-  scan           Run jev over a directory's files on disk, whether or not it is in a git repository; print its findings and summary, and save them to a new db given --db
+  scan           Run jev over a file, or a directory's files, on disk, whether or not it is in a git repository; print its findings and summary, and save them to a new db given --db
   scan-git       Run jev over a git directory at a revision, or over a diff; print its findings and summary, and save them to a new db given --db
   scan-github    Run jev over a GitHub repo, through the GitHub API on the host GH_HOST names (github.com when unset); print its findings and summary, and save them to a new db given --db
   pending        Print each finding without a verdict as a line of JSON, its file relative to the source
@@ -24,11 +24,13 @@ COMMAND:
 
 ## `jevrev scan`
 ```
-DIR                       Directory to scan; findings are relative to it
+PATH                      File or directory to scan, symlinks followed; findings are relative to the directory, or the file's own; a file is scanned even when an ignore file matches it
 --rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
+-i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
+-e, --exclude <PATTERN>   Leave out files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns; wins over --include
 --metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
 --exit-zero               Exit 0 even when the scan has findings
 ```
@@ -42,6 +44,8 @@ DIR                       Directory in a git repository to scan; findings are re
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
+-i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
+-e, --exclude <PATTERN>   Leave out files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns; wins over --include
 --metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
 --exit-zero               Exit 0 even when the scan has findings
 ```
@@ -56,6 +60,8 @@ ORG/NAME                  GitHub repo to scan; findings are relative to its top
 --extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
 --ignore                  Leave out every file .gitignore, .ignore or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
+-i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
+-e, --exclude <PATTERN>   Leave out files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns; wins over --include
 --metadata <KEY> <VALUE>  Metadata stored with the review and printed by show; repeat for more keys; requires --db
 --exit-zero               Exit 0 even when the scan has findings
 ```

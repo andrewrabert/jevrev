@@ -2,6 +2,7 @@
 them."""
 
 import asyncio
+import collections
 import pathlib
 import typing
 
@@ -21,22 +22,32 @@ class Files(typing.Protocol):
 
 
 def walk(root: pathlib.Path) -> list[str]:
-    stack = [root]
+    """Every file under root, relative to it, skipping .git directories and following symlinks.
+    Each directory and file is listed once: one in root by its own path, so a symlink into root
+    is skipped; one outside by its shallowest path through a symlink, the first in sorted order
+    among those as deep. A symlink loop ends."""
+    top = root.resolve()
+    queue = collections.deque([root])
     found = []
-    while stack:
-        for path in stack.pop().iterdir():
-            if path.is_symlink():
+    seen = {top}
+    while queue:
+        for path in sorted(queue.popleft().iterdir()):
+            real = path.resolve()
+            if real in seen or (
+                path.is_symlink() and real.is_relative_to(top)
+            ):
                 continue
+            seen.add(real)
             if path.is_dir():
                 if path.name != ".git":
-                    stack.append(path)
+                    queue.append(path)
             elif path.is_file():
                 found.append(path.relative_to(root).as_posix())
     return sorted(found)
 
 
 class OnDisk:
-    """root's files on disk; symlinks and .git directories are skipped."""
+    """root's files on disk, as walk lists them."""
 
     def __init__(self, root: pathlib.Path):
         self.root = root.resolve()
@@ -48,15 +59,18 @@ class OnDisk:
         return await asyncio.to_thread((self.root / path).read_bytes)
 
 
-class InMemory:
-    def __init__(self, contents: dict[str, bytes]):
-        self.contents = contents
+class OneFile:
+    """One file on disk, by its name in its directory; a symlink is followed."""
+
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+        self.name = path.name
 
     async def paths(self) -> list[str]:
-        return sorted(self.contents)
+        return [self.name]
 
     async def read(self, path: str) -> bytes:
-        return self.contents[path]
+        return await asyncio.to_thread(self.path.read_bytes)
 
 
 def _spec(contents: bytes) -> pathspec.GitIgnoreSpec:

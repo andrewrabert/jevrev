@@ -79,10 +79,14 @@ class Diff(pydantic.RootModel[list[ChangedFile]]):
 
 
 def _changed_file(patch: pygit2.Patch, path: str) -> ChangedFile | None:
-    """The patch's added or modified text file, as path; None when it is removed, binary or not
-    UTF-8."""
+    """The patch's added or modified text file, as path; None when it is removed, binary, not
+    UTF-8 or a symlink, whose text is only its target's path."""
     delta = patch.delta
-    if delta.status == pygit2.enums.DeltaStatus.DELETED or delta.is_binary:
+    if (
+        delta.status == pygit2.enums.DeltaStatus.DELETED
+        or delta.is_binary
+        or delta.new_file.mode == pygit2.GIT_FILEMODE_LINK
+    ):
         return None
     changed = ChangedFile(
         path=path,
@@ -277,6 +281,16 @@ class _Repo:
         return Diff(files)
 
     def untracked(self, pathspecs: list[str], ignored: bool) -> list[str]:
+        """The untracked files under root in pathspecs, ignored ones too when ignored, relative
+        to root; never a symlink, or a file reached through one."""
+        return [
+            path
+            for path in self._untracked(pathspecs, ignored)
+            if (self.top / self.prefix / path).resolve()
+            == self.top / self.prefix / path
+        ]
+
+    def _untracked(self, pathspecs: list[str], ignored: bool) -> list[str]:
         if ignored:
             # libgit2 lists an ignored directory, not the files under it; the files are every
             # file on disk under root that the index does not hold.

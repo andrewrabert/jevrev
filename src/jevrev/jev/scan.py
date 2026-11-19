@@ -464,19 +464,32 @@ async def scan_states(
     rule_set=None,
     evaluate=None,
     all_added=False,
+    include: collections.abc.Sequence[str] = (),
+    exclude: collections.abc.Sequence[str] = (),
 ) -> list[jevrev.state.State]:
     """The states to ask jev about. `files` holds the reviewed version, and every path is
     relative to it. Without a diff, every file of `files` is reviewed whole; with one, its hunks
     are, their files read from `files`, and each of `untracked` whole, as added. With `ignore`,
     every path it matches is left out, from files' paths, diff's files and untracked alike;
-    None (--no-ignore) leaves none out."""
+    None (--no-ignore) leaves none out. Of the paths `ignore` leaves, only those an `include`
+    pattern matches are reviewed, or every one when there are none, and none an `exclude` pattern
+    matches; both are gitignore patterns relative to `files`. A rule set's `exists` still sees
+    every path `ignore` leaves."""
     evaluations = evaluate or [jevrev.state.Evaluation.HUNK]
     if diff is None and (evaluate is not None or all_added):
         raise UserError("evaluate and all_added need a diff")
     paths = await files.paths()
     if ignore is not None:
         paths = [path for path in paths if not ignore.matches(path)]
-    present = set(paths)
+    included = pathspec.GitIgnoreSpec.from_lines(include)
+    excluded = pathspec.GitIgnoreSpec.from_lines(exclude)
+    reviewed = [
+        path
+        for path in paths
+        if (not include or included.match_file(path))
+        and not excluded.match_file(path)
+    ]
+    present = set(reviewed)
     sets = _sets_among(
         tuple(
             {
@@ -488,7 +501,7 @@ async def scan_states(
         paths,
     )
     if diff is None:
-        sources = await _texts(files, paths, _in_whole_scan)
+        sources = await _texts(files, reviewed, _in_whole_scan)
         scanned = _merge_constants(
             [
                 state

@@ -148,6 +148,8 @@ async def _scan_and_save(
     found, summary = await _run_jev_scan(
         files=files,
         ignore=ignore,
+        include=args.include,
+        exclude=args.exclude,
         diff=diff,
         untracked=untracked,
         rules=args.rules,
@@ -157,6 +159,8 @@ async def _scan_and_save(
     review = jevrev.db.Review(
         source=source,
         metadata=metadata,
+        include=args.include,
+        exclude=args.exclude,
         findings=[
             jevrev.db.Finding(**finding.model_dump(), index=index)
             for index, finding in enumerate(found, 1)
@@ -210,17 +214,28 @@ def _print_findings(findings: list[jevrev.db.Finding], summary: str):
 
 
 async def _cmd_scan(args):
-    """Review DIR's files on disk, whether or not DIR is in a git repository."""
+    """Review PATH's files on disk, whether or not PATH is in a git repository. A file is
+    reviewed by its name, even when an ignore file matches it."""
     metadata = _scan_metadata(args)
-    root = _local_dir(args.dir)
-    files = jevrev.files.OnDisk(root)
+    path: pathlib.Path = args.path
+    if path.is_dir():
+        root = path.resolve()
+        files: jevrev.files.Files = jevrev.files.OnDisk(root)
+        ignore = await _local_ignore(args, root=root, files=files, commit=None)
+    elif path.is_file():
+        # Its directory resolved, its own name kept, as a symlink's is its own.
+        root = path.absolute().parent.resolve() / path.name
+        files = jevrev.files.OneFile(root)
+        ignore = None
+    else:
+        raise UserError(f"{path}: no such file or directory")
     return await _scan_and_save(
         args,
         metadata=metadata,
         source=jevrev.db.LocalDir(path=root),
         name=str(root),
         files=files,
-        ignore=await _local_ignore(args, root=root, files=files, commit=None),
+        ignore=ignore,
     )
 
 
@@ -355,6 +370,8 @@ async def _cmd_scan_github(args):
 async def _run_jev_scan(
     files: jevrev.files.Files,
     ignore: jevrev.files.Ignore | None,
+    include: list[str],
+    exclude: list[str],
     diff: jevrev.git.Diff | None,
     untracked: collections.abc.Sequence[str],
     rules: pathlib.Path,
@@ -382,6 +399,8 @@ async def _run_jev_scan(
                 diff=diff,
                 untracked=untracked,
                 extra_rules=extra_rules,
+                include=include,
+                exclude=exclude,
                 evaluate=None
                 if diff is None
                 else [
@@ -579,7 +598,9 @@ def _front_matter(review: jevrev.db.Review) -> str:
         **review.model_dump(
             mode="json",
             exclude={"findings"}
-            | (set() if review.metadata else {"metadata"}),
+            | (set() if review.metadata else {"metadata"})
+            | (set() if review.include else {"include"})
+            | (set() if review.exclude else {"exclude"}),
             exclude_none=True,
         ),
         "findings": len(review.findings),
@@ -775,6 +796,25 @@ def _add_scan_arguments(parser):
         help="Scan files an ignore file matches too",
     )
     parser.add_argument(
+        "-i",
+        "--include",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Scan only files PATTERN matches, in gitignore syntax relative "
+        "to the source, of those the ignore files leave; repeat for more "
+        "patterns, any of which may match",
+    )
+    parser.add_argument(
+        "-e",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Leave out files PATTERN matches, in gitignore syntax relative "
+        "to the source; repeat for more patterns; wins over --include",
+    )
+    parser.add_argument(
         "--metadata",
         nargs=2,
         action="append",
@@ -822,18 +862,20 @@ def _parser():
     )
 
     description = (
-        "Run jev over a directory's files on disk, whether or not it is in a "
-        "git repository; print its findings and summary, and save them to a "
-        "new db given --db"
+        "Run jev over a file, or a directory's files, on disk, whether or not "
+        "it is in a git repository; print its findings and summary, and save "
+        "them to a new db given --db"
     )
     scan_parser = subparsers.add_parser(
         "scan", help=description, description=description
     )
     scan_parser.add_argument(
-        "dir",
+        "path",
         type=pathlib.Path,
-        metavar="DIR",
-        help="Directory to scan; findings are relative to it",
+        metavar="PATH",
+        help="File or directory to scan, symlinks followed; findings are "
+        "relative to the directory, or the file's own; a file is scanned "
+        "even when an ignore file matches it",
     )
     _add_scan_arguments(scan_parser)
 
@@ -986,6 +1028,7 @@ def cli():
         jevrev.github.api.GithubError,
         jevrev.git.GitError,
         jevrev.db.OperationalError,
+        OSError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(_EXIT_ERROR)
