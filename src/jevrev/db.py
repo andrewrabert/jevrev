@@ -1,10 +1,11 @@
-"""A review's SQLite db: the review, the pull request it is of, and its
+"""A review's SQLite db: the review's source, the version of it reviewed, its metadata and its
 findings, each in a table of its own."""
 
 import contextlib
 import enum
 import pathlib
 import sqlite3
+import typing
 
 import pydantic
 
@@ -23,40 +24,64 @@ class Verdict(enum.StrEnum):
     REJECTED = "rejected"
 
 
+# A finding's position in the scan's findings, from 1.
+type FindingIndex = typing.Annotated[int, pydantic.Field(ge=1)]
+
+type VerdictReason = str
+
+
 class Finding(jevrev.jev.scan.Finding):
-    """A jevrev.jev.scan finding, its file relative to the review's dir, with its
-    index in the scan's findings, from 1, and its verdict once it has one."""
+    """A jevrev.jev.scan finding, its file relative to the review's source, with its index and
+    its verdict once it has one."""
 
-    index: int
+    index: FindingIndex
     verdict: Verdict | None = None
-    reason: str | None = None
+    reason: VerdictReason | None = None
 
 
-class PullRequestSource(pydantic.BaseModel):
-    """The pull request a review's dir is a clone of, at its head."""
+type MetadataKey = typing.Annotated[
+    str, pydantic.StringConstraints(min_length=1)
+]
 
-    repo: jevrev.github.repo.GithubRepo
-    pr: jevrev.github.pull_request.GithubPRNumber
-    head_sha: jevrev.git.GitSha
-    target: str
-    target_sha: jevrev.git.GitSha
-    merge_base: jevrev.git.GitSha
+# A --metadata value given to scan; may be empty.
+type MetadataValue = str
 
 
-class Review(pydantic.BaseModel):
-    """One scan of a directory and the verdicts on its findings."""
+class LocalDir(pydantic.BaseModel):
+    """A directory reviewed as its files on disk."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    dir: pathlib.Path
-    # The revision the change is from; None when full.
-    base: str | None = None
-    # Whether jev scanned every file of the dir, not the change from base.
-    full: bool = False
-    # Set when the dir is a clone of a pull request.
-    pull_request: PullRequestSource | None = None
-    # The --metadata KEY=VALUE pairs given to scan.
-    metadata: dict[str, str] = {}
+    path: pathlib.Path
+
+
+class LocalGitDir(pydantic.BaseModel):
+    """A git directory reviewed at git."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    path: pathlib.Path
+    git: jevrev.git.GitRev | jevrev.git.GitDiff | jevrev.git.GitDiffToDisk
+
+
+class GithubRepo(jevrev.github.repo.GithubRepo):
+    """A GitHub repo, on the host scan-github resolved, reviewed at git."""
+
+    git: (
+        jevrev.git.GitRev
+        | jevrev.git.GitDiff
+        | jevrev.github.pull_request.GithubPullRequest
+    )
+
+
+class Review(pydantic.BaseModel):
+    """One scan and the verdicts on its findings; findings' files are relative to the
+    source."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    source: LocalDir | LocalGitDir | GithubRepo
+    metadata: dict[MetadataKey, MetadataValue] = {}
     # jevrev.jev.scan's findings, in its order.
     findings: list[Finding]
 
@@ -65,29 +90,54 @@ def _one_of(column: str, values: type[enum.StrEnum]) -> str:
     return f"{column} IN ({', '.join(repr(v.value) for v in values)})"
 
 
+# One single-row table for each kind of source and each kind of selection: a review's db holds
+# one source row and, unless the source is a LocalDir, one selection row.
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS review (
-    id INTEGER PRIMARY KEY CHECK (id = 0),
-    dir TEXT NOT NULL,
-    base TEXT,
-    full INTEGER NOT NULL CHECK (full IN (0, 1))
+    id INTEGER PRIMARY KEY CHECK (id = 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS local_dir (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    path TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS local_git_dir (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    path TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS github_repo (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    host TEXT NOT NULL,
+    org TEXT NOT NULL,
+    name TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS git_rev (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    "commit" TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS git_diff (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    base TEXT NOT NULL,
+    head TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS git_diff_to_disk (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
+    base TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS github_pull_request (
+    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES git_diff (id),
+    number INTEGER NOT NULL CHECK (number > 0)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS pull_request (
-    id INTEGER PRIMARY KEY CHECK (id = 0) REFERENCES review (id),
-    host TEXT NOT NULL,
-    org TEXT NOT NULL,
-    name TEXT NOT NULL,
-    pr INTEGER NOT NULL CHECK (pr > 0),
-    head_sha TEXT NOT NULL,
-    target TEXT NOT NULL,
-    target_sha TEXT NOT NULL,
-    merge_base TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS finding (
@@ -108,13 +158,83 @@ CREATE TABLE IF NOT EXISTS finding (
 ) STRICT;
 """
 
-_FINDING_COLUMNS = list(Finding.model_fields)
-_PULL_REQUEST_COLUMNS = [
-    "host",
-    "org",
-    "name",
-    *(f for f in PullRequestSource.model_fields if f != "repo"),
-]
+
+class _Row(pydantic.BaseModel):
+    """A row of table, its fields its columns."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    table: typing.ClassVar[str]
+
+
+class _SingleRow(_Row):
+    """A row of a table that holds at most one."""
+
+    id: typing.Literal[0] = 0
+
+
+class _ReviewRow(_SingleRow):
+    table = "review"
+
+
+class _LocalDirRow(_SingleRow):
+    table = "local_dir"
+
+    path: pathlib.Path
+
+
+class _LocalGitDirRow(_SingleRow):
+    table = "local_git_dir"
+
+    path: pathlib.Path
+
+
+class _GithubRepoRow(_SingleRow, jevrev.github.repo.GithubRepo):
+    table = "github_repo"
+
+
+class _GitRevRow(_SingleRow, jevrev.git.GitRev):
+    table = "git_rev"
+
+
+class _GitDiffRow(_SingleRow, jevrev.git.GitDiff):
+    table = "git_diff"
+
+
+class _GitDiffToDiskRow(_SingleRow, jevrev.git.GitDiffToDisk):
+    table = "git_diff_to_disk"
+
+
+class _GithubPullRequestRow(_SingleRow):
+    table = "github_pull_request"
+
+    number: jevrev.github.pull_request.GithubPRNumber
+
+
+class _MetadataRow(_Row):
+    table = "metadata"
+
+    key: MetadataKey
+    value: MetadataValue
+
+
+class _FindingRow(_Row, Finding):
+    table = "finding"
+
+
+# Child tables first, so a delete never leaves a row its parent's delete would orphan.
+_ROWS: tuple[type[_Row], ...] = (
+    _FindingRow,
+    _MetadataRow,
+    _GithubPullRequestRow,
+    _GitDiffToDiskRow,
+    _GitDiffRow,
+    _GitRevRow,
+    _GithubRepoRow,
+    _LocalGitDirRow,
+    _LocalDirRow,
+    _ReviewRow,
+)
 
 
 def _quoted(columns: list[str]) -> str:
@@ -129,70 +249,147 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
 
-    def load(self) -> Review | None:
-        """The review; None when the db holds no review."""
-        row = self.db.execute("SELECT dir, base, full FROM review").fetchone()
-        if row is None:
-            return None
-        pull_request = None
-        if pr := self.db.execute(
-            f"SELECT {_quoted(_PULL_REQUEST_COLUMNS)} FROM pull_request"
-        ).fetchone():
-            pull_request = PullRequestSource(
-                repo=jevrev.github.repo.GithubRepo(
-                    host=pr["host"], org=pr["org"], name=pr["name"]
-                ),
-                pr=pr["pr"],
-                head_sha=pr["head_sha"],
-                target=pr["target"],
-                target_sha=pr["target_sha"],
-                merge_base=pr["merge_base"],
-            )
-        return Review(
-            dir=row["dir"],
-            base=row["base"],
-            full=row["full"],
-            pull_request=pull_request,
-            metadata=dict(
-                self.db.execute("SELECT key, value FROM metadata ORDER BY key")
-            ),
-            findings=[
-                Finding.model_validate(dict(finding))
-                for finding in self.db.execute(
-                    f'SELECT {_quoted(_FINDING_COLUMNS)} FROM finding ORDER BY "index"'
+    def _rows[R: _Row](
+        self, model: type[R], order: str | None = None
+    ) -> list[R]:
+        """Every row of model's table, each validated as model; order names the column they are
+        sorted by."""
+        columns = list(model.model_fields)
+        query = f"SELECT {_quoted(columns)} FROM {model.table}"
+        if order is not None:
+            query += f" ORDER BY {_quoted([order])}"
+        try:
+            return [
+                model.model_validate(dict(row))
+                for row in self.db.execute(query)
+            ]
+        except pydantic.ValidationError as e:
+            raise OperationalError(f"{model.table}: {e}") from e
+
+    def _single[R: _SingleRow](self, model: type[R]) -> R | None:
+        rows = self._rows(model)
+        return rows[0] if rows else None
+
+    def _insert(self, row: _Row):
+        values = row.model_dump(mode="json")
+        self.db.execute(
+            f"INSERT INTO {row.table} ({_quoted(list(values))}) "
+            f"VALUES ({', '.join(':' + column for column in values)})",
+            values,
+        )
+
+    def _selection(
+        self,
+    ) -> (
+        jevrev.git.GitRev
+        | jevrev.git.GitDiff
+        | jevrev.git.GitDiffToDisk
+        | jevrev.github.pull_request.GithubPullRequest
+        | None
+    ):
+        found = []
+        if rev := self._single(_GitRevRow):
+            found.append(jevrev.git.GitRev(commit=rev.commit))
+        if diff := self._single(_GitDiffRow):
+            if pr := self._single(_GithubPullRequestRow):
+                found.append(
+                    jevrev.github.pull_request.GithubPullRequest(
+                        base=diff.base, head=diff.head, number=pr.number
+                    )
                 )
+            else:
+                found.append(
+                    jevrev.git.GitDiff(base=diff.base, head=diff.head)
+                )
+        if to_disk := self._single(_GitDiffToDiskRow):
+            found.append(jevrev.git.GitDiffToDisk(base=to_disk.base))
+        if len(found) > 1:
+            raise OperationalError("the db holds more than one selection")
+        return found[0] if found else None
+
+    def _source(self) -> LocalDir | LocalGitDir | GithubRepo:
+        selection = self._selection()
+        found = []
+        if local := self._single(_LocalDirRow):
+            if selection is not None:
+                raise OperationalError(
+                    "the db holds a selection of a local dir"
+                )
+            found.append(LocalDir(path=local.path))
+        if local_git := self._single(_LocalGitDirRow):
+            found.append(LocalGitDir(path=local_git.path, git=selection))
+        if github := self._single(_GithubRepoRow):
+            found.append(
+                GithubRepo(
+                    host=github.host,
+                    org=github.org,
+                    name=github.name,
+                    git=selection,
+                )
+            )
+        if len(found) != 1:
+            raise OperationalError("the db does not hold exactly one source")
+        return found[0]
+
+    def load(self) -> Review | None:
+        if self._single(_ReviewRow) is None:
+            return None
+        try:
+            source = self._source()
+        except pydantic.ValidationError as e:
+            raise OperationalError(
+                f"the db holds an invalid source: {e}"
+            ) from e
+        return Review(
+            source=source,
+            metadata={
+                row.key: row.value
+                for row in self._rows(_MetadataRow, order="key")
+            },
+            findings=[
+                Finding.model_validate(row.model_dump())
+                for row in self._rows(_FindingRow, order="index")
             ],
         )
 
+    def _save_selection(
+        self,
+        selection: jevrev.git.GitRev
+        | jevrev.git.GitDiff
+        | jevrev.git.GitDiffToDisk,
+    ):
+        match selection:
+            case jevrev.git.GitRev(commit=commit):
+                self._insert(_GitRevRow(commit=commit))
+            case jevrev.git.GitDiff(base=base, head=head):
+                self._insert(_GitDiffRow(base=base, head=head))
+                if isinstance(
+                    selection, jevrev.github.pull_request.GithubPullRequest
+                ):
+                    self._insert(
+                        _GithubPullRequestRow(number=selection.number)
+                    )
+            case jevrev.git.GitDiffToDisk(base=base):
+                self._insert(_GitDiffToDiskRow(base=base))
+
     def save(self, review: Review):
         """Replace whatever review the db holds with review."""
-        self.db.execute("DELETE FROM finding")
-        self.db.execute("DELETE FROM pull_request")
-        self.db.execute("DELETE FROM metadata")
-        self.db.execute("DELETE FROM review")
-        self.db.execute(
-            "INSERT INTO review (id, dir, base, full) VALUES (0, ?, ?, ?)",
-            (str(review.dir), review.base, review.full),
-        )
-        self.db.executemany(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            review.metadata.items(),
-        )
-        if (source := review.pull_request) is not None:
-            row = {
-                **source.repo.model_dump(mode="json"),
-                **source.model_dump(mode="json", exclude={"repo"}),
-            }
-            self.db.execute(
-                f"INSERT INTO pull_request (id, {_quoted(_PULL_REQUEST_COLUMNS)}) "
-                f"VALUES (0, {', '.join(':' + c for c in _PULL_REQUEST_COLUMNS)})",
-                row,
-            )
-        self.db.executemany(
-            f"INSERT INTO finding ({_quoted(_FINDING_COLUMNS)}) "
-            f"VALUES ({', '.join(':' + c for c in _FINDING_COLUMNS)})",
-            [finding.model_dump(mode="json") for finding in review.findings],
-        )
+        for model in _ROWS:
+            self.db.execute(f"DELETE FROM {model.table}")
+        self._insert(_ReviewRow())
+        match review.source:
+            case LocalDir(path=path):
+                self._insert(_LocalDirRow(path=path))
+            case LocalGitDir(path=path, git=selection):
+                self._insert(_LocalGitDirRow(path=path))
+                self._save_selection(selection)
+            case GithubRepo(host=host, org=org, name=name, git=selection):
+                self._insert(_GithubRepoRow(host=host, org=org, name=name))
+                self._save_selection(selection)
+        for key, value in review.metadata.items():
+            self._insert(_MetadataRow(key=key, value=value))
+        for finding in review.findings:
+            self._insert(_FindingRow.model_validate(finding.model_dump()))
 
 
 @contextlib.contextmanager

@@ -20,8 +20,22 @@ class User(pydantic.BaseModel):
 
 
 class PullRequest(pydantic.BaseModel):
-    author: User
-    base_ref_name: str
+    """A pull request as GET /repos/O/R/pulls/N gives it: its author, its head, and the head of
+    the branch it merges into."""
+
+    author: User = pydantic.Field(validation_alias="user")
+    head: jevrev.git.GitObjectId = pydantic.Field(
+        validation_alias=pydantic.AliasPath("head", "sha")
+    )
+    target: jevrev.git.GitObjectId = pydantic.Field(
+        validation_alias=pydantic.AliasPath("base", "sha")
+    )
+
+
+class GithubPullRequest(jevrev.git.GitDiff):
+    """A pull request's changes: base is merge-base(target, head), head is the PR's head."""
+
+    number: GithubPRNumber
 
 
 class LineReviewComment(pydantic.BaseModel):
@@ -53,7 +67,7 @@ class NewReview(pydantic.BaseModel):
     """A review to post: its body and its comments, on commit_id, submitted
     as event."""
 
-    commit_id: jevrev.git.GitSha
+    commit_id: jevrev.git.GitObjectId
     event: ReviewEvent
     body: str
     comments: list[ReviewComment]
@@ -63,7 +77,7 @@ class PendingReviewInput(pydantic.BaseModel):
     """The REST body that starts a pending review: the API takes only line
     comments here, so file comments are added to it as threads."""
 
-    commit_id: jevrev.git.GitSha
+    commit_id: jevrev.git.GitObjectId
     body: str
     comments: list[LineReviewComment]
 

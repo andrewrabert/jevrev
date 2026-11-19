@@ -10,21 +10,20 @@ import enum
 import os
 import pathlib
 import sys
-import tempfile
 
 import minijinja
 import pydantic
 import yaml
 
 import jevrev.db
+import jevrev.files
 import jevrev.git
-import jevrev.github.gh
+import jevrev.github.api
 import jevrev.github.pull_request
 import jevrev.github.repo
 import jevrev.jev.api
 import jevrev.jev.ask
 import jevrev.jev.scan
-import jevrev.process
 import jevrev.settings
 import jevrev.state
 import jevrev.templates
@@ -67,7 +66,6 @@ def _open_review(path: pathlib.Path):
 
 
 def _judged_review(args) -> jevrev.db.Review:
-    """The review in the db. Fails while any finding has no verdict."""
     with _open_review(args.db) as store:
         review = _load_review(store)
     if unjudged := [
@@ -79,40 +77,14 @@ def _judged_review(args) -> jevrev.db.Review:
     return review
 
 
-async def _clone_pull_request(
-    repo: jevrev.github.repo.GithubRepo,
-    pr: jevrev.github.pull_request.GithubPRNumber,
-    dest: pathlib.Path,
-) -> jevrev.db.PullRequestSource:
-    """Clone the pull request to dest, its head checked out."""
-    target = (await jevrev.github.gh.gh.pull_request(repo, pr)).base_ref_name
-    await jevrev.github.gh.gh.clone(
-        repo=repo, dest=dest, git_args=["--no-checkout"]
-    )
-    await jevrev.git.git.fetch(dest, f"+refs/pull/{pr}/head:refs/pr/{pr}/head")
-    head_sha, target_sha = await jevrev.git.git.rev_parse(
-        dest, [f"refs/pr/{pr}/head", f"refs/remotes/origin/{target}"]
-    )
-    merge_base = await jevrev.git.git.merge_base(
-        root=dest, first=head_sha, second=target_sha
-    )
-    await jevrev.git.git.checkout_detached(dest, head_sha)
-    return jevrev.db.PullRequestSource(
-        repo=repo,
-        pr=pr,
-        head_sha=head_sha,
-        target=target,
-        target_sha=target_sha,
-        merge_base=merge_base,
-    )
-
-
-async def _cmd_scan(args):
+def _scan_metadata(args) -> dict[str, str]:
     db: pathlib.Path = args.db
     if db.exists():
         raise UserError(f"{db} already exists")
     if args.rules is None:
         raise UserError("Give --rules or set JEV_RULES_DIR.")
+    if any(key == "" for key, _ in args.metadata):
+        raise UserError("--metadata: a key is empty")
     metadata = dict(args.metadata)
     if len(metadata) != len(args.metadata):
         keys = [key for key, _ in args.metadata]
@@ -120,56 +92,61 @@ async def _cmd_scan(args):
             "--metadata: keys given more than once: "
             + ", ".join(sorted({k for k in keys if keys.count(k) > 1}))
         )
-    pull_request = None
-    if args.repo is not None:
-        if args.pr is None:
-            raise UserError("--repo requires --pr.")
-        if args.base is not None:
-            raise UserError("--base requires --dir.")
-        if args.cache_dir is not None:
-            args.cache_dir.mkdir(parents=True, exist_ok=True)
-        root = pathlib.Path(
-            tempfile.mkdtemp(prefix="jevrev-", dir=args.cache_dir)
-        ).resolve()
-        pull_request = await _clone_pull_request(
-            repo=args.repo, pr=args.pr, dest=root
-        )
-        base = None if args.full else pull_request.merge_base
-    else:
-        if args.pr is not None:
-            raise UserError("--pr requires --repo.")
-        if (args.base is None) != args.full:
-            raise UserError("--dir requires one of --base or --full.")
-        root = args.dir.resolve()
-        base = args.base
-    evaluate = None
-    if base is not None:
-        evaluate = [
-            jevrev.state.Evaluation.HUNK,
-            jevrev.state.Evaluation.FILE,
-        ]
+    return metadata
+
+
+def _local_dir(path: pathlib.Path) -> pathlib.Path:
+    root = path.resolve()
+    if not root.is_dir():
+        raise UserError(f"{path} is not a directory")
+    return root
+
+
+async def _local_ignore(
+    args,
+    root: pathlib.Path,
+    files: jevrev.files.Files,
+    commit: jevrev.git.GitObjectId | None,
+) -> jevrev.files.Ignore | None:
+    if not args.ignore:
+        return None
+    prefix, above = await jevrev.git.git.ignore_files_above(root, commit)
+    return await jevrev.files.Ignore.load(
+        files,
+        excludes=await jevrev.git.git.excludes(root),
+        prefix=prefix,
+        above=above,
+    )
+
+
+async def _scan_and_save(
+    args,
+    metadata: dict[str, str],
+    source: jevrev.db.LocalDir | jevrev.db.LocalGitDir | jevrev.db.GithubRepo,
+    name: str,
+    files: jevrev.files.Files,
+    ignore: jevrev.files.Ignore | None,
+    diff: jevrev.git.Diff | None = None,
+    untracked: collections.abc.Sequence[str] = (),
+):
     found, summary = await _run_jev_scan(
-        root=root,
+        files=files,
+        ignore=ignore,
+        diff=diff,
+        untracked=untracked,
         rules=args.rules,
         extra_rules=args.extra_rules,
-        base=base,
-        evaluate=evaluate,
+        name=name,
     )
     review = jevrev.db.Review(
-        dir=root,
-        base=base,
-        full=args.full,
-        pull_request=pull_request,
+        source=source,
         metadata=metadata,
         findings=[
-            jevrev.db.Finding(
-                **finding.model_dump(exclude={"file"}),
-                file=str(pathlib.Path(finding.file).relative_to(root)),
-                index=index,
-            )
+            jevrev.db.Finding(**finding.model_dump(), index=index)
             for index, finding in enumerate(found, 1)
         ],
     )
+    db: pathlib.Path = args.db
     try:
         with jevrev.db.open_db(db) as store:
             store.save(review)
@@ -179,10 +156,160 @@ async def _cmd_scan(args):
     print(summary)
 
 
-async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
-    """Run jev-scan on root against the rule sets under rules and each of
-    extra_rules: its findings, and its summary line. Fails if any jev
-    request fails."""
+async def _cmd_scan(args):
+    """Review DIR's files on disk, whether or not DIR is in a git repository."""
+    metadata = _scan_metadata(args)
+    root = _local_dir(args.dir)
+    files = jevrev.files.OnDisk(root)
+    await _scan_and_save(
+        args,
+        metadata=metadata,
+        source=jevrev.db.LocalDir(path=root),
+        name=str(root),
+        files=files,
+        ignore=await _local_ignore(args, root=root, files=files, commit=None),
+    )
+
+
+async def _cmd_scan_git(args):
+    """Review DIR at --git-rev or --git-diff, resolved to object ids before jev runs. Never
+    writes to DIR, its repository or its HEAD."""
+    metadata = _scan_metadata(args)
+    root = _local_dir(args.dir)
+    if not await jevrev.git.git.in_work_tree(root):
+        raise UserError(f"{root} is not in a git repository")
+    diff = None
+    untracked: list[str] = []
+    if args.git_rev is not None:
+        selection = await jevrev.git.git.resolve_rev(root, args.git_rev)
+        files = jevrev.git.CommitFiles(root, selection.commit)
+        commit = selection.commit
+    else:
+        selection = await jevrev.git.git.resolve_diff(root, args.git_diff)
+        match selection:
+            case jevrev.git.GitDiff(base=base, head=head):
+                files = jevrev.git.CommitFiles(root, head)
+                commit = head
+                diff = await jevrev.git.git.diff_commits(
+                    root=root,
+                    base=base,
+                    head=head,
+                    context=jevrev.jev.scan.DIFF_CONTEXT,
+                    inter_hunk_context=0,
+                )
+            case jevrev.git.GitDiffToDisk(base=base):
+                files = jevrev.files.OnDisk(root)
+                commit = None
+                diff = await jevrev.git.git.diff_work_tree(
+                    root=root,
+                    revision=base,
+                    context=jevrev.jev.scan.DIFF_CONTEXT,
+                    pathspecs=["."],
+                )
+                untracked = await jevrev.git.git.untracked_files(
+                    root, ["."], ignored=not args.ignore
+                )
+    await _scan_and_save(
+        args,
+        metadata=metadata,
+        source=jevrev.db.LocalGitDir(path=root, git=selection),
+        name=str(root),
+        files=files,
+        ignore=await _local_ignore(
+            args, root=root, files=files, commit=commit
+        ),
+        diff=diff,
+        untracked=untracked,
+    )
+
+
+async def _github_client(host: str) -> jevrev.github.api.Client:
+    return jevrev.github.api.Client(
+        host=host, token=await jevrev.github.api.token(host)
+    )
+
+
+async def _github_selection(
+    args,
+    client: jevrev.github.api.Client,
+    repo: jevrev.github.repo.GithubRepo,
+) -> (
+    jevrev.git.GitRev
+    | jevrev.git.GitDiff
+    | jevrev.github.pull_request.GithubPullRequest
+):
+    if args.github_pr is not None:
+        pull_request = await client.pull_request(repo, args.github_pr)
+        return jevrev.github.pull_request.GithubPullRequest(
+            base=await client.merge_base(
+                repo, pull_request.target, pull_request.head
+            ),
+            head=pull_request.head,
+            number=args.github_pr,
+        )
+    if args.git_diff is not None:
+        spec: jevrev.git.GitDiffSpec = args.git_diff
+        base = await client.commit(repo, spec.base)
+        head = await client.commit(repo, spec.head)
+        if spec.merge_base:
+            base = await client.merge_base(repo, base, head)
+        return jevrev.git.GitDiff(base=base, head=head)
+    if args.git_rev is not None:
+        return jevrev.git.GitRev(
+            commit=await client.commit(repo, args.git_rev)
+        )
+    return jevrev.git.GitRev(commit=await client.default_branch_head(repo))
+
+
+async def _cmd_scan_github(args):
+    """Review a GitHub repo through the GitHub API on the host GH_HOST names."""
+    metadata = _scan_metadata(args)
+    if args.git_diff is not None and args.git_diff.head is None:
+        raise UserError(
+            "--git-diff: give A..B or A...B; a GitHub repo has no files on disk"
+        )
+    repo: jevrev.github.repo.GithubRepo = args.github
+    async with await _github_client(repo.host) as client:
+        selection = await _github_selection(args, client=client, repo=repo)
+        diff = None
+        if isinstance(selection, jevrev.git.GitRev):
+            files = await client.tarball(repo, selection.commit)
+        else:
+            files = await client.tree(repo, selection.head)
+            diff = await client.diff(
+                repo,
+                base=selection.base,
+                head=selection.head,
+                context=jevrev.jev.scan.DIFF_CONTEXT,
+                inter_hunk_context=0,
+            )
+        ignore = None
+        if args.ignore:
+            ignore = await jevrev.files.Ignore.load(
+                files, excludes=await jevrev.git.git.global_excludes()
+            )
+        await _scan_and_save(
+            args,
+            metadata=metadata,
+            source=jevrev.db.GithubRepo(**repo.model_dump(), git=selection),
+            name=f"{repo.host}/{repo.org}/{repo.name}",
+            files=files,
+            ignore=ignore,
+            diff=diff,
+        )
+
+
+async def _run_jev_scan(
+    files: jevrev.files.Files,
+    ignore: jevrev.files.Ignore | None,
+    diff: jevrev.git.Diff | None,
+    untracked: collections.abc.Sequence[str],
+    rules: pathlib.Path,
+    extra_rules: list[pathlib.Path],
+    name: str,
+):
+    """Run jev-scan on files against the rule sets under rules and each of extra_rules: its
+    findings, and its summary line. Fails if any jev request fails."""
     settings = jevrev.settings.load_settings()
     if settings.api_key is None:
         raise UserError(
@@ -195,16 +322,22 @@ async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     )
     try:
         async with asyncio.timeout(_JEV_SCAN_TIMEOUT):
-            root, scanned = await jevrev.jev.scan.scan_states(
+            scanned = await jevrev.jev.scan.scan_states(
                 rules,
-                root=root,
+                files=files,
+                ignore=ignore,
+                diff=diff,
+                untracked=untracked,
                 extra_rules=extra_rules,
-                base=base,
-                evaluate=evaluate,
+                evaluate=None
+                if diff is None
+                else [
+                    jevrev.state.Evaluation.HUNK,
+                    jevrev.state.Evaluation.FILE,
+                ],
             )
             found, failures = await jevrev.jev.scan.review(
                 scanned=scanned,
-                root=root,
                 concurrency=_JEV_SCAN_CONCURRENCY,
                 verbose=False,
                 client=client,
@@ -226,7 +359,7 @@ async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
             + "\n".join(failures)
         )
     summary = jevrev.jev.scan.summary_line(
-        scanned=scanned, root=root, found=found, failures=failures
+        scanned=scanned, source=name, found=found, failures=failures
     )
     return found, summary
 
@@ -287,29 +420,39 @@ async def _cmd_show(args):
 
 async def _cmd_submit_github(args):
     review = _judged_review(args)
-    source = review.pull_request
-    if source is None:
-        raise UserError("The review is not of a pull request.")
+    source = review.source
+    if not isinstance(source, jevrev.db.GithubRepo) or not isinstance(
+        source.git, jevrev.github.pull_request.GithubPullRequest
+    ):
+        raise UserError("The review is not of a GitHub pull request.")
     if not _confirmed(review.findings):
         print("No confirmed findings; no GitHub review submitted.")
         return
-    gh = jevrev.github.gh.gh
-    pull_request = await gh.pull_request(source.repo, source.pr)
-    user = await gh.current_user(source.repo.host)
-    url = await gh.post_review(
-        repo=source.repo,
-        pr=source.pr,
-        review=_pr_review(
-            source=source,
-            findings=review.findings,
-            hunks=await _github_hunks(review.dir, source),
-            # GitHub refuses a request for changes on one's own pull
-            # request.
-            event=jevrev.github.pull_request.ReviewEvent.COMMENT
-            if pull_request.author.login == user.login
-            else jevrev.github.pull_request.ReviewEvent.REQUEST_CHANGES,
-        ),
-    )
+    pr = source.git
+    async with await _github_client(source.host) as client:
+        pull_request = await client.pull_request(source, pr.number)
+        user = await client.current_user()
+        diff = await client.diff(
+            source,
+            base=pr.base,
+            head=pr.head,
+            context=_GITHUB_DIFF_CONTEXT,
+            inter_hunk_context=_GITHUB_INTER_HUNK_CONTEXT,
+        )
+        url = await client.post_review(
+            repo=source,
+            pr=pr.number,
+            review=_pr_review(
+                head=pr.head,
+                findings=review.findings,
+                hunks=_github_hunks(diff),
+                # GitHub refuses a request for changes on one's own pull
+                # request.
+                event=jevrev.github.pull_request.ReviewEvent.COMMENT
+                if pull_request.author.login == user.login
+                else jevrev.github.pull_request.ReviewEvent.REQUEST_CHANGES,
+            ),
+        )
     print(url)
 
 
@@ -412,18 +555,9 @@ def _review_text(review: jevrev.db.Review) -> str:
     )
 
 
-async def _github_hunks(
-    root: pathlib.Path, source: jevrev.db.PullRequestSource
-) -> dict[str, list[range]]:
+def _github_hunks(diff: jevrev.git.Diff) -> dict[str, list[range]]:
     """The head's lines of each hunk of the pull request's diff as GitHub
     shows it, by path: the lines a review comment can be left on."""
-    diff = await jevrev.git.git.diff_commits(
-        root=root,
-        base=source.merge_base,
-        head=source.head_sha,
-        context=_GITHUB_DIFF_CONTEXT,
-        inter_hunk_context=_GITHUB_INTER_HUNK_CONTEXT,
-    )
     return {
         file.path: [
             range(hunk.target_start, hunk.target_start + hunk.target_length)
@@ -437,8 +571,6 @@ async def _github_hunks(
 def _pr_comment(
     f: jevrev.db.Finding, hunks: dict[str, list[range]]
 ) -> jevrev.github.pull_request.ReviewComment:
-    """A comment on f's lines within the first GitHub hunk they overlap, or
-    on its file when f is a file finding or overlaps none."""
     body = _render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
     )
@@ -496,7 +628,7 @@ def _pr_review_body(
 
 
 def _pr_review(
-    source: jevrev.db.PullRequestSource,
+    head: jevrev.git.GitObjectId,
     findings: list[jevrev.db.Finding],
     hunks: dict[str, list[range]],
     event: jevrev.github.pull_request.ReviewEvent,
@@ -507,7 +639,7 @@ def _pr_review(
     inside = [f for f in found if f.file in hunks]
     outside = [f for f in found if f.file not in hunks]
     return jevrev.github.pull_request.NewReview(
-        commit_id=source.head_sha,
+        commit_id=head,
         event=event,
         body=_pr_review_body(found, outside),
         comments=[_pr_comment(f, hunks) for f in inside],
@@ -521,19 +653,83 @@ def _positive_int(value):
     return number
 
 
+def _git_revision(value) -> jevrev.git.GitRevision:
+    try:
+        return pydantic.TypeAdapter(jevrev.git.GitRevision).validate_python(
+            value
+        )
+    except pydantic.ValidationError as e:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a revision") from e
+
+
 def _github_repo(value) -> jevrev.github.repo.GithubRepo:
-    host, *rest = value.split("/")
-    if len(rest) != 2:
-        raise argparse.ArgumentTypeError(f"{value}: expected HOST/ORG/NAME")
+    """ORG/NAME, on the host GH_HOST names."""
+    org, slash, name = value.partition("/")
+    if not slash:
+        raise argparse.ArgumentTypeError(f"{value}: expected ORG/NAME")
     try:
         return jevrev.github.repo.GithubRepo(
-            host=host, org=rest[0], name=rest[1]
+            host=jevrev.github.api.host(), org=org, name=name
         )
     except pydantic.ValidationError as e:
         problems = "; ".join(
             problem["msg"] for problem in e.errors(include_url=False)
         )
         raise argparse.ArgumentTypeError(f"{value}: {problems}") from e
+
+
+def _git_diff_spec(value) -> jevrev.git.GitDiffSpec:
+    try:
+        return jevrev.git.GitDiffSpec.parse(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a diff") from e
+
+
+def _add_scan_arguments(parser):
+    rules_group = parser.add_argument_group("rules")
+    rules_group.add_argument(
+        "--rules",
+        type=pathlib.Path,
+        default=jevrev.jev.scan.env_path("JEV_RULES_DIR"),
+        metavar="DIR",
+        help="Directory of rule sets jev-scan reviews against "
+        "[default: $JEV_RULES_DIR]; required",
+    )
+    rules_group.add_argument(
+        "--extra-rules",
+        type=jevrev.jev.scan.path_list,
+        default=jevrev.jev.scan.path_list(
+            os.environ.get("JEV_RULES_EXTRA", "")
+        ),
+        metavar="DIRS",
+        help=f"More directories of rule sets, separated by {os.pathsep!r} "
+        "[default: $JEV_RULES_EXTRA]",
+    )
+    ignore_group = parser.add_argument_group("ignore")
+    ignore_group.add_argument(
+        "--ignore",
+        dest="ignore",
+        action="store_true",
+        default=True,
+        help="Leave out every file .gitignore, .ignore, .git/info/exclude or "
+        "core.excludesFile matches [default]; the last of --ignore and "
+        "--no-ignore wins",
+    )
+    ignore_group.add_argument(
+        "--no-ignore",
+        dest="ignore",
+        action="store_false",
+        help="Scan files an ignore file matches too",
+    )
+    parser.add_argument(
+        "--metadata",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("KEY", "VALUE"),
+        help="Metadata stored with the review and printed by show; repeat "
+        "for more keys",
+    )
 
 
 def _add_judge_arguments(parser, reason_help):
@@ -559,94 +755,100 @@ def _parser():
         type=pathlib.Path,
         required=True,
         metavar="FILE",
-        help="SQLite file holding one review: its dir, base, pull request, "
-        "metadata, findings, and verdicts",
+        help="SQLite file holding one review: its source, the version of it "
+        "scanned, metadata, findings, and verdicts",
     )
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"
     )
 
     description = (
-        "Run jev over a directory, or a clone of a pull request, into a new "
-        "db: the change from a base, or every file when full; print the "
-        "scan's summary"
+        "Run jev over a directory's files on disk into a new db, whether or "
+        "not it is in a git repository; print the scan's summary"
     )
     scan_parser = subparsers.add_parser(
         "scan", help=description, description=description
     )
-    source_group = scan_parser.add_argument_group("source")
-    dir_or_repo = source_group.add_mutually_exclusive_group(required=True)
-    dir_or_repo.add_argument(
-        "--dir",
+    scan_parser.add_argument(
+        "dir",
         type=pathlib.Path,
         metavar="DIR",
-        help="Directory to scan in place; findings are relative to it; "
-        "requires --base or --full; conflicts with --repo",
+        help="Directory to scan; findings are relative to it",
     )
-    dir_or_repo.add_argument(
-        "--repo",
+    _add_scan_arguments(scan_parser)
+
+    description = (
+        "Run jev over a git directory at a revision, or over a diff, into a "
+        "new db; print the scan's summary"
+    )
+    scan_git_parser = subparsers.add_parser(
+        "scan-git", help=description, description=description
+    )
+    scan_git_parser.add_argument(
+        "dir",
+        type=pathlib.Path,
+        metavar="DIR",
+        help="Directory in a git repository to scan; findings are relative "
+        "to it",
+    )
+    git_group = scan_git_parser.add_argument_group("git")
+    selection = git_group.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--git-rev",
+        type=_git_revision,
+        metavar="REV",
+        help="Scan the files at REV",
+    )
+    selection.add_argument(
+        "--git-diff",
+        type=_git_diff_spec,
+        metavar="DIFF",
+        help="Scan a diff, in git diff's syntax: REV, the changes from REV "
+        "to the files on disk; A..B, from A to B; A...B, from merge-base(A, "
+        "B) to B; an empty side of A..B or A...B is HEAD",
+    )
+    _add_scan_arguments(scan_git_parser)
+
+    description = (
+        "Run jev over a GitHub repo, through the GitHub API on the host "
+        "GH_HOST names (github.com when unset), into a new db; print the "
+        "scan's summary"
+    )
+    scan_github_parser = subparsers.add_parser(
+        "scan-github", help=description, description=description
+    )
+    scan_github_parser.add_argument(
+        "github",
         type=_github_repo,
-        metavar="HOST/ORG/NAME",
-        help="GitHub repo of the pull request to clone and scan; requires "
-        "--pr; conflicts with --dir",
+        metavar="ORG/NAME",
+        help="GitHub repo to scan; findings are relative to its top",
     )
-    source_group.add_argument(
-        "--pr",
+    github_group = scan_github_parser.add_argument_group("github")
+    github_selection = github_group.add_mutually_exclusive_group()
+    github_selection.add_argument(
+        "--git-rev",
+        type=_git_revision,
+        metavar="REV",
+        help="Scan the files at REV [default: the head of the default branch]",
+    )
+    github_selection.add_argument(
+        "--git-diff",
+        type=_git_diff_spec,
+        metavar="A..B",
+        help="Scan a diff, in git diff's syntax: A..B, the changes from A to "
+        "B; A...B, from merge-base(A, B) to B; an empty side is HEAD",
+    )
+    github_selection.add_argument(
+        "--github-pr",
         type=_positive_int,
         metavar="N",
-        help="Pull request number; requires --repo",
+        help="Scan pull request N's changes",
     )
-    source_group.add_argument(
-        "--cache-dir",
-        type=pathlib.Path,
-        metavar="DIR",
-        help="Directory the pull request is cloned under, and left in "
-        "[default: the temporary directory]",
-    )
-    change_group = scan_parser.add_argument_group("change")
-    change_group.add_argument(
-        "--base",
-        metavar="REV",
-        help="Revision of the git dir to compare from; requires --dir; "
-        "conflicts with --full",
-    )
-    change_group.add_argument(
-        "--full",
-        action="store_true",
-        help="Scan every file, not the change from the base or the pull "
-        "request's merge base",
-    )
-    rules_group = scan_parser.add_argument_group("rules")
-    rules_group.add_argument(
-        "--rules",
-        type=pathlib.Path,
-        default=jevrev.jev.scan.env_path("JEV_RULES_DIR"),
-        metavar="DIR",
-        help="Directory of rule sets jev-scan reviews against "
-        "[default: $JEV_RULES_DIR]; required",
-    )
-    rules_group.add_argument(
-        "--extra-rules",
-        type=jevrev.jev.scan.path_list,
-        default=jevrev.jev.scan.path_list(
-            os.environ.get("JEV_RULES_EXTRA", "")
-        ),
-        metavar="DIRS",
-        help=f"More directories of rule sets, separated by {os.pathsep!r} "
-        "[default: $JEV_RULES_EXTRA]",
-    )
-    scan_parser.add_argument(
-        "--metadata",
-        nargs=2,
-        action="append",
-        default=[],
-        metavar=("KEY", "VALUE"),
-        help="Metadata stored with the review and printed by show; repeat for more keys",
-    )
+    _add_scan_arguments(scan_github_parser)
 
     description = (
         "Print each finding without a verdict as a line of JSON, its file "
-        "relative to the dir"
+        "relative to the source"
     )
     subparsers.add_parser("pending", help=description, description=description)
 
@@ -698,6 +900,10 @@ async def _main():
     match args.command:
         case "scan":
             await _cmd_scan(args)
+        case "scan-git":
+            await _cmd_scan_git(args)
+        case "scan-github":
+            await _cmd_scan_github(args)
         case "pending":
             await _cmd_pending(args)
         case "confirm":
@@ -716,7 +922,7 @@ def cli():
     except (
         UserError,
         jevrev.settings.UserError,
-        jevrev.github.gh.GithubError,
+        jevrev.github.api.GithubError,
         jevrev.git.GitError,
         jevrev.db.OperationalError,
     ) as e:

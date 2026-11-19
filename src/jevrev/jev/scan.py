@@ -1,9 +1,10 @@
 """Scan code and text with jev rule sets: each definition, run of top-level code or whole file of
-the files in a known language under a root, or the hunks of any text file changed since a
-revision. Each file is reviewed against the rule sets under the rules directory whose `when`
+the files in a known language of one version of a source, or the hunks of any text file a diff
+changes. Each file is reviewed against the rule sets under the rules directory whose `when`
 matches it."""
 
 import asyncio
+import collections.abc
 import dataclasses
 import enum
 import functools
@@ -12,17 +13,18 @@ import os
 import pathlib
 import re
 import sys
+import typing
 
 import pathspec
 import pydantic
 import yaml
 
+import jevrev.files
 import jevrev.git
 import jevrev.jev.api
 import jevrev.jev.ask
 import jevrev.languages
 import jevrev.languages.base
-import jevrev.process
 import jevrev.rules
 import jevrev.state
 
@@ -43,14 +45,12 @@ class Condition:
 
     languages: frozenset[jevrev.rules.Language]
     patterns: pathspec.GitIgnoreSpec | None
-    # Each matches at least one path under the root.
+    # Each matches at least one path of the source.
     exists: tuple[pathspec.Pattern, ...]
 
-    def holds_under(self, root):
+    def holds_among(self, paths):
         return all(
-            next(
-                pathspec.GitIgnoreSpec([pattern]).match_tree_files(root), None
-            )
+            next(pathspec.GitIgnoreSpec([pattern]).match_files(paths), None)
             is not None
             for pattern in self.exists
         )
@@ -67,12 +67,13 @@ class RuleSet:
     # The set reviews a file when any of these matches it.
     conditions: tuple[Condition, ...]
 
-    def under(self, root):
-        """The set as it applies under `root`: only the conditions whose paths exist there."""
+    def among(self, paths):
+        """The set as it applies to a source of `paths`: only the conditions whose paths exist
+        among them."""
         return dataclasses.replace(
             self,
             conditions=tuple(
-                c for c in self.conditions if c.holds_under(root)
+                c for c in self.conditions if c.holds_among(paths)
             ),
         )
 
@@ -106,7 +107,6 @@ def _rule_sets(rules):
 
 
 def env_path(name):
-    """The path in the environment variable name, or None when it is unset or empty."""
     value = os.environ.get(name)
     return pathlib.Path(value) if value else None
 
@@ -116,9 +116,10 @@ def path_list(value):
     return [pathlib.Path(entry) for entry in value.split(os.pathsep) if entry]
 
 
-def _sets_under(sets, root):
-    """The rule sets that can apply under `root`, each with only its conditions that do."""
-    return tuple(s for s in (s.under(root) for s in sets) if s.conditions)
+def _sets_among(sets, paths):
+    """The rule sets that can apply to a source of `paths`, each with only its conditions that
+    do."""
+    return tuple(s for s in (s.among(paths) for s in sets) if s.conditions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,7 +133,7 @@ class Review:
 
 
 def _review_of(name, source, sets):
-    """How a file is reviewed against `sets`; `name` is its path from the root."""
+    """How a file is reviewed against `sets`; `name` is its path in the source."""
     language = jevrev.languages.detect(name, source)
     return Review(
         sets=tuple(
@@ -145,7 +146,7 @@ def _review_of(name, source, sets):
 
 
 def _in_whole_scan(name, source):
-    """Whether a whole-directory scan reviews the file: it has a language. With --base, every
+    """Whether a scan without a diff reviews the file: it has a language. With a diff, every
     changed text file is reviewed."""
     return jevrev.languages.detect(name, source).name is not None
 
@@ -154,22 +155,43 @@ class UserError(Exception):
     pass
 
 
-def _inside(root, path):
-    """Whether path, its symlinks followed, is under root, which is resolved."""
-    return path.resolve().is_relative_to(root)
+type LineNumber = typing.Annotated[int, pydantic.Field(ge=1)]
+
+# The path of a finding's file, relative to the source.
+type FindingPath = typing.Annotated[
+    str, pydantic.StringConstraints(min_length=1)
+]
+
+# The definition, run of code, hunk or file a finding is in, as its state names it.
+type ItemName = str
+
+# The rule set's file name and the rule's position in it, from 1, such as text.yaml#1.
+type RuleId = typing.Annotated[
+    str, pydantic.StringConstraints(pattern=r"^[^#]+#[1-9][0-9]*$")
+]
+
+# How likely jev judges the rule broken, rounded to 2 places.
+type Probability = typing.Annotated[float, pydantic.Field(ge=0.0, le=1.0)]
+
+# What a rule flags, as its rule set states it.
+type RuleFlags = str
+
+# A rule's bad or good examples, joined by spaces.
+type RuleExamples = str
 
 
 class Finding(pydantic.BaseModel):
-    file: str
-    start: int
-    end: int
-    item: str
-    # The rule set's file name and the rule's position in it, such as text.yaml#1.
-    rule: str
-    probability: float
-    flags: str
-    violation: str
-    accepted: str
+    file: FindingPath
+    start: LineNumber
+    end: LineNumber
+    item: ItemName
+    rule: RuleId
+    probability: Probability
+    flags: RuleFlags
+    # The rule's examples of what breaks it.
+    violation: RuleExamples
+    # The rule's examples of what keeps it.
+    accepted: RuleExamples
     evaluated: jevrev.state.Evaluation | None = None
 
 
@@ -233,22 +255,16 @@ def _test_cutoff(source, marker):
     )
 
 
-async def _changed_hunks(root, pathspecs, base, context, sets):
-    """Each hunk changed since `base`'s merge-base with HEAD, with `context` lines around each
-    change, as a diff of its file; and the untracked files."""
-    if base.startswith("-"):
-        raise UserError(f"base {base!r} is not a revision")
-    merge_base = await jevrev.git.git.merge_base(root, base, "HEAD")
-    diff = await jevrev.git.git.diff_work_tree(
-        root=root, revision=merge_base, context=context, pathspecs=pathspecs
-    )
+async def _changed_hunks(files, diff, present, sets):
+    """Each hunk of `diff` that adds a line before its file's tests, as a diff of its file, its
+    file read from `files`; a file not in `present` is left out."""
     changed = []
     for changed_file in diff.root:
         name = changed_file.path
-        # A submodule's diff names its directory.
-        if not (root / name).is_file() or not _inside(root, root / name):
+        # A submodule's diff names its directory, and an ignored file is not present.
+        if name not in present:
             continue
-        source = (root / name).read_bytes()
+        source = await files.read(name)
         review = _review_of(name=name, source=source, sets=sets)
         cutoff = _test_cutoff(source, review.language.test_marker)
         for hunk in changed_file.hunks:
@@ -277,10 +293,11 @@ async def _changed_hunks(root, pathspecs, base, context, sets):
                     ],
                 )
             )
-    return changed, await jevrev.git.git.untracked_files(root, pathspecs)
+    return changed
 
 
-_DEFAULT_CONTEXT = 20
+# The context lines around each change of a diff a scan reviews.
+DIFF_CONTEXT = 20
 
 
 def _added_everywhere(diff):
@@ -369,29 +386,7 @@ def _change_states(hunks, untracked, evaluations, all_added, sets):
     return states
 
 
-def _all_files(root, targets):
-    """The files under each of `targets`, or each target itself, by path from `root`. Symlinks
-    under a target are left out, so no file outside `root` is reached."""
-    stack = []
-    files = set()
-    for target in targets:
-        if target.is_file():
-            files.add(str(target.relative_to(root)))
-        else:
-            stack.append(target)
-    while stack:
-        for path in stack.pop().iterdir():
-            if path.is_symlink():
-                continue
-            if path.is_dir():
-                stack.append(path)
-            elif path.is_file():
-                files.add(str(path.relative_to(root)))
-    return sorted(files)
-
-
-def _findings(state, root, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
-    """The rules of `rule_set` that jev's answers for `state` meet its error threshold on, as findings."""
+def _findings(state, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
     parsed = _read_set(rule_set)
     for position, rule in enumerate(parsed.rules, 1):
         name = jevrev.jev.ask.question_name(position)
@@ -399,7 +394,7 @@ def _findings(state, root, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
         if answer is None or answer.probability < parsed.error_threshold:
             continue
         yield Finding(
-            file=str(root / state.file),
+            file=state.file,
             start=state.start,
             end=state.end,
             item=state.name,
@@ -446,32 +441,43 @@ async def _ask(state, rule_set, gate, verbose, client, model):
     return answers
 
 
+async def _texts(files, names, keep):
+    texts = {}
+    for name in names:
+        source = await files.read(name)
+        try:
+            source.decode()
+        except UnicodeDecodeError:
+            continue
+        if keep(name, source):
+            texts[name] = source
+    return texts
+
+
 async def scan_states(
     rules,
-    root=None,
-    paths=(),
+    files: jevrev.files.Files,
+    ignore: jevrev.files.Ignore | None,
+    diff: jevrev.git.Diff | None = None,
+    untracked: collections.abc.Sequence[str] = (),
     extra_rules=(),
     rule_set=None,
-    base=None,
     evaluate=None,
-    context=None,
     all_added=False,
-):
-    """The resolved root, and the states of it to ask jev about, as main's
-    flags of the same names select them."""
+) -> list[jevrev.state.State]:
+    """The states to ask jev about. `files` holds the reviewed version, and every path is
+    relative to it. Without a diff, every file of `files` is reviewed whole; with one, its hunks
+    are, their files read from `files`, and each of `untracked` whole, as added. With `ignore`,
+    every path it matches is left out, from files' paths, diff's files and untracked alike;
+    None (--no-ignore) leaves none out."""
     evaluations = evaluate or [jevrev.state.Evaluation.HUNK]
-
-    if root is None:
-        try:
-            root = await jevrev.git.git.top_level(pathlib.Path.cwd())
-        except jevrev.git.GitError as e:
-            raise UserError(
-                "the current directory is outside a git repository; give --root"
-            ) from e
-    root = root.resolve()
-    if not root.is_dir():
-        raise UserError(f"--root {root} is not a directory")
-    sets = _sets_under(
+    if diff is None and (evaluate is not None or all_added):
+        raise UserError("evaluate and all_added need a diff")
+    paths = await files.paths()
+    if ignore is not None:
+        paths = [path for path in paths if not ignore.matches(path)]
+    present = set(paths)
+    sets = _sets_among(
         tuple(
             {
                 found.path: found
@@ -479,69 +485,10 @@ async def scan_states(
                 for found in _rule_sets(directory.resolve())
             }.values()
         ),
-        root,
+        paths,
     )
-    targets = []
-    for path in paths:
-        if path.is_absolute():
-            raise UserError(
-                f"{path} is absolute; give PATHs relative to --root"
-            )
-        target = (root / path).resolve()
-        if not target.is_relative_to(root):
-            raise UserError(f"{path} is outside --root {root}")
-        if not target.is_file() and not target.is_dir():
-            raise UserError(
-                f"{path} is neither a directory nor a file in {root}"
-            )
-        targets.append(target)
-    targets = targets or [root]
-    pathspecs = [str(target.relative_to(root)) for target in targets]
-    # Files named on the command line are reviewed whatever their language.
-    named = {
-        str(target.relative_to(root)) for target in targets if target.is_file()
-    }
-
-    if base is None and (
-        evaluate is not None or context is not None or all_added
-    ):
-        raise UserError("--evaluate, --context and --all-added need --base")
-    if not await jevrev.git.git.in_work_tree(root):
-        # Outside a repository every file is new: reviewed whole, or as added with --base.
-        hunks, whole = [], _all_files(root, targets)
-    elif base is None:
-        whole = await jevrev.git.git.files(root, pathspecs)
-        if ignored := sorted(named - set(whole)):
-            raise UserError(f"{', '.join(ignored)} ignored by git")
-    else:
-        lines = _DEFAULT_CONTEXT if context is None else context
-        hunks, whole = await _changed_hunks(
-            root=root,
-            pathspecs=pathspecs,
-            base=base,
-            context=lines,
-            sets=sets,
-        )
-    sources = {}
-    for name in whole:
-        # git lists an untracked nested repository as its directory. A symlink out of the root
-        # would send a file outside it to jev.
-        if not (root / name).is_file() or not _inside(root, root / name):
-            continue
-        source = (root / name).read_bytes()
-        try:
-            source.decode()
-        except UnicodeDecodeError:
-            # Not text, so nothing for the rule sets to judge.
-            continue
-        if (
-            base is None
-            and name not in named
-            and not _in_whole_scan(name, source)
-        ):
-            continue
-        sources[name] = source
-    if base is None:
+    if diff is None:
+        sources = await _texts(files, paths, _in_whole_scan)
         scanned = _merge_constants(
             [
                 state
@@ -555,25 +502,29 @@ async def scan_states(
         )
     else:
         scanned = _change_states(
-            hunks=hunks,
-            untracked=sources,
+            hunks=await _changed_hunks(
+                files=files, diff=diff, present=present, sets=sets
+            ),
+            untracked=await _texts(
+                files,
+                [name for name in untracked if name in present],
+                lambda name, source: True,
+            ),
             evaluations=evaluations,
             all_added=all_added,
             sets=sets,
         )
-    scanned = [
+    return [
         state.model_copy(
             update={"sets": (rule_set,) if rule_set else state.sets}
         )
         for state in scanned
         if rule_set or state.sets
     ]
-    return root, scanned
 
 
 async def review(
     scanned,
-    root,
     concurrency,
     verbose,
     client: jevrev.jev.api.Client,
@@ -610,7 +561,7 @@ async def review(
         if isinstance(result, BaseException):
             raise result
         for finding in _findings(
-            state=state, root=root, answers=result, rule_set=rule_set
+            state=state, answers=result, rule_set=rule_set
         ):
             if (id(state), finding.flags) in reported:
                 continue
@@ -619,9 +570,10 @@ async def review(
     return _without_file_repeats(found), failures
 
 
-def summary_line(scanned, root, found, failures):
+def summary_line(scanned, source, found, failures):
+    """The scan's summary; source names what was scanned."""
     return (
-        f"{len(scanned)} states reviewed in {root}, {len(found)} findings, "
+        f"{len(scanned)} states reviewed in {source}, {len(found)} findings, "
         f"{len(failures)} failures"
     )
 
