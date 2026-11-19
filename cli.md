@@ -7,12 +7,12 @@ exists exactly as written.
 --db <FILE>  SQLite file holding one review: its dir, base, pull request, metadata, findings, and verdicts
 
 COMMAND:
-  scan     Run jev over a directory, or a clone of a pull request, into a new db: the change from a base, or every file when full; print the scan's summary
-  pending  Print each finding without a verdict as a line of JSON, its file relative to the dir
-  confirm  Confirm one finding without a verdict
-  reject   Reject one finding without a verdict
-  show     Print the review once every finding has a verdict; fails while any finding has none
-  post     Post the confirmed findings as a review on the pull request and print its URL, once every finding has a verdict; fails while any finding has none
+  scan           Run jev over a directory, or a clone of a pull request, into a new db: the change from a base, or every file when full; print the scan's summary
+  pending        Print each finding without a verdict as a line of JSON, its file relative to the dir
+  confirm        Confirm one finding without a verdict
+  reject         Reject one finding without a verdict
+  show           Print the review once every finding has a verdict; fails while any finding has none
+  submit-github  Submit the confirmed findings as a review on the GitHub pull request and print its URL, once every finding has a verdict; fails while any finding has none
 ```
 
 ## `jevrev scan`

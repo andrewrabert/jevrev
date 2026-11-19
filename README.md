@@ -12,7 +12,7 @@ jevrev --db review.db pending
 jevrev --db review.db confirm 1 "Why the lines break the rule"
 jevrev --db review.db reject 2 "Why the lines do not break the rule"
 jevrev --db review.db show --format md
-jevrev --db review.db post
+jevrev --db review.db submit-github
 ```
 
 `scan --dir DIR --base REV` scans a git dir's change from REV in place, and `scan --dir DIR --full` scans every file of any directory.

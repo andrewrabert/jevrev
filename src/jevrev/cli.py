@@ -285,7 +285,7 @@ async def _cmd_show(args):
             print(_review_text(review))
 
 
-async def _cmd_post(args):
+async def _cmd_submit_github(args):
     review = _judged_review(args)
     source = review.pull_request
     if source is None:
@@ -683,11 +683,13 @@ def _parser():
     )
 
     description = (
-        "Post the confirmed findings as a review on the pull request and "
-        "print its URL, once every finding has a verdict; fails while any "
-        "finding has none"
+        "Submit the confirmed findings as a review on the GitHub pull "
+        "request and print its URL, once every finding has a verdict; fails "
+        "while any finding has none"
     )
-    subparsers.add_parser("post", help=description, description=description)
+    subparsers.add_parser(
+        "submit-github", help=description, description=description
+    )
     return parser
 
 
@@ -704,8 +706,8 @@ async def _main():
             await _cmd_reject(args)
         case "show":
             await _cmd_show(args)
-        case "post":
-            await _cmd_post(args)
+        case "submit-github":
+            await _cmd_submit_github(args)
 
 
 def cli():
