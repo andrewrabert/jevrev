@@ -91,14 +91,23 @@ def _judged_review(args) -> jevrev.db.Review:
     return review
 
 
+def _rules(args) -> list[pathlib.Path]:
+    rules = [
+        *jevrev.settings.load_settings().rules,
+        *(args.rules or ()),
+    ]
+    if not rules:
+        raise UserError("Give --rules or set JEV_RULES.")
+    return rules
+
+
 def _scan_metadata(args) -> dict[str, str]:
     db: pathlib.Path | None = args.db
     if db is not None and db.exists():
         raise UserError(f"{db} already exists")
     if db is None and args.metadata:
         raise UserError("--metadata: give --db to store it in")
-    if args.rules is None:
-        raise UserError("Give --rules or set JEV_RULES_DIR.")
+    _rules(args)
     if any(key == "" for key, _ in args.metadata):
         raise UserError("--metadata: a key is empty")
     metadata = dict(args.metadata)
@@ -152,8 +161,7 @@ async def _scan_and_save(
         exclude=args.exclude,
         diff=diff,
         untracked=untracked,
-        rules=args.rules,
-        extra_rules=args.extra_rules,
+        rules=_rules(args),
         name=name,
     )
     review = jevrev.db.Review(
@@ -372,11 +380,10 @@ async def _run_jev_scan(
     exclude: list[str],
     diff: jevrev.git.Diff | None,
     untracked: collections.abc.Sequence[str],
-    rules: pathlib.Path,
-    extra_rules: list[pathlib.Path],
+    rules: list[pathlib.Path],
     name: str,
 ):
-    """Run jev-scan on files against the rule sets under rules and each of extra_rules: its
+    """Run jev-scan on files against the rule sets under each directory of rules: its
     findings, and its summary line. Fails if any jev request fails."""
     settings = jevrev.settings.load_settings()
     if settings.api_key is None:
@@ -396,7 +403,6 @@ async def _run_jev_scan(
                 ignore=ignore,
                 diff=diff,
                 untracked=untracked,
-                extra_rules=extra_rules,
                 include=include,
                 exclude=exclude,
                 evaluate=None
@@ -762,20 +768,10 @@ def _add_scan_arguments(parser):
     rules_group.add_argument(
         "--rules",
         type=pathlib.Path,
-        default=jevrev.jev.scan.env_path("JEV_RULES_DIR"),
+        action="append",
         metavar="DIR",
-        help="Directory of rule sets jev-scan reviews against "
-        "[default: $JEV_RULES_DIR]; required",
-    )
-    rules_group.add_argument(
-        "--extra-rules",
-        type=jevrev.jev.scan.path_list,
-        default=jevrev.jev.scan.path_list(
-            os.environ.get("JEV_RULES_EXTRA", "")
-        ),
-        metavar="DIRS",
-        help=f"More directories of rule sets, separated by {os.pathsep!r} "
-        "[default: $JEV_RULES_EXTRA]",
+        help="Directory of rule sets jev-scan reviews against, as well as those of "
+        f"$JEV_RULES, separated by {os.pathsep!r}; repeat for more directories; required",
     )
     ignore_group = parser.add_argument_group("ignore")
     ignore_group.add_argument(

@@ -27,5 +27,11 @@ jevrev = "jevrev.cli:cli"
 requires = ["uv_build>=0.13,<0.14"]
 build-backend = "uv_build"
 
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
 [tool.uv.build-backend]
 module-name = "jevrev"

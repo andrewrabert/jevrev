@@ -1,6 +1,7 @@
 """jevrev's settings, read from the environment, then TYPESAFE_ENV_FILE."""
 
 import os
+import pathlib
 import typing
 
 import pydantic
@@ -28,6 +29,21 @@ type _Url = typing.Annotated[
 ]
 
 
+def _path_list(value: object) -> object:
+    if isinstance(value, str):
+        return [
+            pathlib.Path(entry) for entry in value.split(os.pathsep) if entry
+        ]
+    return value
+
+
+type _PathList = typing.Annotated[
+    list[pathlib.Path],
+    pydantic_settings.NoDecode,
+    pydantic.BeforeValidator(_path_list),
+]
+
+
 class Settings(pydantic_settings.BaseSettings):
     model_config = pydantic_settings.SettingsConfigDict(
         env_prefix="TYPESAFE_",
@@ -44,10 +60,15 @@ class Settings(pydantic_settings.BaseSettings):
         description="Seconds per request; the SDK's own default of 10 cuts "
         "off long states.",
     )
+    rules: _PathList = pydantic.Field(
+        [],
+        validation_alias="JEV_RULES",
+        description="Directories of rule sets jev-scan reviews against, separated by "
+        "os.pathsep, before every --rules.",
+    )
 
 
 def load_settings() -> Settings:
-    """The settings read from the environment, then TYPESAFE_ENV_FILE."""
     try:
         return Settings()
     except pydantic.ValidationError as e:

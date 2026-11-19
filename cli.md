@@ -25,8 +25,7 @@ COMMAND:
 ## `jevrev scan`
 ```
 PATH                      File or directory to scan, symlinks followed; findings are relative to the directory, or the file's own; a file is scanned even when an ignore file matches it
---rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
---extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
+--rules <DIR>             Directory of rule sets jev-scan reviews against, as well as those of $JEV_RULES, separated by ':'; repeat for more directories; required
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
 -i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
@@ -40,8 +39,7 @@ PATH                      File or directory to scan, symlinks followed; findings
 DIR                       Directory in a git repository to scan; findings are relative to it
 --rev <REV>               Scan the files at REV; conflicts with --diff; one of the two is required
 --diff <DIFF>             Scan a diff, in git diff's syntax: REV, the changes from REV to the files on disk; A..B, from A to B; A...B, from merge-base(A, B) to B; an empty side of A..B or A...B is HEAD
---rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
---extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
+--rules <DIR>             Directory of rule sets jev-scan reviews against, as well as those of $JEV_RULES, separated by ':'; repeat for more directories; required
 --ignore                  Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
 -i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
@@ -56,8 +54,7 @@ ORG/NAME                  GitHub repo to scan; findings are relative to its top
 --rev <REV>               Scan the files at REV [default: the head of the default branch]; conflicts with --diff and --pr
 --diff <A..B>             Scan a diff, in git diff's syntax: A..B, the changes from A to B; A...B, from merge-base(A, B) to B; an empty side is HEAD; conflicts with --rev and --pr
 --pr <N>                  Scan pull request N's changes; conflicts with --rev and --diff
---rules <DIR>             Directory of rule sets jev-scan reviews against [default: $JEV_RULES_DIR]; required
---extra-rules <DIRS>      More directories of rule sets, separated by ':' [default: $JEV_RULES_EXTRA]
+--rules <DIR>             Directory of rule sets jev-scan reviews against, as well as those of $JEV_RULES, separated by ':'; repeat for more directories; required
 --ignore                  Leave out every file .gitignore, .ignore or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
 --no-ignore               Scan files an ignore file matches too
 -i, --include <PATTERN>   Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match

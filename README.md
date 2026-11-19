@@ -2,7 +2,7 @@
 
 A CLI that runs jev over a local file or directory, a local git directory or a GitHub repo and prints its findings, records a verdict on each finding, and prints the review or posts it on the pull request.
 
-Give the directory of rule sets to review against with `--rules` or `JEV_RULES_DIR`. [example_rules](example_rules) holds examples.
+Give the directories of rule sets to review against with `--rules`, repeated for each, and `JEV_RULES`, separated by `:`; both are used. [example_rules](example_rules) holds examples.
 
 A scan prints its findings as a linter does, in color when stdout is a terminal, and exits 0 with no findings, 1 with findings (0 given `--exit-zero`), and 2 on any error:
 

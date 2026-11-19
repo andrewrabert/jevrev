@@ -1,17 +1,14 @@
 """Scan code and text with jev rule sets: each definition, run of top-level code or whole file of
 the files in a known language of one version of a source, or the hunks of any text file a diff
-changes. Each file is reviewed against the rule sets under the rules directory whose `when`
+changes. Each file is reviewed against the rule sets under the rules directories whose `when`
 matches it."""
 
 import asyncio
 import collections.abc
 import dataclasses
-import enum
 import functools
 import json
-import os
 import pathlib
-import re
 import sys
 import typing
 
@@ -104,16 +101,6 @@ def _rule_sets(rules):
             )
         )
     return tuple(found)
-
-
-def env_path(name):
-    value = os.environ.get(name)
-    return pathlib.Path(value) if value else None
-
-
-def path_list(value):
-    """The paths of a list separated by os.pathsep, as in PATH, without its empty entries."""
-    return [pathlib.Path(entry) for entry in value.split(os.pathsep) if entry]
 
 
 def _sets_among(sets, paths):
@@ -460,7 +447,6 @@ async def scan_states(
     ignore: jevrev.files.Ignore | None,
     diff: jevrev.git.Diff | None = None,
     untracked: collections.abc.Sequence[str] = (),
-    extra_rules=(),
     rule_set=None,
     evaluate=None,
     all_added=False,
@@ -494,7 +480,7 @@ async def scan_states(
         tuple(
             {
                 found.path: found
-                for directory in (rules, *extra_rules)
+                for directory in rules
                 for found in _rule_sets(directory.resolve())
             }.values()
         ),
