@@ -23,7 +23,7 @@ To scan GitHub or post to it, jevrev needs a GitHub token. See [GitHub](#github)
 jevrev scan src
 ```
 
-jevrev prints each finding on one line as `file:lines [index] rule probability item`. The item is the function or other code item the lines belong to, and the probability is jev's estimate that the lines break the rule. The text of the rule follows on the next line, and a summary line ends the output. Output is in color when stdout is a terminal.
+jevrev prints each finding on one line as `file:lines [index] rule probability state`. The state is what of the file jev was given: `file`, the whole file; `hunk`, one hunk of a change; `hunks`, all of a file's changed hunks; or `language`, one range of the file that a language yields, such as a function. The probability is jev's estimate that the lines break the rule. The text of the rule follows on the next line, and a summary line ends the output. Output is in color when stdout is a terminal.
 
 jevrev exits 0 with no findings, 1 with findings, and 2 on any error, so CI or a pre-commit hook can fail on findings. `--exit-zero` makes it exit 0 even with findings.
 
@@ -74,7 +74,7 @@ The review file records the source and the commit ids the scan resolved. `submit
 | A GitHub repo's changes from A, or from merge-base(A, B), to B | `scan-github ORG/NAME --diff A..B` or `A...B` |
 | A GitHub pull request's changes | `scan-github ORG/NAME --pr N` |
 
-A diff scan reviews each changed hunk, and all of a changed file's hunks together. Any other scan reviews every file.
+A rule set's `when` selects the files it reviews. Each selected file is reviewed whole. A diff scan also reviews each changed hunk, and all of a changed file's hunks together. A rule set whose `when` names a language also reviews each range of the file that language yields, such as each function: every range, or in a diff scan only the ranges the diff touches. A file that the language cannot parse gets no ranges.
 
 No scan writes to the code it reads. `scan-git` reads files from the git repository without checking anything out, and `scan-github` reads them through the GitHub API without cloning.
 

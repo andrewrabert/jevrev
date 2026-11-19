@@ -7,6 +7,15 @@ import pathlib
 import typing
 
 import pathspec
+import pydantic
+
+# A file's path from the top of its source, "/"-separated.
+type SourcePath = typing.Annotated[
+    str, pydantic.StringConstraints(min_length=1)
+]
+
+# A line's number in a file, from 1.
+type LineNumber = typing.Annotated[int, pydantic.Field(ge=1)]
 
 # The ignore files of a directory, lowest precedence first.
 _IGNORE_FILES = (".gitignore", ".ignore")

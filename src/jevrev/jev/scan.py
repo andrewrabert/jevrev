@@ -1,7 +1,7 @@
-"""Scan code and text with jev rule sets: each definition, run of top-level code or whole file of
-the files in a known language of one version of a source, or the hunks of any text file a diff
-changes. Each file is reviewed against the rule sets under the rules directories whose `when`
-matches it."""
+"""Scan text files with jev rule sets. A rule set's `when` selects the files it reviews. Each
+selected file is reviewed whole; with a diff, also each of its hunks and all of them together; and,
+for each language of the file that a selecting `when` names, each range of the file that language
+yields: every range without a diff, the ranges the diff touches with one."""
 
 import asyncio
 import collections.abc
@@ -14,6 +14,7 @@ import typing
 
 import pathspec
 import pydantic
+import pydantic.dataclasses
 import yaml
 
 import jevrev.files
@@ -25,6 +26,8 @@ import jevrev.languages.base
 import jevrev.rules
 import jevrev.state
 
+type Language = type[jevrev.languages.base.Language]
+
 
 @functools.cache
 def _read_set(path):
@@ -34,6 +37,15 @@ def _read_set(path):
         )
     except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
         raise UserError(f"rule set {path}: {e}") from e
+
+
+@pydantic.dataclasses.dataclass(frozen=True)
+class ScanTargetFile:
+    """A file a scan considers: its path from the root, and the languages its name or first line
+    marks it in."""
+
+    path: jevrev.files.SourcePath
+    languages: frozenset[Language]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,10 +64,13 @@ class Condition:
             for pattern in self.exists
         )
 
-    def matches(self, detected, name):
-        return (not self.languages or detected in self.languages) and (
-            self.patterns is None or self.patterns.match_file(name)
-        )
+    def matches(self, file: ScanTargetFile) -> bool:
+        return (
+            not self.languages
+            or any(
+                language.name in self.languages for language in file.languages
+            )
+        ) and (self.patterns is None or self.patterns.match_file(file.path))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,47 +125,245 @@ def _sets_among(sets, paths):
 
 
 @dataclasses.dataclass(frozen=True)
+class SelectingRuleSet:
+    """A rule set whose `when` selects a file, and the languages of the file that a matching
+    `when` entry names: the set reviews those languages' ranges."""
+
+    path: pathlib.Path
+    languages: frozenset[Language]
+
+
+@dataclasses.dataclass(frozen=True)
 class Review:
-    """How a file is reviewed."""
+    """A file and the rule sets that select it."""
 
-    # The rule sets every state of the file is reviewed against.
-    sets: tuple[pathlib.Path, ...]
-    # How the file is split into states and where its test code starts.
-    language: type[jevrev.languages.base.Language]
+    file: ScanTargetFile
+    rule_sets: tuple[SelectingRuleSet, ...]
+
+    def __post_init__(self):
+        if not self.rule_sets:
+            raise ValueError(f"no rule set selects {self.file.path}")
+
+    @property
+    def sets(self) -> tuple[pathlib.Path, ...]:
+        return tuple(s.path for s in self.rule_sets)
+
+    def sets_of(self, language: Language) -> tuple[pathlib.Path, ...]:
+        """The rule sets that review language's ranges of the file."""
+        return tuple(s.path for s in self.rule_sets if language in s.languages)
 
 
-def _review_of(name, source, sets):
-    """How a file is reviewed against `sets`; `name` is its path in the source."""
-    language = jevrev.languages.detect(name, source)
-    return Review(
-        sets=tuple(
-            rule_set.path
-            for rule_set in sets
-            if any(c.matches(language.name, name) for c in rule_set.conditions)
-        ),
-        language=language,
+def _review_of(file: ScanTargetFile, sets) -> Review | None:
+    """file's review by the rule sets of sets that select it; None when none does."""
+    selecting = tuple(
+        SelectingRuleSet(
+            path=rule_set.path,
+            languages=frozenset(
+                language
+                for language in file.languages
+                if any(
+                    c.matches(file) and language.name in c.languages
+                    for c in rule_set.conditions
+                )
+            ),
+        )
+        for rule_set in sets
+        if any(c.matches(file) for c in rule_set.conditions)
     )
-
-
-def _in_whole_scan(name, source):
-    """Whether a scan without a diff reviews the file: it has a language. With a diff, every
-    changed text file is reviewed."""
-    return jevrev.languages.detect(name, source).name is not None
+    return Review(file=file, rule_sets=selecting) if selecting else None
 
 
 class UserError(Exception):
     pass
 
 
-type LineNumber = typing.Annotated[int, pydantic.Field(ge=1)]
+def _text(file: ScanTargetFile, source: bytes) -> str:
+    try:
+        return source.decode()
+    except UnicodeDecodeError as e:
+        raise UserError(f"{file.path} is not UTF-8 text: {e}") from e
 
-# The path of a finding's file, relative to the source.
-type FindingPath = typing.Annotated[
-    str, pydantic.StringConstraints(min_length=1)
-]
 
-# The definition, run of code, hunk or file a finding is in, as its state names it.
-type ItemName = str
+@dataclasses.dataclass(frozen=True)
+class _Before:
+    """A file before a change, rebuilt from the file after it and the change's hunks."""
+
+    text: str
+    # Each line the change keeps, by its number before the change, to its number after it.
+    kept: dict[int, int]
+
+    @classmethod
+    def of(cls, after: list[str], hunks: list[jevrev.git.Hunk]) -> "_Before":
+        lines: list[str] = []
+        kept: dict[int, int] = {}
+        next_after = 1
+
+        def keep_until(stop):
+            nonlocal next_after
+            while next_after < stop:
+                lines.append(after[next_after - 1])
+                kept[len(lines)] = next_after
+                next_after += 1
+
+        for hunk in hunks:
+            # A hunk with no lines after the change sits after its target_start.
+            keep_until(
+                hunk.target_start
+                if hunk.target_length
+                else hunk.target_start + 1
+            )
+            for line in hunk.lines:
+                match line:
+                    case jevrev.git.ContextLine():
+                        lines.append(line.text)
+                        kept[len(lines)] = line.number
+                        next_after = line.number + 1
+                    case jevrev.git.RemovedLine():
+                        lines.append(line.text)
+                    case jevrev.git.AddedLine():
+                        next_after = line.number + 1
+        keep_until(len(after) + 1)
+        return cls(text="".join(f"{line}\n" for line in lines), kept=kept)
+
+
+def _changed_ranges(
+    language: Language,
+    after: list[jevrev.languages.base.LineRange],
+    text: str,
+    change: jevrev.git.ChangedFile,
+) -> list[jevrev.languages.base.LineRange]:
+    """The ranges of after, language's ranges of text, that change touches: each holding an added
+    line, or a line kept from a range before the change that lost a line. Every range when the
+    file before the change is not valid in language."""
+    before = _Before.of(text.splitlines(), change.hunks)
+    try:
+        before_ranges = language.states(before.text)
+    except jevrev.languages.base.ParseError:
+        return after
+    touched = {
+        line.number
+        for hunk in change.hunks
+        for line in hunk.lines
+        if isinstance(line, jevrev.git.AddedLine)
+    }
+    for before_range in before_ranges:
+        if any(n not in before.kept for n in before_range.lines):
+            touched.update(
+                before.kept[n] for n in before_range.lines if n in before.kept
+            )
+    return [r for r in after if not touched.isdisjoint(r.lines)]
+
+
+def _test_cutoff(lines: list[str], marker: str | None) -> int:
+    """The number of the first line that is marker, past the last line when there is none."""
+    return next(
+        (n for n, line in enumerate(lines, 1) if line == marker),
+        len(lines) + 1,
+    )
+
+
+def _language_states(
+    review: Review,
+    language: Language,
+    text: str,
+    change: jevrev.git.ChangedFile | None,
+) -> list[jevrev.state.LanguageState]:
+    """The states of language's ranges of the file, before its test code: every range, or with a
+    change only those it touches. None when text is not valid in language."""
+    sets = review.sets_of(language)
+    if not sets:
+        return []
+    try:
+        ranges = language.states(text)
+    except jevrev.languages.base.ParseError:
+        return []
+    if change is not None:
+        ranges = _changed_ranges(language, ranges, text, change)
+    lines = text.splitlines()
+    cutoff = _test_cutoff(lines, language.test_marker)
+    states = []
+    for r in ranges:
+        if r.start >= cutoff:
+            continue
+        end = min(r.end, cutoff - 1)
+        part = lines[r.start - 1 : end]
+        # Blank lines between definitions hold nothing to judge.
+        if not any(line.strip() for line in part):
+            continue
+        states.append(
+            jevrev.state.LanguageState(
+                file=review.file.path,
+                start=r.start,
+                end=end,
+                sets=sets,
+                text="\n".join(part),
+                language=language.name,
+            )
+        )
+    return states
+
+
+def _hunk_states(
+    review: Review, change: jevrev.git.ChangedFile
+) -> list[jevrev.state.State]:
+    """A state of each hunk of change, and one of all of them together."""
+    states = []
+    for hunk in change.hunks:
+        header = (
+            f"@@ -{hunk.source_start},{hunk.source_length} "
+            f"+{hunk.target_start},{hunk.target_length} @@ {hunk.section}"
+        )
+        # A hunk that leaves no lines sits after its target_start, which is 0 at the top.
+        start = max(hunk.target_start, 1)
+        states.append(
+            jevrev.state.HunkState(
+                file=review.file.path,
+                start=start,
+                end=max(hunk.target_start + hunk.target_length - 1, start),
+                sets=review.sets,
+                hunk=jevrev.state.DiffHunk(
+                    header=header.rstrip(),
+                    lines=[f"{line.prefix}{line.text}" for line in hunk.lines],
+                ),
+            )
+        )
+    if not states:
+        return []
+    return [
+        *states,
+        jevrev.state.HunksState(
+            file=review.file.path,
+            start=states[0].start,
+            end=states[-1].end,
+            sets=review.sets,
+            hunks=[state.hunk for state in states],
+        ),
+    ]
+
+
+def _states(
+    review: Review, text: str, change: jevrev.git.ChangedFile | None
+) -> list[jevrev.state.State]:
+    """Every state of a reviewed file of text: the whole file, its change's hunks when it has a
+    change, and the ranges of each of its languages."""
+    return [
+        jevrev.state.FileState(
+            file=review.file.path,
+            start=1,
+            end=max(len(text.splitlines()), 1),
+            sets=review.sets,
+            text=text,
+        ),
+        *(_hunk_states(review, change) if change is not None else []),
+        *(
+            state
+            for language in sorted(
+                review.file.languages, key=lambda language: language.name
+            )
+            for state in _language_states(review, language, text, change)
+        ),
+    ]
+
 
 # The rule set's file name and the rule's position in it, from 1, such as text.yaml#1.
 type RuleId = typing.Annotated[
@@ -168,10 +381,9 @@ type RuleExamples = str
 
 
 class Finding(pydantic.BaseModel):
-    file: FindingPath
-    start: LineNumber
-    end: LineNumber
-    item: ItemName
+    file: jevrev.files.SourcePath
+    start: jevrev.files.LineNumber
+    end: jevrev.files.LineNumber
     rule: RuleId
     probability: Probability
     flags: RuleFlags
@@ -179,7 +391,8 @@ class Finding(pydantic.BaseModel):
     violation: RuleExamples
     # The rule's examples of what keeps it.
     accepted: RuleExamples
-    evaluated: jevrev.state.Evaluation | None = None
+    # What of the file jev was given.
+    state: jevrev.state.StateKind
 
 
 class AskFailed(Exception):
@@ -189,188 +402,18 @@ class AskFailed(Exception):
         self.stderr = stderr
 
     def __str__(self):
-        return f"{self.state.file}:{self.state.start} {self.state.name}: {self.stderr.strip()}"
+        return (
+            f"{self.state.file}:{self.state.start}-{self.state.end} "
+            f"{self.state.kind}: {self.stderr.strip()}"
+        )
 
 
 def json_dumps(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
-def _file_contents(name, source, review):
-    return [
-        content.model_copy(update={"sets": review.sets})
-        for content in review.language.contents(source, name)
-    ]
-
-
-def _merge_constants(contents):
-    """Consecutive const, static and assignment contents as one, so they cost one review together."""
-    merged = []
-    for content in contents:
-        previous = merged[-1] if merged else None
-        if (
-            previous is not None
-            and previous.file == content.file
-            and previous.context == content.context
-            and previous.kind in jevrev.state.MERGED
-            and content.kind in jevrev.state.MERGED
-            and content.start - previous.end <= 2
-        ):
-            gap = "\n" * (content.start - previous.end)
-            merged[-1] = previous.model_copy(
-                update={
-                    "end": content.end,
-                    "name": f"{previous.name}, {content.name}",
-                    "text": previous.text + gap + content.text,
-                }
-            )
-        else:
-            merged.append(content)
-    return merged
-
-
-def _test_cutoff(source, marker):
-    """The line number of the first line that is `marker`, after the last line when there is none."""
-    lines = source.decode(errors="replace").splitlines()
-    return next(
-        (
-            n
-            for n, line in enumerate(lines, 1)
-            if marker is not None and line == marker
-        ),
-        len(lines) + 1,
-    )
-
-
-async def _changed_hunks(files, diff, present, sets):
-    """Each hunk of `diff` that adds a line before its file's tests, as a diff of its file, its
-    file read from `files`; a file not in `present` is left out."""
-    changed = []
-    for changed_file in diff.root:
-        name = changed_file.path
-        # A submodule's diff names its directory, and an ignored file is not present.
-        if name not in present:
-            continue
-        source = await files.read(name)
-        review = _review_of(name=name, source=source, sets=sets)
-        cutoff = _test_cutoff(source, review.language.test_marker)
-        for hunk in changed_file.hunks:
-            lines = [line for line in hunk.lines if line.number < cutoff]
-            if not any(line.added for line in lines):
-                continue
-            header = (
-                f"@@ -{hunk.source_start},{hunk.source_length} "
-                f"+{hunk.target_start},{hunk.target_length} @@ {hunk.section}"
-            )
-            changed.append(
-                jevrev.state.FileDiff(
-                    file=name,
-                    start=hunk.target_start,
-                    end=lines[-1].number,
-                    name=hunk.section or jevrev.state.Evaluation.HUNK,
-                    sets=review.sets,
-                    hunks=[
-                        jevrev.state.DiffHunk(
-                            header=header.rstrip(),
-                            lines=[
-                                f"{'+' if line.added else ' '}{line.text}"
-                                for line in lines
-                            ],
-                        )
-                    ],
-                )
-            )
-    return changed
-
-
 # The context lines around each change of a diff a scan reviews.
 DIFF_CONTEXT = 20
-
-
-def _added_everywhere(diff):
-    """`diff` with every context line of its hunks marked as added, so it is judged too."""
-    return diff.model_copy(
-        update={
-            "hunks": [
-                hunk.model_copy(
-                    update={"lines": [f"+{line[1:]}" for line in hunk.lines]}
-                )
-                for hunk in diff.hunks
-            ]
-        }
-    )
-
-
-def _file_diffs(hunks):
-    """One diff per file holding all of the file's hunks."""
-    by_file = {}
-    for hunk in hunks:
-        by_file.setdefault(hunk.file, []).append(hunk)
-    return [
-        jevrev.state.FileDiff(
-            file=name,
-            start=file_hunks[0].start,
-            end=file_hunks[-1].end,
-            name=jevrev.state.Evaluation.FILE,
-            sets=file_hunks[0].sets,
-            hunks=[hunk for diff in file_hunks for hunk in diff.hunks],
-        )
-        for name, file_hunks in by_file.items()
-    ]
-
-
-def _change_states(hunks, untracked, evaluations, all_added, sets):
-    """The states that evaluate the change's `hunks` as each of `evaluations` says. An untracked
-    file is all added, so its diff is the whole file, and its hunks are its top-level contents."""
-    if all_added:
-        hunks = [_added_everywhere(hunk) for hunk in hunks]
-    states = []
-    if jevrev.state.Evaluation.FILE in evaluations:
-        new_files = []
-        for name, source in untracked.items():
-            review = _review_of(name=name, source=source, sets=sets)
-            lines = source.decode(errors="replace").splitlines()
-            lines = lines[
-                : _test_cutoff(source, review.language.test_marker) - 1
-            ]
-            new_files.append(
-                jevrev.state.FileContent(
-                    file=name,
-                    start=1,
-                    end=max(len(lines), 1),
-                    name=jevrev.state.ContentKind.FILE,
-                    kind=jevrev.state.ContentKind.FILE,
-                    context="",
-                    text="\n".join(lines),
-                    sets=review.sets,
-                )
-            )
-        states += [
-            state.model_copy(
-                update={"evaluated": jevrev.state.Evaluation.FILE}
-            )
-            for state in _file_diffs(hunks) + new_files
-        ]
-    if jevrev.state.Evaluation.HUNK in evaluations:
-        new = [
-            content
-            for name, source in untracked.items()
-            for content in _file_contents(
-                name=name,
-                source=source,
-                review=_review_of(name=name, source=source, sets=sets),
-            )
-        ]
-        states += [
-            state.model_copy(
-                update={
-                    "headless": True,
-                    "evaluated": jevrev.state.Evaluation.HUNK,
-                }
-            )
-            for state in hunks + _merge_constants(new)
-        ]
-    return states
 
 
 def _findings(state, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
@@ -384,13 +427,12 @@ def _findings(state, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
             file=state.file,
             start=state.start,
             end=state.end,
-            item=state.name,
             rule=f"{rule_set.name}#{position}",
             probability=round(answer.probability, 2),
             flags=rule.flags,
             violation=" ".join(rule.bad),
             accepted=" ".join(rule.good),
-            evaluated=state.evaluated,
+            state=state.kind,
         )
 
 
@@ -412,8 +454,8 @@ async def _ask(state, rule_set, gate, verbose, client, model):
                     {
                         "file": state.file,
                         "start": state.start,
-                        "item": state.name,
-                        "evaluated": state.evaluated,
+                        "end": state.end,
+                        "state": state.kind,
                         "request": request.model_dump(
                             mode="json", exclude_none=True
                         ),
@@ -428,17 +470,38 @@ async def _ask(state, rule_set, gate, verbose, client, model):
     return answers
 
 
-async def _texts(files, names, keep):
-    texts = {}
-    for name in names:
-        source = await files.read(name)
-        try:
-            source.decode()
-        except UnicodeDecodeError:
-            continue
-        if keep(name, source):
-            texts[name] = source
-    return texts
+@pydantic.dataclasses.dataclass(frozen=True)
+class _Unchanged:
+    """A file of a scan without a diff."""
+
+    path: jevrev.files.SourcePath
+
+    def change(self, text: str) -> None:
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _Changed:
+    """A file a diff changes."""
+
+    changed: jevrev.git.ChangedFile
+
+    @property
+    def path(self) -> jevrev.files.SourcePath:
+        return self.changed.path
+
+    def change(self, text: str) -> jevrev.git.ChangedFile:
+        return self.changed
+
+
+@pydantic.dataclasses.dataclass(frozen=True)
+class _Untracked:
+    """A file git does not track, which a diff to the files on disk adds whole."""
+
+    path: jevrev.files.SourcePath
+
+    def change(self, text: str) -> jevrev.git.ChangedFile:
+        return jevrev.git.ChangedFile.added(self.path, text)
 
 
 async def scan_states(
@@ -447,35 +510,27 @@ async def scan_states(
     ignore: jevrev.files.Ignore | None,
     diff: jevrev.git.Diff | None = None,
     untracked: collections.abc.Sequence[str] = (),
-    rule_set=None,
-    evaluate=None,
-    all_added=False,
     include: collections.abc.Sequence[str] = (),
     exclude: collections.abc.Sequence[str] = (),
 ) -> list[jevrev.state.State]:
     """The states to ask jev about. `files` holds the reviewed version, and every path is
-    relative to it. Without a diff, every file of `files` is reviewed whole; with one, its hunks
-    are, their files read from `files`, and each of `untracked` whole, as added. With `ignore`,
-    every path it matches is left out, from files' paths, diff's files and untracked alike;
-    None (--no-ignore) leaves none out. Of the paths `ignore` leaves, only those an `include`
-    pattern matches are reviewed, or every one when there are none, and none an `exclude` pattern
-    matches; both are gitignore patterns relative to `files`. A rule set's `exists` still sees
-    every path `ignore` leaves."""
-    evaluations = evaluate or [jevrev.state.Evaluation.HUNK]
-    if diff is None and (evaluate is not None or all_added):
-        raise UserError("evaluate and all_added need a diff")
+    relative to it. Without a diff, every file of `files` is a scan target; with one, each file it
+    changes, and each of `untracked`, as added whole. With `ignore`, every path it matches is left
+    out; None (--no-ignore) leaves none out. Of the paths `ignore` leaves, only those an `include`
+    pattern matches are scan targets, or every one when there are none, and none an `exclude`
+    pattern matches; both are gitignore patterns relative to `files`. A rule set's `exists` still
+    sees every path `ignore` leaves."""
     paths = await files.paths()
     if ignore is not None:
         paths = [path for path in paths if not ignore.matches(path)]
     included = pathspec.GitIgnoreSpec.from_lines(include)
     excluded = pathspec.GitIgnoreSpec.from_lines(exclude)
-    reviewed = [
+    scope = frozenset(
         path
         for path in paths
         if (not include or included.match_file(path))
         and not excluded.match_file(path)
-    ]
-    present = set(reviewed)
+    )
     sets = _sets_among(
         tuple(
             {
@@ -486,40 +541,28 @@ async def scan_states(
         ),
         paths,
     )
-    if diff is None:
-        sources = await _texts(files, reviewed, _in_whole_scan)
-        scanned = _merge_constants(
-            [
-                state
-                for name, source in sources.items()
-                for state in _file_contents(
-                    name=name,
-                    source=source,
-                    review=_review_of(name=name, source=source, sets=sets),
-                )
-            ]
+    targets: collections.abc.Sequence[_Unchanged | _Changed | _Untracked] = (
+        [_Unchanged(path) for path in paths]
+        if diff is None
+        else [_Changed(changed) for changed in diff.root]
+        + [_Untracked(path) for path in untracked]
+    )
+    states = []
+    for target in targets:
+        # A submodule's diff names its directory, and an ignored file is out of scope.
+        if target.path not in scope:
+            continue
+        source = await files.read(target.path)
+        file = ScanTargetFile(
+            path=target.path,
+            languages=jevrev.languages.detect(target.path, source),
         )
-    else:
-        scanned = _change_states(
-            hunks=await _changed_hunks(
-                files=files, diff=diff, present=present, sets=sets
-            ),
-            untracked=await _texts(
-                files,
-                [name for name in untracked if name in present],
-                lambda name, source: True,
-            ),
-            evaluations=evaluations,
-            all_added=all_added,
-            sets=sets,
-        )
-    return [
-        state.model_copy(
-            update={"sets": (rule_set,) if rule_set else state.sets}
-        )
-        for state in scanned
-        if rule_set or state.sets
-    ]
+        review = _review_of(file, sets)
+        if review is None:
+            continue
+        text = _text(file, source)
+        states += _states(review, text, target.change(text))
+    return states
 
 
 async def review(
@@ -578,16 +621,16 @@ def summary_line(scanned, source, found, failures):
 
 
 def _without_file_repeats(found):
-    """`found` without each file finding whose rule also fired on a hunk of the same file,
-    as the hunk's finding names the lines."""
-    in_hunks = {
+    """`found` without each finding on a whole file or change whose rule also fired on a hunk or
+    range of the same file, as that finding names the lines."""
+    on_lines = {
         (finding.file, finding.flags)
         for finding in found
-        if finding.evaluated == jevrev.state.Evaluation.HUNK
+        if finding.state in jevrev.state.LINE_KINDS
     }
     return [
         finding
         for finding in found
-        if finding.evaluated != jevrev.state.Evaluation.FILE
-        or (finding.file, finding.flags) not in in_hunks
+        if finding.state in jevrev.state.LINE_KINDS
+        or (finding.file, finding.flags) not in on_lines
     ]

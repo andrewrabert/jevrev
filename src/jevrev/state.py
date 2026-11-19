@@ -2,54 +2,54 @@
 
 import enum
 import pathlib
+import typing
 
 import pydantic
 
+import jevrev.files
+import jevrev.rules
 
-class Evaluation(enum.StrEnum):
-    """What a state of a change evaluates: one hunk, or all of a file's hunks."""
 
+class StateKind(enum.StrEnum):
+    """What of a file a state holds."""
+
+    # The whole file.
     FILE = "file"
+    # One hunk of a change to the file.
     HUNK = "hunk"
+    # Every hunk of a change to the file.
+    HUNKS = "hunks"
+    # One range of the file that a language yields.
+    LANGUAGE = "language"
 
 
-class ContentKind(enum.StrEnum):
-    """What a FileContent is; MERGED kinds next to each other are reviewed as one state."""
-
-    CONST = "const"
-    STATIC = "static"
-    ASSIGNMENT = "assignment"
-    DEFINITION = "definition"
-    TOP_LEVEL = "top-level"
-    FILE = "file"
-
-
-MERGED = frozenset(
-    {ContentKind.CONST, ContentKind.STATIC, ContentKind.ASSIGNMENT}
-)
+# The kinds of states that hold a few lines of a file, which a finding on one points at; the other
+# kinds hold a whole file or change.
+LINE_KINDS = frozenset({StateKind.HUNK, StateKind.LANGUAGE})
 
 
 class DiffHunk(pydantic.BaseModel):
     header: str
-    # The hunk's added and context lines, each with its `+` or ` ` prefix; removed lines are left
-    # out.
+    # The hunk's lines, each with its `+`, `-` or ` ` prefix.
     lines: list[str]
 
 
 class State(pydantic.BaseModel):
     """Lines of one file that jev is asked about, and the rule sets it is asked against."""
 
-    # The file's path from the root.
-    file: str
-    start: int
-    end: int
-    name: str
-    # The rule sets the state is reviewed against.
-    sets: tuple[pathlib.Path, ...] = ()
-    # How much of a change the state evaluates; None outside a change.
-    evaluated: Evaluation | None = None
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    kind: typing.ClassVar[StateKind]
     # Whether the rendered diff leaves out its `@@` lines.
-    headless: bool = False
+    headless: typing.ClassVar[bool] = False
+
+    file: jevrev.files.SourcePath
+    start: jevrev.files.LineNumber
+    end: jevrev.files.LineNumber
+    # The rule sets the state is reviewed against.
+    sets: typing.Annotated[
+        tuple[pathlib.Path, ...], pydantic.Field(min_length=1)
+    ]
 
     def _hunks(self) -> list[DiffHunk]:
         raise NotImplementedError
@@ -74,29 +74,45 @@ class State(pydantic.BaseModel):
         )
 
 
-class FileContent(State):
-    """A file's current content, or part of it, read from disk; every line is rendered as
-    added."""
+class _Text(State):
+    """Lines of the file as it is, every one rendered as added."""
 
-    kind: ContentKind = ContentKind.DEFINITION
-    # What the content is inside, such as its impl or class; empty at the top level.
-    context: str
     text: str
 
     def _hunks(self):
         lines = self.text.splitlines()
         return [
             DiffHunk(
-                header=f"@@ -0,0 +{self.start},{len(lines)} @@ {self.context}".rstrip(),
+                header=f"@@ -0,0 +{self.start},{len(lines)} @@",
                 lines=[f"+{line}" for line in lines],
             )
         ]
 
 
-class FileDiff(State):
-    """git's diff of one file since the base: one of its hunks, or all of them."""
+class FileState(_Text):
+    kind = StateKind.FILE
 
-    hunks: list[DiffHunk]
+
+class LanguageState(_Text):
+    kind = StateKind.LANGUAGE
+
+    language: jevrev.rules.Language
+
+
+class HunkState(State):
+    kind = StateKind.HUNK
+    headless = True
+
+    hunk: DiffHunk
+
+    def _hunks(self):
+        return [self.hunk]
+
+
+class HunksState(State):
+    kind = StateKind.HUNKS
+
+    hunks: typing.Annotated[list[DiffHunk], pydantic.Field(min_length=1)]
 
     def _hunks(self):
         return self.hunks

@@ -1,119 +1,86 @@
-"""Python: each top-level statement, and each method of a class apart from its head."""
+"""Python: each top-level statement, and each method of a class apart from its head; runs of
+assignments are one range."""
 
+import enum
 import re
 
 import tree_sitter
 import tree_sitter_python
 
 import jevrev.rules
-import jevrev.state
 from jevrev.languages import base
 
 _PARSER = tree_sitter.Parser(
     tree_sitter.Language(tree_sitter_python.language())
 )
 
+
+class _Node(enum.StrEnum):
+    """The types of tree-sitter-python nodes the ranges depend on."""
+
+    COMMENT = "comment"
+    IMPORT_STATEMENT = "import_statement"
+    IMPORT_FROM_STATEMENT = "import_from_statement"
+    FUTURE_IMPORT_STATEMENT = "future_import_statement"
+    PASS_STATEMENT = "pass_statement"
+    EXPRESSION_STATEMENT = "expression_statement"
+    ASSIGNMENT = "assignment"
+    CLASS_DEFINITION = "class_definition"
+    FUNCTION_DEFINITION = "function_definition"
+
+
+class _Field(enum.StrEnum):
+    BODY = "body"
+    # A decorated definition's definition, under its decorators.
+    DEFINITION = "definition"
+
+
 # Siblings that belong to the statement after them.
-_LEADING = {"comment"}
+_LEADING = frozenset({_Node.COMMENT})
 
 # Statements with nothing for the rule set to judge.
-_SKIPPED = {
-    "import_statement",
-    "import_from_statement",
-    "future_import_statement",
-    "comment",
-    "pass_statement",
+_SKIPPED = _LEADING | {
+    _Node.IMPORT_STATEMENT,
+    _Node.IMPORT_FROM_STATEMENT,
+    _Node.FUTURE_IMPORT_STATEMENT,
+    _Node.PASS_STATEMENT,
 }
 
 
-def _leading(node, kinds):
-    """The siblings of `kinds` directly above `node`, top first."""
-    found = []
-    sibling = node.prev_sibling
-    while sibling is not None and sibling.type in kinds:
-        below = found[0] if found else node
-        if below.start_point[0] - sibling.end_point[0] > 1:
-            break
-        found.insert(0, sibling)
-        sibling = sibling.prev_sibling
-    return found
+def _is_assignment(node):
+    return (
+        node.type == _Node.EXPRESSION_STATEMENT
+        and bool(node.named_children)
+        and node.named_children[0].type == _Node.ASSIGNMENT
+    )
 
 
-def _header_of(node, source):
-    """The text of `node` up to its body, on one line."""
-    body = node.child_by_field_name("body")
-    end = body.start_byte if body is not None else node.end_byte
-    return " ".join(source[node.start_byte : end].decode().split())
-
-
-def _name_of(node, source):
-    if node.type == "expression_statement" and node.named_children:
-        statement = node.named_children[0]
-        target = statement.child_by_field_name("left")
-        if statement.type == "assignment" and target is not None:
-            return f"assignment {source[target.start_byte : target.end_byte].decode()}"
-        return statement.type
-    name = node.child_by_field_name("name")
-    label = source[name.start_byte : name.end_byte].decode() if name else ""
-    return f"{node.type.removesuffix('_definition')} {label}".strip()
-
-
-def _kind_of(node):
-    if (
-        node.type == "expression_statement"
-        and node.named_children
-        and node.named_children[0].type == "assignment"
-    ):
-        return jevrev.state.ContentKind.ASSIGNMENT
-    return jevrev.state.ContentKind.DEFINITION
-
-
-def _contents(nodes, source, path, context=""):
-    lines = source.decode().splitlines()
-
-    def content(first, last, name, kind=jevrev.state.ContentKind.DEFINITION):
-        return jevrev.state.FileContent(
-            file=path,
-            start=first + 1,
-            end=last + 1,
-            name=name,
-            kind=kind,
-            context=context,
-            text="\n".join(lines[first : last + 1]),
-        )
-
+def _units(nodes):
     for node in nodes:
         if node.type in _SKIPPED:
             continue
-        above = _leading(node, _LEADING)
-        start = (above[0] if above else node).start_point[0]
-        definition = node.child_by_field_name("definition") or node
-        name = _name_of(definition, source)
-        body = definition.child_by_field_name("body")
-        if definition.type == "class_definition" and body is not None:
+        above = base.leading(node, _LEADING)
+        first = (above[0] if above else node).start_point[0]
+        definition = node.child_by_field_name(_Field.DEFINITION) or node
+        body = definition.child_by_field_name(_Field.BODY)
+        if definition.type == _Node.CLASS_DEFINITION and body is not None:
             methods = [
                 c
                 for c in body.named_children
-                if (c.child_by_field_name("definition") or c).type
-                == "function_definition"
+                if (c.child_by_field_name(_Field.DEFINITION) or c).type
+                == _Node.FUNCTION_DEFINITION
             ]
             if methods:
-                first = _leading(methods[0], _LEADING) or [methods[0]]
-                yield content(
-                    first=start, last=first[0].start_point[0] - 1, name=name
-                )
-                yield from _contents(
-                    nodes=methods,
-                    source=source,
-                    path=path,
-                    context=_header_of(definition, source),
-                )
+                head_end = (
+                    base.leading(methods[0], _LEADING) or [methods[0]]
+                )[0].start_point[0]
+                yield base.Unit(first=first, last=head_end - 1)
+                yield from _units(methods)
                 continue
-        yield content(
-            first=start,
+        yield base.Unit(
+            first=first,
             last=node.end_point[0],
-            name=name,
-            kind=_kind_of(definition),
+            mergeable=_is_assignment(definition),
         )
 
 
@@ -127,11 +94,8 @@ class Python(base.Language):
     )
 
     @classmethod
-    def contents(cls, source, path):
-        return list(
-            _contents(
-                nodes=_PARSER.parse(source).root_node.named_children,
-                source=source,
-                path=path,
-            )
-        )
+    def states(cls, text):
+        root = _PARSER.parse(text.encode(errors="surrogateescape")).root_node
+        if root.has_error:
+            raise base.ParseError("not valid Python")
+        return base.tile(_units(root.named_children), len(text.splitlines()))

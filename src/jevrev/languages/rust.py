@@ -1,112 +1,79 @@
-"""Rust: each top-level item, each item of an inline module, and each method of an impl or trait."""
+"""Rust: each top-level item, each item of an inline module, and each method of an impl or trait;
+runs of consts and statics are one range."""
+
+import enum
 
 import tree_sitter
 import tree_sitter_rust
 
 import jevrev.rules
-import jevrev.state
 from jevrev.languages import base
 
 _PARSER = tree_sitter.Parser(tree_sitter.Language(tree_sitter_rust.language()))
 
+
+class _Node(enum.StrEnum):
+    """The types of tree-sitter-rust nodes the ranges depend on."""
+
+    LINE_COMMENT = "line_comment"
+    BLOCK_COMMENT = "block_comment"
+    ATTRIBUTE_ITEM = "attribute_item"
+    INNER_ATTRIBUTE_ITEM = "inner_attribute_item"
+    USE_DECLARATION = "use_declaration"
+    EXTERN_CRATE_DECLARATION = "extern_crate_declaration"
+    EMPTY_STATEMENT = "empty_statement"
+    CONST_ITEM = "const_item"
+    STATIC_ITEM = "static_item"
+    MOD_ITEM = "mod_item"
+    IMPL_ITEM = "impl_item"
+    TRAIT_ITEM = "trait_item"
+    FUNCTION_ITEM = "function_item"
+    FUNCTION_SIGNATURE_ITEM = "function_signature_item"
+
+
+class _Field(enum.StrEnum):
+    BODY = "body"
+
+
 # Siblings that belong to the item after them.
-_LEADING = {"line_comment", "block_comment", "attribute_item"}
+_LEADING = frozenset(
+    {_Node.LINE_COMMENT, _Node.BLOCK_COMMENT, _Node.ATTRIBUTE_ITEM}
+)
 
 # Items with nothing for the rule set to judge.
-_SKIPPED = {
-    "use_declaration",
-    "extern_crate_declaration",
-    "inner_attribute_item",
-    "line_comment",
-    "block_comment",
-    "attribute_item",
-    "empty_statement",
+_SKIPPED = _LEADING | {
+    _Node.USE_DECLARATION,
+    _Node.EXTERN_CRATE_DECLARATION,
+    _Node.INNER_ATTRIBUTE_ITEM,
+    _Node.EMPTY_STATEMENT,
 }
 
-# The kind of each node type that is not a definition.
-_NODE_KINDS = {
-    "const_item": jevrev.state.ContentKind.CONST,
-    "static_item": jevrev.state.ContentKind.STATIC,
-}
+_MERGEABLE = frozenset({_Node.CONST_ITEM, _Node.STATIC_ITEM})
+
+_METHODS = frozenset({_Node.FUNCTION_ITEM, _Node.FUNCTION_SIGNATURE_ITEM})
 
 
-def _leading(node, kinds):
-    """The siblings of `kinds` directly above `node`, top first."""
-    found = []
-    sibling = node.prev_sibling
-    while sibling is not None and sibling.type in kinds:
-        below = found[0] if found else node
-        if below.start_point[0] - sibling.end_point[0] > 1:
-            break
-        found.insert(0, sibling)
-        sibling = sibling.prev_sibling
-    return found
-
-
-def _header_of(node, source):
-    """The text of `node` up to its body, on one line."""
-    body = node.child_by_field_name("body")
-    end = body.start_byte if body is not None else node.end_byte
-    return " ".join(source[node.start_byte : end].decode().split())
-
-
-def _is_test(node, source):
-    return node.type == "attribute_item" and b"cfg(test)" in source[
-        node.start_byte : node.end_byte
-    ].replace(b" ", b"")
-
-
-def _name_of(node, source):
-    name = node.child_by_field_name("name")
-    if name is None:
-        name = node.child_by_field_name("type")
-    label = source[name.start_byte : name.end_byte].decode() if name else ""
-    return f"{node.type.removesuffix('_item')} {label}".strip()
-
-
-def _contents(nodes, source, path, context=""):
-    lines = source.decode().splitlines()
+def _units(nodes):
     for node in nodes:
         if node.type in _SKIPPED:
             continue
-        above = _leading(node, _LEADING)
-        if any(_is_test(a, source) for a in above):
+        above = base.leading(node, _LEADING)
+        body = node.child_by_field_name(_Field.BODY)
+        if node.type == _Node.MOD_ITEM and body is not None:
+            yield from _units(body.named_children)
             continue
-        body = node.child_by_field_name("body")
-        if node.type == "mod_item" and body is not None:
-            yield from _contents(
-                nodes=body.named_children,
-                source=source,
-                path=path,
-                context=_header_of(node, source),
-            )
-            continue
-        if node.type in ("impl_item", "trait_item") and body is not None:
-            methods = [
-                c
-                for c in body.named_children
-                if c.type in ("function_item", "function_signature_item")
-            ]
+        if (
+            node.type in (_Node.IMPL_ITEM, _Node.TRAIT_ITEM)
+            and body is not None
+        ):
+            methods = [c for c in body.named_children if c.type in _METHODS]
             if methods:
-                yield from _contents(
-                    nodes=methods,
-                    source=source,
-                    path=path,
-                    context=_header_of(node, source),
-                )
+                yield from _units(methods)
                 continue
-        start = (above[0] if above else node).start_point[0]
-        end = node.end_point[0]
-        yield jevrev.state.FileContent(
-            file=path,
-            start=start + 1,
-            end=end + 1,
-            name=_name_of(node, source),
-            kind=_NODE_KINDS.get(
-                node.type, jevrev.state.ContentKind.DEFINITION
-            ),
-            context=context,
-            text="\n".join(lines[start : end + 1]),
+        yield base.Unit(
+            first=(above[0] if above else node).start_point[0],
+            last=node.end_point[0],
+            mergeable=node.type in _MERGEABLE,
         )
 
 
@@ -116,11 +83,8 @@ class Rust(base.Language):
     test_marker = "#[cfg(test)]"
 
     @classmethod
-    def contents(cls, source, path):
-        return list(
-            _contents(
-                nodes=_PARSER.parse(source).root_node.named_children,
-                source=source,
-                path=path,
-            )
-        )
+    def states(cls, text):
+        root = _PARSER.parse(text.encode(errors="surrogateescape")).root_node
+        if root.has_error:
+            raise base.ParseError("not valid Rust")
+        return base.tile(_units(root.named_children), len(text.splitlines()))

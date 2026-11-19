@@ -1,4 +1,4 @@
-"""Markdown: the whole file is one state."""
+"""Markdown: the whole file is one range."""
 
 import jevrev.rules
 from jevrev.languages import base

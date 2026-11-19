@@ -2,6 +2,7 @@
 with paths and line text decoded from git's bytes."""
 
 import asyncio
+import enum
 import os
 import pathlib
 import typing
@@ -46,13 +47,46 @@ def _decode(raw: bytes) -> str:
     return raw.decode(errors="surrogateescape")
 
 
-class Line(pydantic.BaseModel):
-    """An added or context line of a hunk."""
+class HunkLineKind(enum.StrEnum):
+    ADDED = "added"
+    CONTEXT = "context"
+    REMOVED = "removed"
 
-    added: bool
-    # The line's number in the file after the change.
-    number: int
+
+class HunkLine(pydantic.BaseModel):
+    """A line of a hunk."""
+
+    # The character a diff writes before the line, as libgit2 gives it in a line's origin.
+    prefix: typing.ClassVar[str]
+
     text: str
+
+
+class AddedLine(HunkLine):
+    prefix = "+"
+    kind: typing.Literal[HunkLineKind.ADDED] = HunkLineKind.ADDED
+    # The line's number in the file after the change.
+    number: jevrev.files.LineNumber
+
+
+class ContextLine(HunkLine):
+    prefix = " "
+    kind: typing.Literal[HunkLineKind.CONTEXT] = HunkLineKind.CONTEXT
+    # The line's number in the file after the change.
+    number: jevrev.files.LineNumber
+
+
+class RemovedLine(HunkLine):
+    """A line of the file before the change that the change removes; it is at the position of
+    the hunk's lines it is among."""
+
+    prefix = "-"
+    kind: typing.Literal[HunkLineKind.REMOVED] = HunkLineKind.REMOVED
+
+
+type Line = typing.Annotated[
+    AddedLine | ContextLine | RemovedLine, pydantic.Field(discriminator="kind")
+]
 
 
 class Hunk(pydantic.BaseModel):
@@ -62,20 +96,68 @@ class Hunk(pydantic.BaseModel):
     target_length: int
     # The function or section git names after the hunk's `@@` line; empty when none.
     section: str
-    # Removed lines are left out: they are the old content, which nothing reviews.
     lines: list[Line]
 
 
 class ChangedFile(pydantic.BaseModel):
     """A file the diff adds or modifies, by its path."""
 
-    path: str
+    path: jevrev.files.SourcePath
     hunks: list[Hunk]
+
+    @classmethod
+    def added(cls, path: str, text: str) -> "ChangedFile":
+        """The file at path, of text, added whole."""
+        lines = text.splitlines()
+        return cls(
+            path=path,
+            hunks=[
+                Hunk(
+                    source_start=0,
+                    source_length=0,
+                    target_start=1,
+                    target_length=len(lines),
+                    section="",
+                    lines=[
+                        AddedLine(number=n, text=line)
+                        for n, line in enumerate(lines, 1)
+                    ],
+                )
+            ]
+            if lines
+            else [],
+        )
 
 
 class Diff(pydantic.RootModel[list[ChangedFile]]):
     """The text files a diff adds or modifies. Removed and binary files are left out, and so is a
-    file whose path or added and context lines are not UTF-8: it is not text to review."""
+    file whose path or added and context lines are not UTF-8: it is not text to review. Removed
+    lines keep git's bytes, decoded with surrogateescape."""
+
+
+class _NoNewlineNote(enum.StrEnum):
+    """The origin of a note libgit2 adds to a hunk that a side does not end in a newline; not a
+    line of the file."""
+
+    BOTH = "="
+    NEW = ">"
+    OLD = "<"
+
+
+def _line(line: pygit2.DiffLine) -> Line | None:
+    """line as a line of the hunk; None for a note that a side does not end in a newline."""
+    text = _decode(line.raw_content).removesuffix("\n")
+    match line.origin:
+        case AddedLine.prefix:
+            return AddedLine(number=line.new_lineno, text=text)
+        case ContextLine.prefix:
+            return ContextLine(number=line.new_lineno, text=text)
+        case RemovedLine.prefix:
+            return RemovedLine(text=text)
+        case origin if origin in _NoNewlineNote:
+            return None
+        case origin:
+            raise GitError(f"unknown diff line origin {origin!r}")
 
 
 def _changed_file(patch: pygit2.Patch, path: str) -> ChangedFile | None:
@@ -98,13 +180,9 @@ def _changed_file(patch: pygit2.Patch, path: str) -> ChangedFile | None:
                 target_length=hunk.new_lines,
                 section=hunk.header.split("@@", 2)[2].strip(),
                 lines=[
-                    Line(
-                        added=line.origin == "+",
-                        number=line.new_lineno,
-                        text=_decode(line.raw_content).removesuffix("\n"),
-                    )
+                    parsed
                     for line in hunk.lines
-                    if line.origin in ("+", " ")
+                    if (parsed := _line(line)) is not None
                 ],
             )
             for hunk in patch.hunks
@@ -114,6 +192,7 @@ def _changed_file(patch: pygit2.Patch, path: str) -> ChangedFile | None:
         _is_utf8(hunk.section) and _is_utf8(line.text)
         for hunk in changed.hunks
         for line in hunk.lines
+        if not isinstance(line, RemovedLine)
     ):
         return changed
     return None

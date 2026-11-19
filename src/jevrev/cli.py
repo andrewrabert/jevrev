@@ -229,7 +229,7 @@ def _print_findings(findings: list[jevrev.store.Finding], summary: str):
                 " ",
                 (f"{f.probability:.2f}", _probability_style(f.probability)),
                 " ",
-                (f.item, "cyan"),
+                (f.state, "cyan"),
             )
         )
         console.print(rich.text.Text(f"    {f.flags}"))
@@ -414,12 +414,6 @@ async def _run_jev_scan(
                 untracked=untracked,
                 include=include,
                 exclude=exclude,
-                evaluate=None
-                if diff is None
-                else [
-                    jevrev.state.Evaluation.HUNK,
-                    jevrev.state.Evaluation.FILE,
-                ],
             )
             found, failures = await jevrev.jev.scan.review(
                 scanned=scanned,
@@ -663,7 +657,7 @@ def _pr_comment(
     body = _render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
     )
-    if f.evaluated != jevrev.state.Evaluation.FILE:
+    if f.state in jevrev.state.LINE_KINDS:
         for hunk in hunks.get(f.file, []):
             start, end = max(f.start, hunk.start), min(f.end, hunk.stop - 1)
             if start <= end:
@@ -934,15 +928,15 @@ fields of each line:
   index        the finding's INDEX for confirm and reject, from 1
   file         the finding's file, relative to the scanned source
   start, end   the finding's first and last lines
-  item         the definition, run of code, hunk or file the lines are in
   rule         the rule's id: its rule set's file name and its position in
                it, from 1, such as text.yaml#1
   probability  how likely jev judges the rule broken, 0 to 1
   flags        what the rule flags, as its rule set states it
   violation    the rule's examples of what breaks it
   accepted     the rule's examples of what keeps it
-  evaluated    what jev was given of a change: "hunk", one changed hunk, or
-               "file", all of a file's changed hunks; absent outside a change"""
+  state        what jev was given of the file: "file", the whole file; "hunk",
+               one hunk of a change; "hunks", all of a file's changed hunks;
+               or "language", one range of the file that a language yields"""
 
 _JUDGE_NOTES = """\
 A finding's verdict cannot be changed. A command holds the review file's lock

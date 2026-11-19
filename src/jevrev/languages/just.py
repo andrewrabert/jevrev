@@ -1,4 +1,4 @@
-"""just: the whole justfile is one state."""
+"""just: the whole justfile is one range."""
 
 import jevrev.rules
 from jevrev.languages import base
