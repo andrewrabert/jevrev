@@ -59,16 +59,16 @@ def _load_review(store: jevrev.db.Store) -> jevrev.db.Review:
 
 
 @contextlib.contextmanager
-def _open_review(path: pathlib.Path, lock_timeout: float):
+def _open_review(path: pathlib.Path):
     if not path.is_file():
         raise UserError(f"{path}: no such db file")
-    with jevrev.db.open_db(path, lock_timeout) as store:
+    with jevrev.db.open_db(path) as store:
         yield store
 
 
 def _judged_review(args) -> jevrev.db.Review:
     """The review in the db. Fails while any finding has no verdict."""
-    with _open_review(args.db, args.lock_timeout) as store:
+    with _open_review(args.db) as store:
         review = _load_review(store)
     if unjudged := [
         str(finding.index)
@@ -171,7 +171,7 @@ async def _cmd_scan(args):
         ],
     )
     try:
-        with jevrev.db.open_db(db, args.lock_timeout) as store:
+        with jevrev.db.open_db(db) as store:
             store.save(review)
     except BaseException:
         db.unlink(missing_ok=True)
@@ -232,7 +232,7 @@ async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
 
 
 async def _cmd_pending(args):
-    with _open_review(args.db, args.lock_timeout) as store:
+    with _open_review(args.db) as store:
         review = _load_review(store)
     sys.stdout.write(
         "".join(
@@ -260,7 +260,7 @@ async def _cmd_reject(args):
 
 async def _judge(args, verdict: jevrev.db.Verdict):
     index = args.index
-    with _open_review(args.db, args.lock_timeout) as store:
+    with _open_review(args.db) as store:
         review = _load_review(store)
         count = len(review.findings)
         if not 1 <= index <= count:
@@ -514,13 +514,6 @@ def _pr_review(
     )
 
 
-def _positive_float(value):
-    number = float(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError(f"{value} is not positive")
-    return number
-
-
 def _positive_int(value):
     number = int(value)
     if number <= 0:
@@ -568,14 +561,6 @@ def _parser():
         metavar="FILE",
         help="SQLite file holding one review: its dir, base, pull request, "
         "metadata, findings, and verdicts",
-    )
-    db_group.add_argument(
-        "--lock-timeout",
-        type=_positive_float,
-        default=3600,
-        metavar="SECONDS",
-        help="Seconds to wait for another command to release the db "
-        "[default: 3600]",
     )
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"

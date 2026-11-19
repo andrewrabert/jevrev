@@ -4,8 +4,7 @@ exists exactly as written.
 
 ## `jevrev`
 ```
---db <FILE>               SQLite file holding one review: its dir, base, pull request, metadata, findings, and verdicts
---lock-timeout <SECONDS>  Seconds to wait for another command to release the db [default: 3600]
+--db <FILE>  SQLite file holding one review: its dir, base, pull request, metadata, findings, and verdicts
 
 COMMAND:
   scan     Run jev over a directory, or a clone of a pull request, into a new db: the change from a base, or every file when full; print the scan's summary

@@ -14,7 +14,7 @@ import jevrev.github.repo
 import jevrev.jev.scan
 import jevrev.state
 
-# Raised when the db can't be opened, read, or locked in time.
+# Raised when the db can't be opened or read, or another command holds its lock.
 OperationalError = sqlite3.OperationalError
 
 
@@ -196,10 +196,11 @@ class Store:
 
 
 @contextlib.contextmanager
-def open_db(path: pathlib.Path, lock_timeout: float):
-    """The db at path, holding its write lock until exit."""
+def open_db(path: pathlib.Path):
+    """The db at path, holding its write lock until exit. Fails at once if
+    another command holds the lock."""
     with contextlib.closing(
-        sqlite3.connect(path, timeout=lock_timeout, autocommit=True)
+        sqlite3.connect(path, timeout=0, autocommit=True)
     ) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
