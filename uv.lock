@@ -25,22 +25,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bashkit"
-version = "0.21.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a1/9d/9cff0266acbc2b478662bdf383c5db77552def10578266222a2c7b86f791/bashkit-0.21.0.tar.gz", hash = "sha256:f4cea93349fceae548904f6213f3d5712bb218d871dd7c752cbfa81cd7c33370", size = 12759217, upload-time = "2026-11-11T00:46:02.473Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/79/1a/9170a911a09f4293b3846b65c827c9687185ccf4c60630a533d27c11721b/bashkit-0.21.0-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:c69442d94bd9e538849ef51c7c2adfe8113f68341f7b1ed7383e98ea83baab44", size = 19206856, upload-time = "2026-11-11T00:45:37.396Z" },
-    { url = "https://files.pythonhosted.org/packages/b7/f5/ef3627b0e99ef973d3963ad2cfe2ccd3db5a3fd68424db5d0e33ed247093/bashkit-0.21.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:90027f9e87a5943b1ef048c70ab1cc84874c685f5f7d20da956ae8725577af8d", size = 18036503, upload-time = "2026-11-11T00:45:40.703Z" },
-    { url = "https://files.pythonhosted.org/packages/63/03/fc8cf264fa6d5624ae461701f1437f1ecd62b984e1e689e69e28b56cbbc2/bashkit-0.21.0-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:cb7a79ed4af2b444015468748ba56bedd0ef870fc2f115b3a48dd01f3d281232", size = 18995238, upload-time = "2026-11-11T00:45:43.872Z" },
-    { url = "https://files.pythonhosted.org/packages/86/5f/c9d3d32d20f291b16fb34e1e5aea88349b881e76871513ffd4bc79a2433c/bashkit-0.21.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:70f8c1549a9d951126662075f9f1ced0f79f36adb348b43b52814de0984925f4", size = 20244316, upload-time = "2026-11-11T00:45:47.17Z" },
-    { url = "https://files.pythonhosted.org/packages/2f/6e/fbab6ce3a5f92c178d72b605d965dae20473dc69a5ded2afddf36904f1cd/bashkit-0.21.0-cp39-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:32d22cd910310f1ec50f1a18e97a3d9be6a259ebd36580a6d80614df3d832c0b", size = 19117366, upload-time = "2026-11-11T00:45:50.834Z" },
-    { url = "https://files.pythonhosted.org/packages/89/1b/f1dabd5b94cf90ced7d136cb2052bae3202c97552f97d77dd2cc9eff8562/bashkit-0.21.0-cp39-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:3acae81535f46347f161245405f75d62176f3fdea1daba7a70c39b27ed1c4e52", size = 20557274, upload-time = "2026-11-11T00:45:54.616Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/06/d460538f13bdb881fa5d18f4d2d013d2e4e568ff026862d7b7e2da299821/bashkit-0.21.0-cp39-abi3-pyemscripten_2025_0_wasm32.whl", hash = "sha256:55239648bec41cca92148e1e2b3552728b6d47d48110595427df597321b6a586", size = 8081901, upload-time = "2026-11-11T00:45:57.039Z" },
-    { url = "https://files.pythonhosted.org/packages/54/a8/858a6677ca097c835c099cc6d0537bc080b951f5b9c5691d08f228d93f6e/bashkit-0.21.0-cp39-abi3-win_amd64.whl", hash = "sha256:6cf08e7bebe74235805b69d48a469e05613c2c78be230d7491f6e7e6fa0781cb", size = 20037147, upload-time = "2026-11-11T00:45:59.591Z" },
-]
-
-[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -97,12 +81,10 @@ wheels = [
 ]
 
 [[package]]
-name = "jev-code-review"
+name = "jev-review"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "annotated-types" },
-    { name = "bashkit" },
     { name = "minijinja" },
     { name = "pathspec" },
     { name = "pydantic" },
@@ -119,8 +101,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "annotated-types", specifier = ">=0.8,<0.9" },
-    { name = "bashkit", specifier = ">=0.21,<0.22" },
     { name = "minijinja", specifier = ">=3.1,<4" },
     { name = "pathspec", specifier = ">=1.1.1,<2" },
     { name = "pydantic", specifier = ">=2.14.3,<3" },

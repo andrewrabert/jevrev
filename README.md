@@ -1,15 +1,18 @@
-# jev-code-review
+# jev-review
 
-A CLI that runs jev over a pull request or two revisions of a local git dir, judges each finding in a read-only [bashkit](https://pypi.org/project/bashkit/) sandbox, and posts the confirmed findings as a review on the pull request.
+A CLI that runs jev over a directory or a GitHub pull request, records a verdict on each finding, and prints the review or posts it on the pull request.
 
 Give the directory of rule sets to review against with `--rules` or `JEV_RULES_DIR`. [example_rules](example_rules) holds examples.
 
-A review's data is in one SQLite state file given by `--state`. Its clone is kept under `--cache-dir` until the review finishes or is cancelled. [cli.md](cli.md) is the CLI's surface.
+A review is one SQLite file given by `--db`. A pull request is cloned under `--cache-dir` and left there. [cli.md](cli.md) is the CLI's surface.
 
 ```sh
-jev-code-review --state review.db review start --repo github.com/ORG/NAME --pr 12 --rules example_rules
-jev-code-review --state review.db review file-read --file-path /sandbox/jev-findings.jsonl
-jev-code-review --state review.db review jev-confirm 1 "Why the lines break the rule"
-jev-code-review --state review.db review finish
-jev-code-review --state review.db review show
+jev-review --db review.db scan --repo github.com/ORG/NAME --pr 12 --rules example_rules
+jev-review --db review.db pending
+jev-review --db review.db confirm 1 "Why the lines break the rule"
+jev-review --db review.db reject 2 "Why the lines do not break the rule"
+jev-review --db review.db show --format md
+jev-review --db review.db post
 ```
+
+`scan --dir DIR --base REV` scans a git dir's change from REV in place, and `scan --dir DIR --full` scans every file of any directory.

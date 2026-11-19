@@ -1,11 +1,8 @@
-"""Ask TypeSafe's Jev whether the text on stdin breaks each rule of a rule set, and print one answer per rule as JSON."""
+"""Ask TypeSafe's Jev whether a state breaks each rule of a rule set."""
 
-import argparse
-import asyncio
 import json
 import os
 import pathlib
-import sys
 import typing
 
 import pydantic
@@ -14,26 +11,10 @@ import typesafe_sdk
 import yaml
 import yarl
 
-import jev_rules.models
+import jev_review.rules
 
 # Jev's context window in tokens, estimated as a payload's bytes over 4.
 MAX_CONTEXT_TOKENS = 32_000
-
-# Exit status when the request would fail or waste a call, so nothing was sent.
-REJECTED = 2
-
-EPILOG = """\
-examples:
-  git diff -W | jev-ask -r standards.yaml
-  jev-ask --dry-run -r standards.yaml < /dev/null
-
-settings, read from the environment, then TYPESAFE_ENV_FILE:
-  TYPESAFE_API_KEY        API key
-  TYPESAFE_DEFAULT_MODEL  model; default jev-latest
-  TYPESAFE_BASE_URL       API root; default https://api.typesafe.ai
-  TYPESAFE_TIMEOUT        seconds per request; default 90
-  TYPESAFE_ENV_FILE       dotenv file holding the settings above; read from the environment only
-"""
 
 
 class UserError(Exception):
@@ -74,10 +55,6 @@ class Settings(pydantic_settings.BaseSettings):
         description="Seconds per request; the SDK's own default of 10 cuts "
         "off long states.",
     )
-
-
-def json_dumps(data):
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def parse_value(text):
@@ -141,7 +118,7 @@ class Request(pydantic.BaseModel):
         return self.model_dump_json(exclude_none=True)
 
 
-def noul(rule: jev_rules.models.Rule) -> Noul:
+def noul(rule: jev_review.rules.Rule) -> Noul:
     """The noul jev is asked: true when the code is what the rule flags."""
     return Noul(
         instructions=Instructions(task=TASK, flags=rule.flags),
@@ -159,7 +136,7 @@ def question_name(position):
 def parse_rules(text):
     """The nouls jev is asked for a rule set, each named by question_name."""
     try:
-        rule_set = jev_rules.models.RuleSet.model_validate(parse_value(text))
+        rule_set = jev_review.rules.RuleSet.model_validate(parse_value(text))
     except pydantic.ValidationError as e:
         raise UserError(str(e)) from e
     return {
@@ -249,53 +226,3 @@ async def ask(request: Request, settings: Settings) -> dict:
     except typesafe_sdk.TypeSafeError as e:
         raise UserError(str(e)) from e
     return summary(response)
-
-
-async def main():
-    parser = argparse.ArgumentParser(
-        prog="jev-ask",
-        description=__doc__,
-        epilog=EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "-r",
-        "--rules",
-        type=pathlib.Path,
-        required=True,
-        help="rule set file (YAML or JSON)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print the request that would be sent, and exit without sending it",
-    )
-    args = parser.parse_args()
-    questions = load_questions(args.rules)
-    if sys.stdin.isatty():
-        raise UserError("no input given, and stdin is a terminal")
-    state = sys.stdin.read()
-    settings = load_settings()
-    request = build_request(
-        questions=questions, state=state, settings=settings
-    )
-    if args.dry_run:
-        print(request.to_json())
-        return
-    print(json_dumps(await ask(request, settings)))
-
-
-def cli():
-    try:
-        sys.exit(asyncio.run(main()))
-    except UserError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Rejected as e:
-        for line in rejected_lines(e):
-            print(line, file=sys.stderr)
-        sys.exit(REJECTED)
-
-
-if __name__ == "__main__":
-    cli()

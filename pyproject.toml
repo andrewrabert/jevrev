@@ -1,11 +1,9 @@
 [project]
-name = "jev-code-review"
+name = "jev-review"
 version = "0.1.0"
-description = "Run jev over a pull request or a local git dir, judge its findings, and post the confirmed ones as a review"
+description = "Run jev over a directory or a GitHub pull request, judge its findings, and print the review or post it on the pull request"
 requires-python = ">=3.14"
 dependencies = [
-  "annotated-types>=0.8,<0.9",
-  "bashkit>=0.21,<0.22",
   "minijinja>=3.1,<4",
   "pathspec>=1.1.1,<2",
   "pydantic>=2.14.3,<3",
@@ -21,11 +19,11 @@ dependencies = [
 ]
 
 [project.scripts]
-jev-code-review = "jev_pr_review.review:cli"
+jev-review = "jev_review.cli:cli"
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = ["github", "jev_pr_review", "jev_rules"]
+module-name = "jev_review"

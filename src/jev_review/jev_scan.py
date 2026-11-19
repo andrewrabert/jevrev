@@ -1,6 +1,7 @@
-"""Review code and text with jev rule sets and print the findings as JSON lines: every top-level item of the files in a known language under a root, or the hunks of any text file changed since a revision. Each file is reviewed against the rule sets under --rules whose `when` matches it."""
+"""Scan code and text with jev rule sets: every top-level item of the files in a known language
+under a root, or the hunks of any text file changed since a revision. Each file is reviewed
+against the rule sets under the rules directory whose `when` matches it."""
 
-import argparse
 import asyncio
 import dataclasses
 import enum
@@ -20,9 +21,8 @@ import tree_sitter_rust
 import unidiff
 import yaml
 
-import jev_pr_review.jev_ask
-import jev_pr_review.process
-import jev_rules.models
+import jev_review.jev_ask
+import jev_review.rules
 
 # Siblings that belong to the item after them.
 LEADING = {"line_comment", "block_comment", "attribute_item"}
@@ -64,7 +64,7 @@ class Syntax:
     test_marker: str | None = None
 
 
-LanguageName = jev_rules.models.Language
+LanguageName = jev_review.rules.Language
 
 # The languages a rule set's `when.language` can name.
 SYNTAXES = {
@@ -121,7 +121,7 @@ def detect_language(name, source) -> LanguageName | None:
 @functools.cache
 def read_set(path):
     try:
-        return jev_rules.models.RuleSet.model_validate(
+        return jev_review.rules.RuleSet.model_validate(
             yaml.safe_load(path.read_text(encoding="utf-8"))
         )
     except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
@@ -368,14 +368,14 @@ def json_dumps(data):
 
 
 async def run(*argv, stdin=None, cwd=None):
-    proc = await jev_pr_review.process.start(
+    proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await jev_pr_review.process.communicate(proc, stdin)
+    stdout, stderr = await proc.communicate(stdin)
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
@@ -828,26 +828,6 @@ async def changed_items(root, pathspecs, base, context, sets):
 
 DEFAULT_CONTEXT = 20
 
-FULL_CONTEXT = "full"
-
-# A git diff context length longer than any file, so each file's diff is one hunk.
-WHOLE_FILE_LINES = 100_000_000
-
-
-def context_lines(value):
-    """The lines of context a --context value asks for: a count, or every line for `full`."""
-    if value == FULL_CONTEXT:
-        return WHOLE_FILE_LINES
-    try:
-        lines = int(value)
-    except ValueError:
-        lines = -1
-    if lines < 0:
-        raise argparse.ArgumentTypeError(
-            f"expected a count of lines, 0 or more, or {FULL_CONTEXT}; got {value!r}"
-        )
-    return lines
-
 
 def added_everywhere(item):
     """`item` with every context line of its hunks marked as added, so it is judged too."""
@@ -979,9 +959,7 @@ def findings(item, root, answers, rule_set):
     """The rules of `rule_set` that jev's answers for `item` meet its error threshold on, as findings."""
     parsed = read_set(rule_set)
     for position, rule in enumerate(parsed.rules, 1):
-        probability = answers.get(
-            jev_pr_review.jev_ask.question_name(position)
-        )
+        probability = answers.get(jev_review.jev_ask.question_name(position))
         if probability is None or probability < parsed.error_threshold:
             continue
         yield Finding(
@@ -1002,16 +980,16 @@ async def ask(item, rule_set, gate, verbose, settings):
     state = item.state if item.state is not None else item.diff
     async with gate:
         try:
-            request = jev_pr_review.jev_ask.build_request(
-                questions=jev_pr_review.jev_ask.load_questions(rule_set),
+            request = jev_review.jev_ask.build_request(
+                questions=jev_review.jev_ask.load_questions(rule_set),
                 state=state,
                 settings=settings,
             )
-        except jev_pr_review.jev_ask.UserError as e:
+        except jev_review.jev_ask.UserError as e:
             raise AskFailed(item, str(e))
-        except jev_pr_review.jev_ask.Rejected as e:
+        except jev_review.jev_ask.Rejected as e:
             raise AskFailed(
-                item, "\n".join(jev_pr_review.jev_ask.rejected_lines(e))
+                item, "\n".join(jev_review.jev_ask.rejected_lines(e))
             )
         if verbose:
             print(
@@ -1029,133 +1007,10 @@ async def ask(item, rule_set, gate, verbose, settings):
                 file=sys.stderr,
             )
         try:
-            answers = await jev_pr_review.jev_ask.ask(request, settings)
-        except jev_pr_review.jev_ask.UserError as e:
+            answers = await jev_review.jev_ask.ask(request, settings)
+        except jev_review.jev_ask.UserError as e:
             raise AskFailed(item, str(e))
     return Answers.model_validate(answers).root
-
-
-async def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "paths",
-        nargs="*",
-        type=pathlib.Path,
-        metavar="PATH",
-        help="files or directories to review, relative to --root; default: the whole root. A "
-        "directory without --base scans its files in a known language, and with --base every "
-        "changed text file",
-    )
-    parser.add_argument(
-        "--root",
-        type=pathlib.Path,
-        help="the directory PATHs are relative to, each rule set's `when.pattern` is matched "
-        "from, and git runs in; default: the git repository holding the current directory. "
-        "Outside a git repository every file counts as new",
-    )
-    rules_group = parser.add_argument_group("rule sets")
-    rules_group.add_argument(
-        "--rules",
-        metavar="DIR",
-        type=pathlib.Path,
-        default=env_path("JEV_RULES_DIR"),
-        help="the directory of rule sets; every *.yaml under it, at any depth, whose `when` "
-        "matches a file reviews it; default: $JEV_RULES_DIR; one of the two is required",
-    )
-    rules_group.add_argument(
-        "--extra-rules",
-        metavar="DIRS",
-        type=path_list,
-        default=path_list(os.environ.get("JEV_RULES_EXTRA", "")),
-        help=f"more directories of rule sets, separated by {os.pathsep!r}, read as "
-        "--rules is and used alongside it; default: $JEV_RULES_EXTRA",
-    )
-    rules_group.add_argument(
-        "--set",
-        dest="rule_set",
-        type=pathlib.Path,
-        help="rule set for every item; default: each set under --rules whose `when` "
-        "matches the file",
-    )
-    change_group = parser.add_argument_group("change")
-    change_group.add_argument(
-        "--base",
-        help="review only what changed from this revision's merge-base with HEAD to the "
-        "working tree, plus untracked files; HEAD reviews uncommitted changes",
-    )
-    change_group.add_argument(
-        "-e",
-        "--evaluate",
-        action="append",
-        type=Evaluation,
-        choices=list(Evaluation),
-        help="with --base, what each request evaluates: the full diff, each file's diff, or "
-        "each hunk of it; repeatable; default: hunk",
-    )
-    change_group.add_argument(
-        "-C",
-        "--context",
-        type=context_lines,
-        metavar="LINES",
-        help="with --base, the lines of context on each side of a hunk, or "
-        f"{FULL_CONTEXT} for every line of the file; default: {DEFAULT_CONTEXT}",
-    )
-    change_group.add_argument(
-        "-a",
-        "--all-added",
-        action="store_true",
-        help="with --base, mark every line of each evaluated hunk as added, so jev judges the "
-        "unchanged lines too",
-    )
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print each item's diff instead of asking jev",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="print each request sent to jev to stderr as a JSON line",
-    )
-    args = parser.parse_args()
-    if args.rules is None:
-        parser.error("give --rules or set JEV_RULES_DIR")
-    root, scanned = await scan_items(
-        root=args.root,
-        paths=args.paths,
-        rules=args.rules,
-        extra_rules=args.extra_rules,
-        rule_set=args.rule_set,
-        base=args.base,
-        evaluate=args.evaluate,
-        context=args.context,
-        all_added=args.all_added,
-    )
-    if args.dry_run:
-        for item in scanned:
-            print(
-                item.state if item.state is not None else item.diff, end="\n\n"
-            )
-        print(f"{len(scanned)} items", file=sys.stderr)
-        return
-    found, failures = await review(
-        scanned=scanned,
-        root=root,
-        concurrency=args.concurrency,
-        verbose=args.verbose,
-    )
-    for finding in found:
-        print(json_dumps(finding.model_dump(exclude_none=True)))
-    for failure in failures:
-        print(json_dumps({"failure": failure}))
-    print(
-        summary_line(
-            scanned=scanned, root=root, found=found, failures=failures
-        ),
-        file=sys.stderr,
-    )
 
 
 async def scan_items(
@@ -1280,7 +1135,7 @@ async def review(scanned, root, concurrency, verbose):
     """The findings jev reports on scanned, and the requests that failed."""
     asked = [(item, s) for item in scanned for s in item.sets]
     gate = asyncio.Semaphore(concurrency)
-    settings = jev_pr_review.jev_ask.load_settings()
+    settings = jev_review.jev_ask.load_settings()
     results = await asyncio.gather(
         *(
             ask(
@@ -1337,15 +1192,3 @@ def without_file_repeats(found):
         if finding.evaluated != Evaluation.FILE
         or (finding.file, finding.flags) not in in_hunks
     ]
-
-
-def cli():
-    try:
-        sys.exit(asyncio.run(main()))
-    except (UserError, jev_pr_review.jev_ask.UserError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    cli()

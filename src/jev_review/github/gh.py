@@ -6,12 +6,11 @@ import pathlib
 
 import yarl
 
-import github.pull_request
-import github.repo
-import jev_pr_review.process
+import jev_review.github.pull_request
+import jev_review.github.repo
 
 PULL_REQUEST_FIELDS = "author,baseRefName"
-# gh's pull request JSON as a github.pull_request.PullRequest.
+# gh's pull request JSON as a jev_review.github.pull_request.PullRequest.
 PULL_REQUEST_JQ = (
     "{author: {login: .author.login}, base_ref_name: .baseRefName}"
 )
@@ -44,9 +43,10 @@ class GithubError(Exception):
 class gh:
     @staticmethod
     async def pull_request(
-        repo: github.repo.GithubRepo, pr: github.pull_request.GithubPRNumber
-    ) -> github.pull_request.PullRequest:
-        proc = await jev_pr_review.process.start(
+        repo: jev_review.github.repo.GithubRepo,
+        pr: jev_review.github.pull_request.GithubPRNumber,
+    ) -> jev_review.github.pull_request.PullRequest:
+        proc = await asyncio.create_subprocess_exec(
             "gh",
             "pr",
             "view",
@@ -61,10 +61,12 @@ class gh:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await jev_pr_review.process.communicate(proc)
+        stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise GithubError(f"gh pr view {pr}: {stderr.decode().strip()}")
-        return github.pull_request.PullRequest.model_validate_json(stdout)
+        return jev_review.github.pull_request.PullRequest.model_validate_json(
+            stdout
+        )
 
     @staticmethod
     async def api(
@@ -72,7 +74,7 @@ class gh:
     ) -> bytes:
         """Call the API with gh: its response body, or GithubError. GitHub's
         error body, which gh prints on stdout, goes only to the log."""
-        proc = await jev_pr_review.process.start(
+        proc = await asyncio.create_subprocess_exec(
             "gh",
             "api",
             "--hostname",
@@ -87,7 +89,7 @@ class gh:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await jev_pr_review.process.communicate(proc, payload)
+        stdout, stderr = await proc.communicate(payload)
         if proc.returncode != 0:
             LOGGER.error(
                 "gh api %s %s: %s %s",
@@ -102,34 +104,36 @@ class gh:
         return stdout
 
     @staticmethod
-    async def current_user(host: str) -> github.pull_request.User:
+    async def current_user(host: str) -> jev_review.github.pull_request.User:
         """The user gh is logged in as on host."""
-        return github.pull_request.User.model_validate_json(
+        return jev_review.github.pull_request.User.model_validate_json(
             await gh.api(host=host, method=HttpMethod.GET, path="user")
         )
 
     @staticmethod
     async def post_review(
-        repo: github.repo.GithubRepo,
-        pr: github.pull_request.GithubPRNumber,
-        review: github.pull_request.NewReview,
+        repo: jev_review.github.repo.GithubRepo,
+        pr: jev_review.github.pull_request.GithubPRNumber,
+        review: jev_review.github.pull_request.NewReview,
     ) -> yarl.URL:
         """Post review as one review: started pending with its line
         comments, given its file comments as threads, then submitted. A
         failure deletes the pending review, as GitHub keeps one per user."""
         reviews = f"repos/{repo.org}/{repo.name}/pulls/{pr}/reviews"
-        pending = github.pull_request.PendingReview.model_validate_json(
+        pending = jev_review.github.pull_request.PendingReview.model_validate_json(
             await gh.api(
                 host=repo.host,
                 method=HttpMethod.POST,
                 path=reviews,
-                payload=github.pull_request.PendingReviewInput(
+                payload=jev_review.github.pull_request.PendingReviewInput(
                     commit_id=review.commit_id,
                     body=review.body,
                     comments=[
                         c
                         for c in review.comments
-                        if isinstance(c, github.pull_request.LineReviewComment)
+                        if isinstance(
+                            c, jev_review.github.pull_request.LineReviewComment
+                        )
                     ],
                 )
                 .model_dump_json(exclude_none=True)
@@ -138,15 +142,17 @@ class gh:
         )
         try:
             for comment in review.comments:
-                if isinstance(comment, github.pull_request.FileReviewComment):
-                    github.pull_request.AddReviewThreadResponse.model_validate_json(
+                if isinstance(
+                    comment, jev_review.github.pull_request.FileReviewComment
+                ):
+                    jev_review.github.pull_request.AddReviewThreadResponse.model_validate_json(
                         await gh.api(
                             host=repo.host,
                             method=HttpMethod.POST,
                             path="graphql",
-                            payload=github.pull_request.GraphqlRequest(
+                            payload=jev_review.github.pull_request.GraphqlRequest(
                                 query=ADD_FILE_THREAD,
-                                variables=github.pull_request.AddFileThreadVariables(
+                                variables=jev_review.github.pull_request.AddFileThreadVariables(
                                     review=pending.node_id,
                                     path=comment.path,
                                     body=comment.body,
@@ -156,12 +162,12 @@ class gh:
                             .encode(),
                         )
                     )
-            submitted = github.pull_request.Review.model_validate_json(
+            submitted = jev_review.github.pull_request.Review.model_validate_json(
                 await gh.api(
                     host=repo.host,
                     method=HttpMethod.POST,
                     path=f"{reviews}/{pending.id}/events",
-                    payload=github.pull_request.ReviewEventInput(
+                    payload=jev_review.github.pull_request.ReviewEventInput(
                         event=review.event
                     )
                     .model_dump_json()
@@ -180,10 +186,12 @@ class gh:
 
     @staticmethod
     async def clone(
-        repo: github.repo.GithubRepo, dest: pathlib.Path, *git_args: str
+        repo: jev_review.github.repo.GithubRepo,
+        dest: pathlib.Path,
+        *git_args: str,
     ) -> None:
         """Clone repo to dest, passing git_args to git clone."""
-        proc = await jev_pr_review.process.start(
+        proc = await asyncio.create_subprocess_exec(
             "gh",
             "repo",
             "clone",
@@ -196,6 +204,6 @@ class gh:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await jev_pr_review.process.communicate(proc)
+        _, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise GithubError(f"gh repo clone: {stderr.decode().strip()}")
