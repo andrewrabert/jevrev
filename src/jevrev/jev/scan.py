@@ -15,9 +15,9 @@ import sys
 
 import pathspec
 import pydantic
-import unidiff
 import yaml
 
+import jevrev.git
 import jevrev.jev.api
 import jevrev.jev.ask
 import jevrev.languages
@@ -187,95 +187,6 @@ def json_dumps(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
-class git:
-    @staticmethod
-    async def _run(root: pathlib.Path, argv: list[str]) -> str:
-        """The stdout of git, in root, with argv."""
-        try:
-            stdout = await jevrev.process.run(["git", *argv], cwd=root)
-        except jevrev.process.ProcessError as e:
-            raise UserError(str(e)) from e
-        return stdout.decode()
-
-    @staticmethod
-    async def current_repository():
-        try:
-            stdout = await jevrev.process.run(
-                ["git", "rev-parse", "--show-toplevel"], cwd=pathlib.Path.cwd()
-            )
-        except jevrev.process.ProcessError as e:
-            raise UserError(
-                "the current directory is outside a git repository; give --root"
-            ) from e
-        return pathlib.Path(stdout.decode().strip())
-
-    @staticmethod
-    async def in_repository(root):
-        try:
-            stdout = await jevrev.process.run(
-                ["git", "rev-parse", "--is-inside-work-tree"], cwd=root
-            )
-        except jevrev.process.ProcessError:
-            return False
-        return stdout.decode().strip() == "true"
-
-    @staticmethod
-    async def merge_base(root, base):
-        """The merge-base of `base` and HEAD."""
-        return (await git._run(root, ["merge-base", base, "HEAD"])).strip()
-
-    @staticmethod
-    async def diff(root, revision, context, pathspecs):
-        """The diff from `revision` to the working tree of the files matching `pathspecs`, with
-        `context` as git diff options for its context lines."""
-        return await git._run(
-            root,
-            [
-                "diff",
-                *context,
-                "--no-color",
-                "--no-ext-diff",
-                "--relative",
-                revision,
-                "--",
-                *pathspecs,
-            ],
-        )
-
-    @staticmethod
-    async def untracked_files(root, pathspecs):
-        """The untracked files matching `pathspecs`, leaving out those git ignores."""
-        stdout = await git._run(
-            root,
-            [
-                "ls-files",
-                "-z",
-                "--others",
-                "--exclude-standard",
-                "--",
-                *pathspecs,
-            ],
-        )
-        return [name for name in stdout.split("\0") if name]
-
-    @staticmethod
-    async def tracked_files(root, pathspecs):
-        """The tracked and untracked files matching `pathspecs`, leaving out those git ignores."""
-        stdout = await git._run(
-            root,
-            [
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                *pathspecs,
-            ],
-        )
-        return [name for name in stdout.split("\0") if name]
-
-
 def _file_contents(name, source, review):
     return [
         content.model_copy(update={"sets": review.sets})
@@ -323,57 +234,50 @@ def _test_cutoff(source, marker):
 
 
 async def _changed_hunks(root, pathspecs, base, context, sets):
-    """Each hunk changed since `base`'s merge-base with HEAD, with `context` as git diff options
-    for its context lines, as a diff of its file; and the untracked files."""
+    """Each hunk changed since `base`'s merge-base with HEAD, with `context` lines around each
+    change, as a diff of its file; and the untracked files."""
     if base.startswith("-"):
         raise UserError(f"base {base!r} is not a revision")
-    merge_base = await git.merge_base(root, base)
-    diff = await git.diff(
+    merge_base = await jevrev.git.git.merge_base(root, base, "HEAD")
+    diff = await jevrev.git.git.diff_work_tree(
         root=root, revision=merge_base, context=context, pathspecs=pathspecs
     )
     changed = []
-    for patched in unidiff.PatchSet(diff):
-        if patched.is_removed_file or patched.is_binary_file:
-            continue
-        name = patched.path
+    for changed_file in diff.root:
+        name = changed_file.path
         # A submodule's diff names its directory.
         if not (root / name).is_file() or not _inside(root, root / name):
             continue
         source = (root / name).read_bytes()
         review = _review_of(name=name, source=source, sets=sets)
         cutoff = _test_cutoff(source, review.language.test_marker)
-        for hunk in patched:
-            lines = [
-                line
-                for line in hunk
-                if (line.is_added or line.is_context)
-                and line.target_line_no < cutoff
-            ]
-            if not any(line.is_added for line in lines):
+        for hunk in changed_file.hunks:
+            lines = [line for line in hunk.lines if line.number < cutoff]
+            if not any(line.added for line in lines):
                 continue
             header = (
                 f"@@ -{hunk.source_start},{hunk.source_length} "
-                f"+{hunk.target_start},{hunk.target_length} @@ {hunk.section_header}"
+                f"+{hunk.target_start},{hunk.target_length} @@ {hunk.section}"
             )
             changed.append(
                 jevrev.state.FileDiff(
                     file=name,
                     start=hunk.target_start,
-                    end=lines[-1].target_line_no,
-                    name=hunk.section_header or jevrev.state.Evaluation.HUNK,
+                    end=lines[-1].number,
+                    name=hunk.section or jevrev.state.Evaluation.HUNK,
                     sets=review.sets,
                     hunks=[
                         jevrev.state.DiffHunk(
                             header=header.rstrip(),
                             lines=[
-                                f"{line.line_type}{line.value.removesuffix('\n')}"
+                                f"{'+' if line.added else ' '}{line.text}"
                                 for line in lines
                             ],
                         )
                     ],
                 )
             )
-    return changed, await git.untracked_files(root, pathspecs)
+    return changed, await jevrev.git.git.untracked_files(root, pathspecs)
 
 
 _DEFAULT_CONTEXT = 20
@@ -557,7 +461,14 @@ async def scan_states(
     flags of the same names select them."""
     evaluations = evaluate or [jevrev.state.Evaluation.HUNK]
 
-    root = (await git.current_repository() if root is None else root).resolve()
+    if root is None:
+        try:
+            root = await jevrev.git.git.top_level(pathlib.Path.cwd())
+        except jevrev.git.GitError as e:
+            raise UserError(
+                "the current directory is outside a git repository; give --root"
+            ) from e
+    root = root.resolve()
     if not root.is_dir():
         raise UserError(f"--root {root} is not a directory")
     sets = _sets_under(
@@ -595,11 +506,11 @@ async def scan_states(
         evaluate is not None or context is not None or all_added
     ):
         raise UserError("--evaluate, --context and --all-added need --base")
-    if not await git.in_repository(root):
+    if not await jevrev.git.git.in_work_tree(root):
         # Outside a repository every file is new: reviewed whole, or as added with --base.
         hunks, whole = [], _all_files(root, targets)
     elif base is None:
-        whole = await git.tracked_files(root, pathspecs)
+        whole = await jevrev.git.git.files(root, pathspecs)
         if ignored := sorted(named - set(whole)):
             raise UserError(f"{', '.join(ignored)} ignored by git")
     else:
@@ -608,7 +519,7 @@ async def scan_states(
             root=root,
             pathspecs=pathspecs,
             base=base,
-            context=(f"-U{lines}",),
+            context=lines,
             sets=sets,
         )
     sources = {}

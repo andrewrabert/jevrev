@@ -14,10 +14,10 @@ import tempfile
 
 import minijinja
 import pydantic
-import unidiff
 import yaml
 
 import jevrev.db
+import jevrev.git
 import jevrev.github.gh
 import jevrev.github.pull_request
 import jevrev.github.repo
@@ -79,62 +79,6 @@ def _judged_review(args) -> jevrev.db.Review:
     return review
 
 
-class git:
-    @staticmethod
-    async def _run(root: pathlib.Path, argv: list[str]) -> str:
-        """The stdout of git, in root, with argv."""
-        try:
-            stdout = await jevrev.process.run(
-                ["git", "--no-pager", "-C", str(root), *argv]
-            )
-        except jevrev.process.ProcessError as e:
-            raise UserError(str(e)) from e
-        return stdout.decode()
-
-    @staticmethod
-    async def fetch(root: pathlib.Path, refspec: str):
-        """Fetch refspec from origin."""
-        await git._run(root, ["fetch", "--quiet", "origin", refspec])
-
-    @staticmethod
-    async def rev_parse(
-        root: pathlib.Path, revisions: collections.abc.Sequence[str]
-    ) -> list[str]:
-        """The commit each of revisions names, in order."""
-        return (await git._run(root, ["rev-parse", *revisions])).split()
-
-    @staticmethod
-    async def merge_base(root: pathlib.Path, first: str, second: str) -> str:
-        return (await git._run(root, ["merge-base", first, second])).strip()
-
-    @staticmethod
-    async def checkout_detached(root: pathlib.Path, revision: str):
-        await git._run(root, ["checkout", "--quiet", "--detach", revision])
-
-    @staticmethod
-    async def diff(
-        root: pathlib.Path,
-        base: str,
-        head: str,
-        context: int,
-        inter_hunk_context: int,
-    ) -> str:
-        """The diff from base to head, with context lines around each change,
-        and changes at most inter_hunk_context lines apart in one hunk."""
-        return await git._run(
-            root,
-            [
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                f"-U{context}",
-                f"--inter-hunk-context={inter_hunk_context}",
-                base,
-                head,
-            ],
-        )
-
-
 async def _clone_pull_request(
     repo: jevrev.github.repo.GithubRepo,
     pr: jevrev.github.pull_request.GithubPRNumber,
@@ -145,14 +89,14 @@ async def _clone_pull_request(
     await jevrev.github.gh.gh.clone(
         repo=repo, dest=dest, git_args=["--no-checkout"]
     )
-    await git.fetch(dest, f"+refs/pull/{pr}/head:refs/pr/{pr}/head")
-    head_sha, target_sha = await git.rev_parse(
+    await jevrev.git.git.fetch(dest, f"+refs/pull/{pr}/head:refs/pr/{pr}/head")
+    head_sha, target_sha = await jevrev.git.git.rev_parse(
         dest, [f"refs/pr/{pr}/head", f"refs/remotes/origin/{target}"]
     )
-    merge_base = await git.merge_base(
+    merge_base = await jevrev.git.git.merge_base(
         root=dest, first=head_sha, second=target_sha
     )
-    await git.checkout_detached(dest, head_sha)
+    await jevrev.git.git.checkout_detached(dest, head_sha)
     return jevrev.db.PullRequestSource(
         repo=repo,
         pr=pr,
@@ -473,7 +417,7 @@ async def _github_hunks(
 ) -> dict[str, list[range]]:
     """The head's lines of each hunk of the pull request's diff as GitHub
     shows it, by path: the lines a review comment can be left on."""
-    diff = await git.diff(
+    diff = await jevrev.git.git.diff_commits(
         root=root,
         base=source.merge_base,
         head=source.head_sha,
@@ -483,10 +427,10 @@ async def _github_hunks(
     return {
         file.path: [
             range(hunk.target_start, hunk.target_start + hunk.target_length)
-            for hunk in file
+            for hunk in file.hunks
             if hunk.target_length
         ]
-        for file in unidiff.PatchSet(diff)
+        for file in diff.root
     }
 
 
@@ -786,6 +730,7 @@ def cli():
         UserError,
         jevrev.settings.UserError,
         jevrev.github.gh.GithubError,
+        jevrev.git.GitError,
         jevrev.db.OperationalError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)

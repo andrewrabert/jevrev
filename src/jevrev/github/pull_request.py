@@ -4,11 +4,9 @@ import typing
 import pydantic
 import yarl
 
-type GithubPRNumber = typing.Annotated[int, pydantic.Field(gt=0)]
+import jevrev.git
 
-type GitSha = typing.Annotated[
-    str, pydantic.StringConstraints(pattern=r"^[0-9a-f]{40}$")
-]
+type GithubPRNumber = typing.Annotated[int, pydantic.Field(gt=0)]
 
 type _Url = typing.Annotated[
     yarl.URL,
@@ -55,7 +53,7 @@ class NewReview(pydantic.BaseModel):
     """A review to post: its body and its comments, on commit_id, submitted
     as event."""
 
-    commit_id: GitSha
+    commit_id: jevrev.git.GitSha
     event: ReviewEvent
     body: str
     comments: list[ReviewComment]
@@ -65,7 +63,7 @@ class PendingReviewInput(pydantic.BaseModel):
     """The REST body that starts a pending review: the API takes only line
     comments here, so file comments are added to it as threads."""
 
-    commit_id: GitSha
+    commit_id: jevrev.git.GitSha
     body: str
     comments: list[LineReviewComment]
 

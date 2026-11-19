@@ -8,6 +8,7 @@ import sqlite3
 
 import pydantic
 
+import jevrev.git
 import jevrev.github.pull_request
 import jevrev.github.repo
 import jevrev.jev.scan
@@ -36,10 +37,10 @@ class PullRequestSource(pydantic.BaseModel):
 
     repo: jevrev.github.repo.GithubRepo
     pr: jevrev.github.pull_request.GithubPRNumber
-    head_sha: jevrev.github.pull_request.GitSha
+    head_sha: jevrev.git.GitSha
     target: str
-    target_sha: jevrev.github.pull_request.GitSha
-    merge_base: jevrev.github.pull_request.GitSha
+    target_sha: jevrev.git.GitSha
+    merge_base: jevrev.git.GitSha
 
 
 class Review(pydantic.BaseModel):
