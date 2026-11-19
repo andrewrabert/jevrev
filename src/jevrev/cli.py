@@ -18,12 +18,12 @@ import pydantic
 import unidiff
 import yaml
 
-import jev_review.github.gh
-import jev_review.github.pull_request
-import jev_review.github.repo
-import jev_review.jev_ask
-import jev_review.jev_scan
-import jev_review.templates
+import jevrev.github.gh
+import jevrev.github.pull_request
+import jevrev.github.repo
+import jevrev.jev_ask
+import jevrev.jev_scan
+import jevrev.templates
 
 # Seconds a jev scan may run.
 JEV_SCAN_TIMEOUT = 600
@@ -54,7 +54,7 @@ class Verdict(enum.StrEnum):
     REJECTED = "rejected"
 
 
-class Finding(jev_review.jev_scan.Finding):
+class Finding(jevrev.jev_scan.Finding):
     """A jev_scan finding, its file relative to the review's dir, with its
     index in the scan's findings, from 1, and its verdict once it has one."""
 
@@ -66,12 +66,12 @@ class Finding(jev_review.jev_scan.Finding):
 class PullRequestSource(pydantic.BaseModel):
     """The pull request a review's dir is a clone of, at its head."""
 
-    repo: jev_review.github.repo.GithubRepo
-    pr: jev_review.github.pull_request.GithubPRNumber
-    head_sha: jev_review.github.pull_request.GitSha
+    repo: jevrev.github.repo.GithubRepo
+    pr: jevrev.github.pull_request.GithubPRNumber
+    head_sha: jevrev.github.pull_request.GitSha
     target: str
-    target_sha: jev_review.github.pull_request.GitSha
-    merge_base: jev_review.github.pull_request.GitSha
+    target_sha: jevrev.github.pull_request.GitSha
+    merge_base: jevrev.github.pull_request.GitSha
 
 
 class Review(pydantic.BaseModel):
@@ -168,15 +168,13 @@ async def git(root: pathlib.Path, *argv) -> str:
 
 
 async def clone_pull_request(
-    repo: jev_review.github.repo.GithubRepo,
-    pr: jev_review.github.pull_request.GithubPRNumber,
+    repo: jevrev.github.repo.GithubRepo,
+    pr: jevrev.github.pull_request.GithubPRNumber,
     dest: pathlib.Path,
 ) -> PullRequestSource:
     """Clone the pull request to dest, its head checked out."""
-    target = (
-        await jev_review.github.gh.gh.pull_request(repo, pr)
-    ).base_ref_name
-    await jev_review.github.gh.gh.clone(repo, dest, "--no-checkout")
+    target = (await jevrev.github.gh.gh.pull_request(repo, pr)).base_ref_name
+    await jevrev.github.gh.gh.clone(repo, dest, "--no-checkout")
     await git(
         dest,
         "fetch",
@@ -219,7 +217,7 @@ async def cmd_scan(args):
         if args.cache_dir is not None:
             args.cache_dir.mkdir(parents=True, exist_ok=True)
         root = pathlib.Path(
-            tempfile.mkdtemp(prefix="jev-review-", dir=args.cache_dir)
+            tempfile.mkdtemp(prefix="jevrev-", dir=args.cache_dir)
         ).resolve()
         pull_request = await clone_pull_request(args.repo, args.pr, root)
         base = None if args.full else pull_request.merge_base
@@ -233,8 +231,8 @@ async def cmd_scan(args):
     evaluate = None
     if base is not None:
         evaluate = [
-            jev_review.jev_scan.Evaluation.HUNK,
-            jev_review.jev_scan.Evaluation.FILE,
+            jevrev.jev_scan.Evaluation.HUNK,
+            jevrev.jev_scan.Evaluation.FILE,
         ]
     found, summary = await run_jev_scan(
         root=root,
@@ -273,14 +271,14 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     request fails."""
     try:
         async with asyncio.timeout(JEV_SCAN_TIMEOUT):
-            root, scanned = await jev_review.jev_scan.scan_items(
+            root, scanned = await jevrev.jev_scan.scan_items(
                 rules,
                 root=root,
                 extra_rules=extra_rules,
                 base=base,
                 evaluate=evaluate,
             )
-            found, failures = await jev_review.jev_scan.review(
+            found, failures = await jevrev.jev_scan.review(
                 scanned=scanned,
                 root=root,
                 concurrency=JEV_SCAN_CONCURRENCY,
@@ -289,8 +287,8 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     except TimeoutError:
         raise UserError(f"jev-scan ran longer than {JEV_SCAN_TIMEOUT} seconds")
     except (
-        jev_review.jev_scan.UserError,
-        jev_review.jev_ask.UserError,
+        jevrev.jev_scan.UserError,
+        jevrev.jev_ask.UserError,
     ) as e:
         raise UserError(f"jev-scan: {e}")
     if failures:
@@ -298,7 +296,7 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
             f"jev-scan: {len(failures)} jev requests failed:\n"
             + "\n".join(failures)
         )
-    summary = jev_review.jev_scan.summary_line(
+    summary = jevrev.jev_scan.summary_line(
         scanned=scanned, root=root, found=found, failures=failures
     )
     return found, summary
@@ -309,7 +307,7 @@ async def cmd_pending(args):
         review = store.load()
     sys.stdout.write(
         "".join(
-            jev_review.jev_scan.json_dumps(
+            jevrev.jev_scan.json_dumps(
                 finding.model_dump(
                     mode="json",
                     exclude={"verdict", "reason"},
@@ -366,7 +364,7 @@ async def cmd_post(args):
     if not confirmed(review.findings):
         print("No confirmed findings; no GitHub review submitted.")
         return
-    gh = jev_review.github.gh.gh
+    gh = jevrev.github.gh.gh
     pull_request = await gh.pull_request(source.repo, source.pr)
     user = await gh.current_user(source.repo.host)
     url = await gh.post_review(
@@ -378,9 +376,9 @@ async def cmd_post(args):
             hunks=await github_hunks(review.dir, source),
             # GitHub refuses a request for changes on one's own pull
             # request.
-            event=jev_review.github.pull_request.ReviewEvent.COMMENT
+            event=jevrev.github.pull_request.ReviewEvent.COMMENT
             if pull_request.author.login == user.login
-            else jev_review.github.pull_request.ReviewEvent.REQUEST_CHANGES,
+            else jevrev.github.pull_request.ReviewEvent.REQUEST_CHANGES,
         ),
     )
     print(url)
@@ -396,9 +394,9 @@ class Template(enum.StrEnum):
 TEMPLATES = minijinja.Environment(
     keep_trailing_newline=True,
     templates={
-        Template.REVIEW: jev_review.templates.REVIEW,
-        Template.PR_REVIEW: jev_review.templates.PR_REVIEW,
-        Template.PR_COMMENT: jev_review.templates.PR_COMMENT,
+        Template.REVIEW: jevrev.templates.REVIEW,
+        Template.PR_REVIEW: jevrev.templates.PR_REVIEW,
+        Template.PR_COMMENT: jevrev.templates.PR_COMMENT,
     },
 )
 
@@ -505,25 +503,23 @@ async def github_hunks(
 
 def pr_comment(
     f: Finding, hunks: dict[str, list[range]]
-) -> jev_review.github.pull_request.ReviewComment:
+) -> jevrev.github.pull_request.ReviewComment:
     """A comment on f's lines within the first GitHub hunk they overlap, or
     on its file when f is a file finding or overlaps none."""
     body = render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
     )
-    if f.evaluated != jev_review.jev_scan.Evaluation.FILE:
+    if f.evaluated != jevrev.jev_scan.Evaluation.FILE:
         for hunk in hunks.get(f.file, []):
             start, end = max(f.start, hunk.start), min(f.end, hunk.stop - 1)
             if start <= end:
-                return jev_review.github.pull_request.LineReviewComment(
+                return jevrev.github.pull_request.LineReviewComment(
                     path=f.file,
                     body=body,
                     line=end,
                     start_line=start if start < end else None,
                 )
-    return jev_review.github.pull_request.FileReviewComment(
-        path=f.file, body=body
-    )
+    return jevrev.github.pull_request.FileReviewComment(path=f.file, body=body)
 
 
 def pr_review_body(found: list[Finding], outside: list[Finding]) -> str:
@@ -568,14 +564,14 @@ def pr_review(
     source: PullRequestSource,
     findings: list[Finding],
     hunks: dict[str, list[range]],
-    event: jev_review.github.pull_request.ReviewEvent,
-) -> jev_review.github.pull_request.NewReview:
+    event: jevrev.github.pull_request.ReviewEvent,
+) -> jevrev.github.pull_request.NewReview:
     found = confirmed(findings)
     # GitHub refuses a review comment on a file the pull request does not
     # change, which a full review's findings can be in.
     inside = [f for f in found if f.file in hunks]
     outside = [f for f in found if f.file not in hunks]
-    return jev_review.github.pull_request.NewReview(
+    return jevrev.github.pull_request.NewReview(
         commit_id=source.head_sha,
         event=event,
         body=pr_review_body(found, outside),
@@ -604,12 +600,12 @@ def json_value(value):
         raise argparse.ArgumentTypeError(f"{value}: {e}") from e
 
 
-def github_repo(value) -> jev_review.github.repo.GithubRepo:
+def github_repo(value) -> jevrev.github.repo.GithubRepo:
     host, *rest = value.split("/")
     if len(rest) != 2:
         raise argparse.ArgumentTypeError(f"{value}: expected HOST/ORG/NAME")
     try:
-        return jev_review.github.repo.GithubRepo(
+        return jevrev.github.repo.GithubRepo(
             host=host, org=rest[0], name=rest[1]
         )
     except pydantic.ValidationError as e:
@@ -631,7 +627,7 @@ def add_judge_arguments(parser, reason_help):
 
 def parser():
     parser = argparse.ArgumentParser(
-        prog="jev-review",
+        prog="jevrev",
         description="Run jev over a directory or a GitHub pull request, "
         "confirm or reject each of its findings, and print the review or "
         "post it on the pull request.",
@@ -707,15 +703,15 @@ def parser():
     scan_parser.add_argument(
         "--rules",
         type=pathlib.Path,
-        default=jev_review.jev_scan.env_path("JEV_RULES_DIR"),
+        default=jevrev.jev_scan.env_path("JEV_RULES_DIR"),
         metavar="DIR",
         help="Directory of rule sets jev-scan reviews against "
         "[default: $JEV_RULES_DIR]; required",
     )
     scan_parser.add_argument(
         "--extra-rules",
-        type=jev_review.jev_scan.path_list,
-        default=jev_review.jev_scan.path_list(
+        type=jevrev.jev_scan.path_list,
+        default=jevrev.jev_scan.path_list(
             os.environ.get("JEV_RULES_EXTRA", "")
         ),
         metavar="DIRS",
@@ -798,7 +794,7 @@ def cli():
         sys.exit(asyncio.run(main()))
     except (
         UserError,
-        jev_review.github.gh.GithubError,
+        jevrev.github.gh.GithubError,
         sqlite3.OperationalError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)

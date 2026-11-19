@@ -2,7 +2,7 @@
 Each subcommand, flag, option, and positional argument declaration below
 exists exactly as written.
 
-## `jev-review`
+## `jevrev`
 ```
 --db <FILE>               SQLite file holding one review: its dir, base, pull request, metadata, findings, and verdicts
 --lock-timeout <SECONDS>  Seconds to wait for another command to release the db [default: 3600]
@@ -16,7 +16,7 @@ COMMAND:
   post     Post the confirmed findings as a review on the pull request and print its URL, once every finding has a verdict; fails while any finding has none
 ```
 
-## `jev-review scan`
+## `jevrev scan`
 ```
 --dir <DIR>             Directory to scan in place; findings are relative to it; requires --base or --full; conflicts with --repo
 --repo <HOST/ORG/NAME>  GitHub repo of the pull request to clone and scan; requires --pr; conflicts with --dir
@@ -29,19 +29,19 @@ COMMAND:
 --metadata <JSON>       JSON value stored with the review and printed by show
 ```
 
-## `jev-review confirm`
+## `jevrev confirm`
 ```
 INDEX   Index of the finding in the scan's findings, from 1
 REASON  One sentence on how the lines match the violation
 ```
 
-## `jev-review reject`
+## `jevrev reject`
 ```
 INDEX   Index of the finding in the scan's findings, from 1
 REASON  One sentence on why the lines do not break the rule
 ```
 
-## `jev-review show`
+## `jevrev show`
 ```
 --format <json|md>  Print the review as JSON, or as markdown of its confirmed findings [default: json]
 ```

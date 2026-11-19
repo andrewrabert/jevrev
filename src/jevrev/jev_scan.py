@@ -21,8 +21,8 @@ import tree_sitter_rust
 import unidiff
 import yaml
 
-import jev_review.jev_ask
-import jev_review.rules
+import jevrev.jev_ask
+import jevrev.rules
 
 # Siblings that belong to the item after them.
 LEADING = {"line_comment", "block_comment", "attribute_item"}
@@ -64,7 +64,7 @@ class Syntax:
     test_marker: str | None = None
 
 
-LanguageName = jev_review.rules.Language
+LanguageName = jevrev.rules.Language
 
 # The languages a rule set's `when.language` can name.
 SYNTAXES = {
@@ -121,7 +121,7 @@ def detect_language(name, source) -> LanguageName | None:
 @functools.cache
 def read_set(path):
     try:
-        return jev_review.rules.RuleSet.model_validate(
+        return jevrev.rules.RuleSet.model_validate(
             yaml.safe_load(path.read_text(encoding="utf-8"))
         )
     except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
@@ -959,7 +959,7 @@ def findings(item, root, answers, rule_set):
     """The rules of `rule_set` that jev's answers for `item` meet its error threshold on, as findings."""
     parsed = read_set(rule_set)
     for position, rule in enumerate(parsed.rules, 1):
-        probability = answers.get(jev_review.jev_ask.question_name(position))
+        probability = answers.get(jevrev.jev_ask.question_name(position))
         if probability is None or probability < parsed.error_threshold:
             continue
         yield Finding(
@@ -980,17 +980,15 @@ async def ask(item, rule_set, gate, verbose, settings):
     state = item.state if item.state is not None else item.diff
     async with gate:
         try:
-            request = jev_review.jev_ask.build_request(
-                questions=jev_review.jev_ask.load_questions(rule_set),
+            request = jevrev.jev_ask.build_request(
+                questions=jevrev.jev_ask.load_questions(rule_set),
                 state=state,
                 settings=settings,
             )
-        except jev_review.jev_ask.UserError as e:
+        except jevrev.jev_ask.UserError as e:
             raise AskFailed(item, str(e))
-        except jev_review.jev_ask.Rejected as e:
-            raise AskFailed(
-                item, "\n".join(jev_review.jev_ask.rejected_lines(e))
-            )
+        except jevrev.jev_ask.Rejected as e:
+            raise AskFailed(item, "\n".join(jevrev.jev_ask.rejected_lines(e)))
         if verbose:
             print(
                 json_dumps(
@@ -1007,8 +1005,8 @@ async def ask(item, rule_set, gate, verbose, settings):
                 file=sys.stderr,
             )
         try:
-            answers = await jev_review.jev_ask.ask(request, settings)
-        except jev_review.jev_ask.UserError as e:
+            answers = await jevrev.jev_ask.ask(request, settings)
+        except jevrev.jev_ask.UserError as e:
             raise AskFailed(item, str(e))
     return Answers.model_validate(answers).root
 
@@ -1135,7 +1133,7 @@ async def review(scanned, root, concurrency, verbose):
     """The findings jev reports on scanned, and the requests that failed."""
     asked = [(item, s) for item in scanned for s in item.sets]
     gate = asyncio.Semaphore(concurrency)
-    settings = jev_review.jev_ask.load_settings()
+    settings = jevrev.jev_ask.load_settings()
     results = await asyncio.gather(
         *(
             ask(

@@ -1,5 +1,5 @@
 [project]
-name = "jev-review"
+name = "jevrev"
 version = "0.1.0"
 description = "Run jev over a directory or a GitHub pull request, judge its findings, and print the review or post it on the pull request"
 requires-python = ">=3.14"
@@ -19,11 +19,11 @@ dependencies = [
 ]
 
 [project.scripts]
-jev-review = "jev_review.cli:cli"
+jevrev = "jevrev.cli:cli"
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = "jev_review"
+module-name = "jevrev"

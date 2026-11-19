@@ -11,7 +11,7 @@ import typesafe_sdk
 import yaml
 import yarl
 
-import jev_review.rules
+import jevrev.rules
 
 # Jev's context window in tokens, estimated as a payload's bytes over 4.
 MAX_CONTEXT_TOKENS = 32_000
@@ -118,7 +118,7 @@ class Request(pydantic.BaseModel):
         return self.model_dump_json(exclude_none=True)
 
 
-def noul(rule: jev_review.rules.Rule) -> Noul:
+def noul(rule: jevrev.rules.Rule) -> Noul:
     """The noul jev is asked: true when the code is what the rule flags."""
     return Noul(
         instructions=Instructions(task=TASK, flags=rule.flags),
@@ -136,7 +136,7 @@ def question_name(position):
 def parse_rules(text):
     """The nouls jev is asked for a rule set, each named by question_name."""
     try:
-        rule_set = jev_review.rules.RuleSet.model_validate(parse_value(text))
+        rule_set = jevrev.rules.RuleSet.model_validate(parse_value(text))
     except pydantic.ValidationError as e:
         raise UserError(str(e)) from e
     return {

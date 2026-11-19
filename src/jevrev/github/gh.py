@@ -6,11 +6,11 @@ import pathlib
 
 import yarl
 
-import jev_review.github.pull_request
-import jev_review.github.repo
+import jevrev.github.pull_request
+import jevrev.github.repo
 
 PULL_REQUEST_FIELDS = "author,baseRefName"
-# gh's pull request JSON as a jev_review.github.pull_request.PullRequest.
+# gh's pull request JSON as a jevrev.github.pull_request.PullRequest.
 PULL_REQUEST_JQ = (
     "{author: {login: .author.login}, base_ref_name: .baseRefName}"
 )
@@ -43,9 +43,9 @@ class GithubError(Exception):
 class gh:
     @staticmethod
     async def pull_request(
-        repo: jev_review.github.repo.GithubRepo,
-        pr: jev_review.github.pull_request.GithubPRNumber,
-    ) -> jev_review.github.pull_request.PullRequest:
+        repo: jevrev.github.repo.GithubRepo,
+        pr: jevrev.github.pull_request.GithubPRNumber,
+    ) -> jevrev.github.pull_request.PullRequest:
         proc = await asyncio.create_subprocess_exec(
             "gh",
             "pr",
@@ -64,7 +64,7 @@ class gh:
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise GithubError(f"gh pr view {pr}: {stderr.decode().strip()}")
-        return jev_review.github.pull_request.PullRequest.model_validate_json(
+        return jevrev.github.pull_request.PullRequest.model_validate_json(
             stdout
         )
 
@@ -104,35 +104,35 @@ class gh:
         return stdout
 
     @staticmethod
-    async def current_user(host: str) -> jev_review.github.pull_request.User:
+    async def current_user(host: str) -> jevrev.github.pull_request.User:
         """The user gh is logged in as on host."""
-        return jev_review.github.pull_request.User.model_validate_json(
+        return jevrev.github.pull_request.User.model_validate_json(
             await gh.api(host=host, method=HttpMethod.GET, path="user")
         )
 
     @staticmethod
     async def post_review(
-        repo: jev_review.github.repo.GithubRepo,
-        pr: jev_review.github.pull_request.GithubPRNumber,
-        review: jev_review.github.pull_request.NewReview,
+        repo: jevrev.github.repo.GithubRepo,
+        pr: jevrev.github.pull_request.GithubPRNumber,
+        review: jevrev.github.pull_request.NewReview,
     ) -> yarl.URL:
         """Post review as one review: started pending with its line
         comments, given its file comments as threads, then submitted. A
         failure deletes the pending review, as GitHub keeps one per user."""
         reviews = f"repos/{repo.org}/{repo.name}/pulls/{pr}/reviews"
-        pending = jev_review.github.pull_request.PendingReview.model_validate_json(
+        pending = jevrev.github.pull_request.PendingReview.model_validate_json(
             await gh.api(
                 host=repo.host,
                 method=HttpMethod.POST,
                 path=reviews,
-                payload=jev_review.github.pull_request.PendingReviewInput(
+                payload=jevrev.github.pull_request.PendingReviewInput(
                     commit_id=review.commit_id,
                     body=review.body,
                     comments=[
                         c
                         for c in review.comments
                         if isinstance(
-                            c, jev_review.github.pull_request.LineReviewComment
+                            c, jevrev.github.pull_request.LineReviewComment
                         )
                     ],
                 )
@@ -143,16 +143,16 @@ class gh:
         try:
             for comment in review.comments:
                 if isinstance(
-                    comment, jev_review.github.pull_request.FileReviewComment
+                    comment, jevrev.github.pull_request.FileReviewComment
                 ):
-                    jev_review.github.pull_request.AddReviewThreadResponse.model_validate_json(
+                    jevrev.github.pull_request.AddReviewThreadResponse.model_validate_json(
                         await gh.api(
                             host=repo.host,
                             method=HttpMethod.POST,
                             path="graphql",
-                            payload=jev_review.github.pull_request.GraphqlRequest(
+                            payload=jevrev.github.pull_request.GraphqlRequest(
                                 query=ADD_FILE_THREAD,
-                                variables=jev_review.github.pull_request.AddFileThreadVariables(
+                                variables=jevrev.github.pull_request.AddFileThreadVariables(
                                     review=pending.node_id,
                                     path=comment.path,
                                     body=comment.body,
@@ -162,12 +162,12 @@ class gh:
                             .encode(),
                         )
                     )
-            submitted = jev_review.github.pull_request.Review.model_validate_json(
+            submitted = jevrev.github.pull_request.Review.model_validate_json(
                 await gh.api(
                     host=repo.host,
                     method=HttpMethod.POST,
                     path=f"{reviews}/{pending.id}/events",
-                    payload=jev_review.github.pull_request.ReviewEventInput(
+                    payload=jevrev.github.pull_request.ReviewEventInput(
                         event=review.event
                     )
                     .model_dump_json()
@@ -186,7 +186,7 @@ class gh:
 
     @staticmethod
     async def clone(
-        repo: jev_review.github.repo.GithubRepo,
+        repo: jevrev.github.repo.GithubRepo,
         dest: pathlib.Path,
         *git_args: str,
     ) -> None:
