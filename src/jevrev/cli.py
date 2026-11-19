@@ -8,6 +8,7 @@ import collections.abc
 import contextlib
 import enum
 import json
+import math
 import os
 import pathlib
 import sys
@@ -18,6 +19,7 @@ import pydantic
 import rich.console
 import rich.text
 import yaml
+import yarl
 
 import jevrev.files
 import jevrev.git
@@ -101,10 +103,10 @@ def _judged_review(args) -> jevrev.store.Review:
 
 
 def _rules(args) -> list[pathlib.Path]:
-    rules = [
-        *jevrev.settings.load_settings().rules,
-        *(args.rules or ()),
-    ]
+    """--rules, or JEV_RULES when no --rules is given."""
+    rules = args.rules
+    if rules is None:
+        rules = jevrev.settings.load_settings().rules
     if not rules:
         raise UserError("Give --rules or set JEV_RULES.")
     return rules
@@ -117,8 +119,24 @@ def _scan_metadata(args) -> dict[str, str]:
     if file is None and args.metadata:
         raise UserError("--metadata: give --review to store it in")
     _rules(args)
+    _jev_client(args)
     # A later KEY wins; sorted by key, as the Rust version stores it.
     return dict(sorted(dict(args.metadata).items()))
+
+
+def _jev_client(args) -> jevrev.jev.api.Client:
+    """A client from the TypeSafe flags, each falling back to its setting."""
+    settings = jevrev.settings.load_settings()
+    api_key = args.api_key
+    if api_key is None and settings.api_key is not None:
+        api_key = settings.api_key.get_secret_value()
+    if api_key is None:
+        raise UserError("Give --api-key or set TYPESAFE_API_KEY.")
+    return jevrev.jev.api.Client(
+        api_key=api_key,
+        base_url=args.base_url or settings.base_url,
+        timeout=args.timeout or settings.timeout,
+    )
 
 
 def _local_dir(path: pathlib.Path) -> pathlib.Path:
@@ -166,6 +184,8 @@ async def _scan_and_save(
         untracked=untracked,
         rules=_rules(args),
         name=name,
+        client=_jev_client(args),
+        model=args.model or jevrev.settings.load_settings().default_model,
     )
     review = jevrev.store.Review(
         source=source,
@@ -379,19 +399,11 @@ async def _run_jev_scan(
     untracked: collections.abc.Sequence[str],
     rules: list[pathlib.Path],
     name: str,
+    client: jevrev.jev.api.Client,
+    model: str,
 ):
     """Run jev-scan on files against the rule sets under each directory of rules: its
     findings, and its summary line. Fails if any jev request fails."""
-    settings = jevrev.settings.load_settings()
-    if settings.api_key is None:
-        raise UserError(
-            "TYPESAFE_API_KEY is not set in the environment or TYPESAFE_ENV_FILE"
-        )
-    client = jevrev.jev.api.Client(
-        api_key=settings.api_key.get_secret_value(),
-        base_url=settings.base_url,
-        timeout=settings.timeout,
-    )
     try:
         async with asyncio.timeout(_JEV_SCAN_TIMEOUT):
             scanned = await jevrev.jev.scan.scan_states(
@@ -414,7 +426,7 @@ async def _run_jev_scan(
                 concurrency=_JEV_SCAN_CONCURRENCY,
                 verbose=False,
                 client=client,
-                model=settings.default_model,
+                model=model,
             )
     except TimeoutError:
         raise UserError(
@@ -723,6 +735,35 @@ def _pr_review(
     )
 
 
+def _path_list(value: str) -> list[pathlib.Path]:
+    """The ':'-separated directories of value, empty entries left out."""
+    return [pathlib.Path(entry) for entry in value.split(":") if entry]
+
+
+def _base_url(value: str) -> yarl.URL:
+    try:
+        url = yarl.URL(value)
+    except ValueError:
+        url = None
+    if url is None or not url.absolute:
+        raise argparse.ArgumentTypeError(
+            f"{json.dumps(value)} is not an absolute URL"
+        )
+    return yarl.URL(value.rstrip("/"))
+
+
+def _timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError:
+        timeout = math.nan
+    if not timeout > 0:
+        raise argparse.ArgumentTypeError(
+            f"{json.dumps(value)} is not a positive number"
+        )
+    return timeout
+
+
 def _metadata(value: str) -> tuple[str, str]:
     key, sep, rest = value.partition("=")
     if not sep or not key:
@@ -775,11 +816,39 @@ def _add_scan_arguments(parser):
     rules_group = parser.add_argument_group("rules")
     rules_group.add_argument(
         "--rules",
-        type=pathlib.Path,
-        action="append",
+        type=_path_list,
+        action="extend",
         metavar="DIR",
-        help="Directory of rule sets jev-scan reviews against, as well as those of "
-        f"$JEV_RULES, separated by {os.pathsep!r}; repeat for more directories; required",
+        help="Directory of rule sets jev-scan reviews against; repeat for "
+        "more directories, or give a ':'-separated list in JEV_RULES [env: "
+        "JEV_RULES]",
+    )
+    api_group = parser.add_argument_group("typesafe")
+    api_group.add_argument(
+        "--api-key",
+        metavar="API_KEY",
+        help="TypeSafe API key [env: TYPESAFE_API_KEY]",
+    )
+    api_group.add_argument(
+        "--base-url",
+        type=_base_url,
+        metavar="BASE_URL",
+        help="TypeSafe API base URL, an absolute URL [env: TYPESAFE_BASE_URL] "
+        f"[default: {jevrev.jev.api.DEFAULT_BASE_URL}]",
+    )
+    api_group.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Jev model to ask [env: TYPESAFE_DEFAULT_MODEL] [default: "
+        f"{jevrev.jev.api.DEFAULT_MODEL}]",
+    )
+    api_group.add_argument(
+        "--timeout",
+        type=_timeout,
+        metavar="TIMEOUT",
+        help="Seconds each connection and read to the TypeSafe API may take; "
+        "inf for no limit [env: TYPESAFE_TIMEOUT] [default: "
+        f"{jevrev.settings.Settings.model_fields['timeout'].default:g}]",
     )
     ignore_group = parser.add_argument_group("ignore")
     ignore_group.add_argument(

@@ -1,5 +1,8 @@
 """TypeSafe's API, through its SDK."""
 
+import math
+
+import httpx2
 import pydantic
 import typesafe_sdk
 import yarl
@@ -43,7 +46,7 @@ class Client:
     def __init__(self, api_key: str, base_url: yarl.URL, timeout: float):
         self.api_key = api_key
         self.base_url = base_url
-        # Seconds per request.
+        # Seconds each connection and read may take; inf for no limit.
         self.timeout = timeout
 
     async def ask(self, request: jevrev.jev.ask.Request) -> list[NoulAnswer]:
@@ -53,7 +56,9 @@ class Client:
                 api_key=self.api_key,
                 base_url=str(self.base_url),
                 model=request.model,
-                timeout=self.timeout,
+                timeout=httpx2.Timeout(None)
+                if math.isinf(self.timeout)
+                else self.timeout,
                 # LiteLLM's pass-through fails on zstd request bodies, which the SDK sends from 1 KiB up.
                 compression=False,
             ) as client:
