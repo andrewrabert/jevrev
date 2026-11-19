@@ -379,6 +379,93 @@ async def run(*argv, stdin=None, cwd=None):
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
+class git:
+    @staticmethod
+    async def current_repository():
+        code, stdout, _ = await run(
+            "git", "rev-parse", "--show-toplevel", cwd=pathlib.Path.cwd()
+        )
+        if code != 0:
+            raise UserError(
+                "the current directory is outside a git repository; give --root"
+            )
+        return pathlib.Path(stdout.strip())
+
+    @staticmethod
+    async def in_repository(root):
+        code, stdout, _ = await run(
+            "git", "rev-parse", "--is-inside-work-tree", cwd=root
+        )
+        return code == 0 and stdout.strip() == "true"
+
+    @staticmethod
+    async def merge_base(root, base):
+        """The merge-base of `base` and HEAD."""
+        code, stdout, stderr = await run(
+            "git", "merge-base", base, "HEAD", cwd=root
+        )
+        if code != 0:
+            raise UserError(f"git merge-base {base} HEAD: {stderr.strip()}")
+        return stdout.strip()
+
+    @staticmethod
+    async def diff(root, revision, context, pathspecs):
+        """The diff from `revision` to the working tree of the files matching `pathspecs`, with
+        `context` as git diff options for its context lines."""
+        code, stdout, stderr = await run(
+            "git",
+            "diff",
+            *context,
+            "--no-color",
+            "--no-ext-diff",
+            "--relative",
+            revision,
+            "--",
+            *pathspecs,
+            cwd=root,
+        )
+        if code != 0:
+            raise UserError(f"git diff {revision}: {stderr.strip()}")
+        return stdout
+
+    @staticmethod
+    async def untracked_files(root, pathspecs):
+        """The untracked files matching `pathspecs`, leaving out those git ignores."""
+        code, stdout, stderr = await run(
+            "git",
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *pathspecs,
+            cwd=root,
+        )
+        if code != 0:
+            raise UserError(
+                f"git ls-files --others in {root}: {stderr.strip()}"
+            )
+        return [name for name in stdout.split("\0") if name]
+
+    @staticmethod
+    async def tracked_files(root, pathspecs):
+        """The tracked and untracked files matching `pathspecs`, leaving out those git ignores."""
+        code, stdout, stderr = await run(
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *pathspecs,
+            cwd=root,
+        )
+        if code != 0:
+            raise UserError(f"git ls-files in {root}: {stderr.strip()}")
+        return [name for name in stdout.split("\0") if name]
+
+
 def is_test(node, source):
     return node.type == "attribute_item" and b"cfg(test)" in source[
         node.start_byte : node.end_byte
@@ -423,7 +510,10 @@ def items(nodes, source, path, context=""):
         body = node.child_by_field_name("body")
         if node.type == "mod_item" and body is not None:
             yield from items(
-                body.named_children, source, path, header_of(node, source)
+                nodes=body.named_children,
+                source=source,
+                path=path,
+                context=header_of(node, source),
             )
             continue
         if node.type in ("impl_item", "trait_item") and body is not None:
@@ -434,7 +524,10 @@ def items(nodes, source, path, context=""):
             ]
             if methods:
                 yield from items(
-                    methods, source, path, header_of(node, source)
+                    nodes=methods,
+                    source=source,
+                    path=path,
+                    context=header_of(node, source),
                 )
                 continue
         start = (above[0] if above else node).start_point[0]
@@ -500,12 +593,22 @@ def python_items(nodes, source, path, context=""):
             ]
             if methods:
                 first = leading(methods[0], PYTHON_LEADING) or [methods[0]]
-                yield item(start, first[0].start_point[0] - 1, name)
+                yield item(
+                    first=start, last=first[0].start_point[0] - 1, name=name
+                )
                 yield from python_items(
-                    methods, source, path, header_of(definition, source)
+                    nodes=methods,
+                    source=source,
+                    path=path,
+                    context=header_of(definition, source),
                 )
                 continue
-        yield item(start, node.end_point[0], name, python_kind_of(definition))
+        yield item(
+            first=start,
+            last=node.end_point[0],
+            name=name,
+            kind=python_kind_of(definition),
+        )
 
 
 def shell_items(nodes, source, path):
@@ -555,21 +658,31 @@ def shell_items(nodes, source, path):
             run.append(node)
             continue
         if run:
-            yield item(run[0], run[-1], ItemKind.TOP_LEVEL, ItemKind.TOP_LEVEL)
+            yield item(
+                first=run[0],
+                last=run[-1],
+                name=ItemKind.TOP_LEVEL,
+                kind=ItemKind.TOP_LEVEL,
+            )
             run = []
         name = node.child_by_field_name("name")
         label = (
             source[name.start_byte : name.end_byte].decode() if name else ""
         )
-        yield item(node, node, f"function {label}".strip())
+        yield item(first=node, last=node, name=f"function {label}".strip())
     if run:
-        yield item(run[0], run[-1], ItemKind.TOP_LEVEL, ItemKind.TOP_LEVEL)
+        yield item(
+            first=run[0],
+            last=run[-1],
+            name=ItemKind.TOP_LEVEL,
+            kind=ItemKind.TOP_LEVEL,
+        )
 
 
 def file_items(name, source, language):
     return [
         item.model_copy(update={"sets": language.sets})
-        for item in parsed_items(name, source, language)
+        for item in parsed_items(name=name, source=source, language=language)
     ]
 
 
@@ -591,16 +704,30 @@ def parsed_items(name, source, language):
         case parser if parser is PYTHON:
             tree = tree_sitter.Parser(parser).parse(source)
             return list(
-                python_items(tree.root_node.named_children, source, name)
+                python_items(
+                    nodes=tree.root_node.named_children,
+                    source=source,
+                    path=name,
+                )
             )
         case parser if parser is BASH:
             tree = tree_sitter.Parser(parser).parse(source)
             return list(
-                shell_items(tree.root_node.named_children, source, name)
+                shell_items(
+                    nodes=tree.root_node.named_children,
+                    source=source,
+                    path=name,
+                )
             )
         case parser:
             tree = tree_sitter.Parser(parser).parse(source)
-            return list(items(tree.root_node.named_children, source, name))
+            return list(
+                items(
+                    nodes=tree.root_node.named_children,
+                    source=source,
+                    path=name,
+                )
+            )
 
 
 def merge_constants(scanned):
@@ -647,28 +774,12 @@ async def changed_items(root, pathspecs, base, context, sets):
     options for its context lines, and the untracked files."""
     if base.startswith("-"):
         raise UserError(f"base {base!r} is not a revision")
-    code, stdout, stderr = await run(
-        "git", "merge-base", base, "HEAD", cwd=root
+    merge_base = await git.merge_base(root, base)
+    diff = await git.diff(
+        root=root, revision=merge_base, context=context, pathspecs=pathspecs
     )
-    if code != 0:
-        raise UserError(f"git merge-base {base} HEAD: {stderr.strip()}")
-    merge_base = stdout.strip()
-    code, stdout, stderr = await run(
-        "git",
-        "diff",
-        *context,
-        "--no-color",
-        "--no-ext-diff",
-        "--relative",
-        merge_base,
-        "--",
-        *pathspecs,
-        cwd=root,
-    )
-    if code != 0:
-        raise UserError(f"git diff {merge_base}: {stderr.strip()}")
     changed = []
-    for patched in unidiff.PatchSet(stdout):
+    for patched in unidiff.PatchSet(diff):
         if patched.is_removed_file or patched.is_binary_file:
             continue
         name = patched.path
@@ -676,7 +787,7 @@ async def changed_items(root, pathspecs, base, context, sets):
         if not (root / name).is_file() or not inside(root, root / name):
             continue
         source = (root / name).read_bytes()
-        language = language_of(name, source, sets)
+        language = language_of(name=name, source=source, sets=sets)
         cutoff = test_cutoff(source, language.test_marker)
         for hunk in patched:
             lines = [
@@ -712,20 +823,7 @@ async def changed_items(root, pathspecs, base, context, sets):
                     ],
                 )
             )
-    code, stdout, stderr = await run(
-        "git",
-        "ls-files",
-        "-z",
-        "--others",
-        "--exclude-standard",
-        "--",
-        *pathspecs,
-        cwd=root,
-    )
-    if code != 0:
-        raise UserError(f"git ls-files --others in {root}: {stderr.strip()}")
-    untracked = [name for name in stdout.split("\0") if name]
-    return changed, untracked
+    return changed, await git.untracked_files(root, pathspecs)
 
 
 DEFAULT_CONTEXT = 20
@@ -793,7 +891,7 @@ def change_items(hunks, untracked, evaluations, all_added, sets):
         hunks = [added_everywhere(hunk) for hunk in hunks]
     new_files = []
     for name, source in untracked.items():
-        language = language_of(name, source, sets)
+        language = language_of(name=name, source=source, sets=sets)
         lines = source.decode(errors="replace").splitlines()
         lines = lines[: test_cutoff(source, language.test_marker) - 1]
         new_files.append(
@@ -841,7 +939,9 @@ def change_items(hunks, untracked, evaluations, all_added, sets):
             item
             for name, source in untracked.items()
             for item in file_items(
-                name, source, language_of(name, source, sets)
+                name=name,
+                source=source,
+                language=language_of(name=name, source=source, sets=sets),
             )
         ]
         scanned += evaluated(
@@ -852,24 +952,6 @@ def change_items(hunks, untracked, evaluations, all_added, sets):
             Evaluation.HUNK,
         )
     return scanned
-
-
-async def current_repository():
-    code, stdout, _ = await run(
-        "git", "rev-parse", "--show-toplevel", cwd=pathlib.Path.cwd()
-    )
-    if code != 0:
-        raise UserError(
-            "the current directory is outside a git repository; give --root"
-        )
-    return pathlib.Path(stdout.strip())
-
-
-async def in_repository(root):
-    code, stdout, _ = await run(
-        "git", "rev-parse", "--is-inside-work-tree", cwd=root
-    )
-    return code == 0 and stdout.strip() == "true"
 
 
 def all_files(root, targets):
@@ -891,24 +973,6 @@ def all_files(root, targets):
             elif path.is_file():
                 files.add(str(path.relative_to(root)))
     return sorted(files)
-
-
-async def tracked_files(root, pathspecs):
-    """The tracked and untracked files matching `pathspecs`, leaving out those git ignores."""
-    code, stdout, stderr = await run(
-        "git",
-        "ls-files",
-        "-z",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "--",
-        *pathspecs,
-        cwd=root,
-    )
-    if code != 0:
-        raise UserError(f"git ls-files in {root}: {stderr.strip()}")
-    return [name for name in stdout.split("\0") if name]
 
 
 def findings(item, root, answers, rule_set):
@@ -939,7 +1003,9 @@ async def ask(item, rule_set, gate, verbose, settings):
     async with gate:
         try:
             request = jev_pr_review.jev_ask.build_request(
-                jev_pr_review.jev_ask.load_questions(rule_set), state, settings
+                questions=jev_pr_review.jev_ask.load_questions(rule_set),
+                state=state,
+                settings=settings,
             )
         except jev_pr_review.jev_ask.UserError as e:
             raise AskFailed(item, str(e))
@@ -955,7 +1021,9 @@ async def ask(item, rule_set, gate, verbose, settings):
                         "start": item.start,
                         "item": item.name,
                         "evaluated": item.evaluated,
-                        "request": json.loads(request.to_json()),
+                        "request": request.model_dump(
+                            mode="json", exclude_none=True
+                        ),
                     }
                 ),
                 file=sys.stderr,
@@ -985,7 +1053,8 @@ async def main():
         "from, and git runs in; default: the git repository holding the current directory. "
         "Outside a git repository every file counts as new",
     )
-    parser.add_argument(
+    rules_group = parser.add_argument_group("rule sets")
+    rules_group.add_argument(
         "--rules",
         metavar="DIR",
         type=pathlib.Path,
@@ -993,7 +1062,7 @@ async def main():
         help="the directory of rule sets; every *.yaml under it, at any depth, whose `when` "
         "matches a file reviews it; default: $JEV_RULES_DIR; one of the two is required",
     )
-    parser.add_argument(
+    rules_group.add_argument(
         "--extra-rules",
         metavar="DIRS",
         type=path_list,
@@ -1001,19 +1070,20 @@ async def main():
         help=f"more directories of rule sets, separated by {os.pathsep!r}, read as "
         "--rules is and used alongside it; default: $JEV_RULES_EXTRA",
     )
-    parser.add_argument(
+    rules_group.add_argument(
         "--set",
         dest="rule_set",
         type=pathlib.Path,
         help="rule set for every item; default: each set under --rules whose `when` "
         "matches the file",
     )
-    parser.add_argument(
+    change_group = parser.add_argument_group("change")
+    change_group.add_argument(
         "--base",
         help="review only what changed from this revision's merge-base with HEAD to the "
         "working tree, plus untracked files; HEAD reviews uncommitted changes",
     )
-    parser.add_argument(
+    change_group.add_argument(
         "-e",
         "--evaluate",
         action="append",
@@ -1022,7 +1092,7 @@ async def main():
         help="with --base, what each request evaluates: the full diff, each file's diff, or "
         "each hunk of it; repeatable; default: hunk",
     )
-    parser.add_argument(
+    change_group.add_argument(
         "-C",
         "--context",
         type=context_lines,
@@ -1030,7 +1100,7 @@ async def main():
         help="with --base, the lines of context on each side of a hunk, or "
         f"{FULL_CONTEXT} for every line of the file; default: {DEFAULT_CONTEXT}",
     )
-    parser.add_argument(
+    change_group.add_argument(
         "-a",
         "--all-added",
         action="store_true",
@@ -1071,13 +1141,21 @@ async def main():
         print(f"{len(scanned)} items", file=sys.stderr)
         return
     found, failures = await review(
-        scanned, root, args.concurrency, args.verbose
+        scanned=scanned,
+        root=root,
+        concurrency=args.concurrency,
+        verbose=args.verbose,
     )
     for finding in found:
         print(json_dumps(finding.model_dump(exclude_none=True)))
     for failure in failures:
         print(json_dumps({"failure": failure}))
-    print(summary_line(scanned, root, found, failures), file=sys.stderr)
+    print(
+        summary_line(
+            scanned=scanned, root=root, found=found, failures=failures
+        ),
+        file=sys.stderr,
+    )
 
 
 async def scan_items(
@@ -1095,7 +1173,7 @@ async def scan_items(
     flags of the same names select them."""
     evaluations = evaluate or [Evaluation.HUNK]
 
-    root = (await current_repository() if root is None else root).resolve()
+    root = (await git.current_repository() if root is None else root).resolve()
     if not root.is_dir():
         raise UserError(f"--root {root} is not a directory")
     sets = sets_under(
@@ -1133,17 +1211,21 @@ async def scan_items(
         evaluate is not None or context is not None or all_added
     ):
         raise UserError("--evaluate, --context and --all-added need --base")
-    if not await in_repository(root):
+    if not await git.in_repository(root):
         # Outside a repository every file is new: reviewed whole, or as added with --base.
         hunks, whole = [], all_files(root, targets)
     elif base is None:
-        whole = await tracked_files(root, pathspecs)
+        whole = await git.tracked_files(root, pathspecs)
         if ignored := sorted(named - set(whole)):
             raise UserError(f"{', '.join(ignored)} ignored by git")
     else:
         lines = DEFAULT_CONTEXT if context is None else context
         hunks, whole = await changed_items(
-            root, pathspecs, base, (f"-U{lines}",), sets
+            root=root,
+            pathspecs=pathspecs,
+            base=base,
+            context=(f"-U{lines}",),
+            sets=sets,
         )
     sources = {}
     for name in whole:
@@ -1170,12 +1252,20 @@ async def scan_items(
                 item
                 for name, source in sources.items()
                 for item in file_items(
-                    name, source, language_of(name, source, sets)
+                    name=name,
+                    source=source,
+                    language=language_of(name=name, source=source, sets=sets),
                 )
             ]
         )
     else:
-        scanned = change_items(hunks, sources, evaluations, all_added, sets)
+        scanned = change_items(
+            hunks=hunks,
+            untracked=sources,
+            evaluations=evaluations,
+            all_added=all_added,
+            sets=sets,
+        )
     scanned = [
         item.model_copy(
             update={"sets": (rule_set,) if rule_set else item.sets}
@@ -1192,7 +1282,16 @@ async def review(scanned, root, concurrency, verbose):
     gate = asyncio.Semaphore(concurrency)
     settings = jev_pr_review.jev_ask.load_settings()
     results = await asyncio.gather(
-        *(ask(item, s, gate, verbose, settings) for item, s in asked),
+        *(
+            ask(
+                item=item,
+                rule_set=s,
+                gate=gate,
+                verbose=verbose,
+                settings=settings,
+            )
+            for item, s in asked
+        ),
         return_exceptions=True,
     )
     if asked and all(isinstance(result, AskFailed) for result in results):
@@ -1207,7 +1306,9 @@ async def review(scanned, root, concurrency, verbose):
             continue
         if isinstance(result, BaseException):
             raise result
-        for finding in findings(item, root, result, rule_set):
+        for finding in findings(
+            item=item, root=root, answers=result, rule_set=rule_set
+        ):
             if (id(item), finding.flags) in reported:
                 continue
             reported.add((id(item), finding.flags))
@@ -1239,7 +1340,11 @@ def without_file_repeats(found):
 
 
 def cli():
-    asyncio.run(main())
+    try:
+        sys.exit(asyncio.run(main()))
+    except (UserError, jev_pr_review.jev_ask.UserError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

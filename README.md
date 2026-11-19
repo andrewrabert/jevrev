@@ -7,10 +7,9 @@ Give the directory of rule sets to review against with `--rules` or `JEV_RULES_D
 A review's data is in one SQLite state file given by `--state`. Its clone is kept under `--cache-dir` until the review finishes or is cancelled. [cli.md](cli.md) is the CLI's surface.
 
 ```sh
-jev-code-review --state review.db start-review --repo github.com/ORG/NAME --pr 12 --rules example_rules
-jev-code-review --state review.db sandbox read --file-path /sandbox/jev-findings.jsonl
-jev-code-review --state review.db confirm-finding 1 "Why the lines break the rule"
-jev-code-review --state review.db finish-review
-jev-code-review --state review.db post-review
-jev-code-review --state review.db read-review
+jev-code-review --state review.db review start --repo github.com/ORG/NAME --pr 12 --rules example_rules
+jev-code-review --state review.db review file-read --file-path /sandbox/jev-findings.jsonl
+jev-code-review --state review.db review jev-confirm 1 "Why the lines break the rule"
+jev-code-review --state review.db review finish
+jev-code-review --state review.db review show
 ```

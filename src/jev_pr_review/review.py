@@ -3,7 +3,6 @@ import asyncio
 import contextlib
 import datetime
 import enum
-import json
 import os
 import pathlib
 import shutil
@@ -76,8 +75,76 @@ async def run(*args):
     return stdout.decode()
 
 
-async def git(git_dir, *argv):
-    return await run("git", "--no-pager", f"--git-dir={git_dir}", *argv)
+class git:
+    @staticmethod
+    async def run(git_dir, *argv):
+        return await run("git", "--no-pager", f"--git-dir={git_dir}", *argv)
+
+    @staticmethod
+    async def clone(source: pathlib.Path, checkout: pathlib.Path):
+        """Clone source to checkout, checking nothing out."""
+        await run(
+            "git", "clone", "--quiet", "--no-checkout", "--", source, checkout
+        )
+
+    @staticmethod
+    async def checkout_detached(checkout: pathlib.Path, commit):
+        await git.run(
+            checkout / ".git",
+            f"--work-tree={checkout}",
+            "checkout",
+            "--quiet",
+            "--detach",
+            commit,
+        )
+
+    @staticmethod
+    async def fetch(git_dir, refspec):
+        await git.run(git_dir, "fetch", "--quiet", "origin", refspec)
+
+    @staticmethod
+    async def symbolic_ref(git_dir, name) -> str:
+        return (await git.run(git_dir, "symbolic-ref", name)).strip()
+
+    @staticmethod
+    async def set_symbolic_ref(git_dir, name, target):
+        await git.run(git_dir, "symbolic-ref", name, target)
+
+    @staticmethod
+    async def rev_parse(git_dir, *revs) -> list[str]:
+        return (await git.run(git_dir, "rev-parse", *revs)).split()
+
+    @staticmethod
+    async def merge_base(git_dir, first, second) -> str:
+        return (await git.run(git_dir, "merge-base", first, second)).strip()
+
+    @staticmethod
+    async def resolve_commit(git_dir: pathlib.Path, rev: str) -> str:
+        return (
+            await git.run(
+                git_dir,
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{rev}^{{commit}}",
+            )
+        ).strip()
+
+    @staticmethod
+    async def diff(git_dir, base, head, context, inter_hunk_context) -> str:
+        """The diff from base to head, with context lines of context around
+        each change and changes up to inter_hunk_context lines apart in one
+        hunk."""
+        return await git.run(
+            git_dir,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            f"-U{context}",
+            f"--inter-hunk-context={inter_hunk_context}",
+            base,
+            head,
+        )
 
 
 def local_repo_path(git_dir: pathlib.Path) -> pathlib.PurePosixPath:
@@ -148,6 +215,13 @@ class JevInlineFinding(pydantic.BaseModel):
     reason: str | None = None
 
 
+class SandboxFinding(jev_pr_review.jev_scan.Finding):
+    """A jev_scan finding as the findings file in the sandbox holds it: its
+    file where the sandbox mounts it, and its index in the file, from 1."""
+
+    index: int
+
+
 class JevInlineReviewResult(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
@@ -159,7 +233,7 @@ class JevInlineReviewResult(pydantic.BaseModel):
     state: pathlib.Path
     started: datetime.datetime
     finished: datetime.datetime
-    comment_url: str | None = None
+    comment_url: github.pull_request.Url | None = None
     findings: list[JevInlineFinding]
 
 
@@ -213,7 +287,7 @@ class LocalJevInlineReviewInput(AgentInput):
     kind: typing.Literal[InputKind.LOCAL] = pydantic.Field(
         description="Two revisions of a git dir on the host"
     )
-    git_dir: str = pydantic.Field(
+    git_dir: pathlib.Path = pydantic.Field(
         description="Path of the git dir on the host"
     )
     base: str = pydantic.Field(description="Revision to compare from")
@@ -231,7 +305,7 @@ class LocalFullJevInlineReviewInput(AgentInput):
     kind: typing.Literal[InputKind.LOCAL_FULL] = pydantic.Field(
         description="Every file of a git dir on the host at a revision"
     )
-    git_dir: str = pydantic.Field(
+    git_dir: pathlib.Path = pydantic.Field(
         description="Path of the git dir on the host"
     )
     head: str = pydantic.Field(description="Revision to audit")
@@ -255,13 +329,6 @@ def validation_error(error: pydantic.ValidationError):
         for e in error.errors(include_url=False)
     )
     return UserError("Invalid review input:\n" + "\n".join(lines))
-
-
-def text_lines(text):
-    lines = text.split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    return [line.removesuffix("\r") for line in lines]
 
 
 def source_commits(source: GithubSource | LocalSource) -> tuple[str, str]:
@@ -297,13 +364,13 @@ class JevInlineReview(pydantic.BaseModel):
     # Where the sandbox mounts the working tree of the head.
     mount: pathlib.PurePosixPath
     # The directory holding the review's clone and head checkout, from
-    # start-review until it finishes or is cancelled.
+    # review start until it finishes or is cancelled.
     clone_dir: pathlib.Path
-    # A pull request review's github_hunks, captured at start-review.
+    # A pull request review's github_hunks, captured at review start.
     github_hunks: dict[str, list[LineRange]] | None = None
     # Whether jev scans every file of the head, not the change from the base.
     full: bool = False
-    comment_url: str | None = None
+    comment_url: github.pull_request.Url | None = None
     # jev_scan's findings, in the order of its file.
     findings: list[JevInlineFinding]
 
@@ -405,7 +472,11 @@ def opened_sandbox(store: "ReviewState", prepared: pathlib.Path, repos):
         for path, host in ((HOME_DIR, prepared), *repos.items())
     ]
     return jev_pr_review.sandbox.Sandbox.opened(
-        store.state, mounts, USERNAME, HOSTNAME, str(HOME_DIR)
+        state=store.state,
+        mounts=mounts,
+        username=USERNAME,
+        hostname=HOSTNAME,
+        cwd=str(HOME_DIR),
     )
 
 
@@ -421,7 +492,7 @@ def sandbox_home(review: JevInlineReview, findings: bytes | None):
 
 
 def review_input(args) -> JevInlineReviewInput:
-    """The review start-review's flags describe."""
+    """The review that review start's flags describe."""
     given = {
         name: value
         for name in ("pr", "git_dir", "base", "head")
@@ -453,22 +524,28 @@ async def prepare_review(root, value: JevInlineReviewInput):
             full = True
         case LocalJevInlineReviewInput():
             source, checkout = await prepare_local_checkout(
-                root, pathlib.Path(value.git_dir), value.base, value.head
+                root=root,
+                git_dir=value.git_dir,
+                base=value.base,
+                head=value.head,
             )
             return source, checkout, False
         case LocalFullJevInlineReviewInput():
             # A full review scans no change, so its base is its head.
             source, checkout = await prepare_local_checkout(
-                root, pathlib.Path(value.git_dir), value.head, value.head
+                root=root,
+                git_dir=value.git_dir,
+                base=value.head,
+                head=value.head,
             )
             return source, checkout, True
     source, checkout = await prepare_github_checkout(
-        root, value.repo, value.pr
+        root=root, repo=value.repo, pr=value.pr
     )
     return source, checkout, full
 
 
-async def start_review(args):
+async def cmd_review_start(args):
     state: pathlib.Path = args.state
     if state.exists():
         raise UserError(f"{state} already exists")
@@ -489,7 +566,12 @@ async def start_review(args):
         source, checkout, full = await prepare_review(root, value)
         (mount,) = source.repos()
         findings, findings_file, summary = await scan(
-            source, checkout, mount, full, args.rules, args.extra_rules
+            source=source,
+            checkout=checkout,
+            mount=mount,
+            full=full,
+            rules=args.rules,
+            extra_rules=args.extra_rules,
         )
         review = JevInlineReview(
             input=value,
@@ -516,7 +598,9 @@ async def start_review(args):
             sandbox_home(review, None) as prepared,
         ):
             store = ReviewState(opened, state)
-            with opened_sandbox(store, prepared, {mount: checkout}) as sandbox:
+            with opened_sandbox(
+                store=store, prepared=prepared, repos={mount: checkout}
+            ) as sandbox:
                 result = sandbox.bash.execute_sync(
                     f"export HOME={HOME_DIR}; unset {' '.join(BUILD_ONLY_ENV)}"
                 )
@@ -536,46 +620,44 @@ async def start_review(args):
 async def scan(source, checkout, mount, full, rules, extra_rules):
     """jev_scan's findings on the head checkout: as findings, as the JSON
     lines of its file in the sandbox, and its summary line."""
-    findings, summary = await run_jev_scan(
-        checkout,
-        rules,
-        extra_rules,
-        **(
-            {}
-            if full
-            else {
-                "base": source_commits(source)[0],
-                "evaluate": [
-                    jev_pr_review.jev_scan.Evaluation.HUNK,
-                    jev_pr_review.jev_scan.Evaluation.FILE,
-                ],
-            }
-        ),
+    base, evaluate = None, None
+    if not full:
+        base = source_commits(source)[0]
+        evaluate = [
+            jev_pr_review.jev_scan.Evaluation.HUNK,
+            jev_pr_review.jev_scan.Evaluation.FILE,
+        ]
+    found, summary = await run_jev_scan(
+        root=checkout,
+        rules=rules,
+        extra_rules=extra_rules,
+        base=base,
+        evaluate=evaluate,
     )
-    lines = list(at_mount(findings, checkout, mount))
-    found = [
-        inline_finding(
-            jev_pr_review.jev_scan.Finding.model_validate_json(line),
-            checkout,
-        )
-        for line in text_lines(findings)
-    ]
     lines = [
-        json.dumps({**json.loads(line), "index": index}, sort_keys=True)
-        for index, line in enumerate(lines, 1)
+        jev_pr_review.jev_scan.json_dumps(
+            SandboxFinding(
+                **finding.model_dump(exclude={"file"}),
+                file=str(
+                    mount / pathlib.Path(finding.file).relative_to(checkout)
+                ),
+                index=index,
+            ).model_dump(mode="json", exclude_none=True)
+        )
+        for index, finding in enumerate(found, 1)
     ]
     return (
-        found,
+        [inline_finding(finding, checkout) for finding in found],
         "".join(f"{line}\n" for line in lines),
         summary.replace(str(checkout), str(mount)),
     )
 
 
-async def confirm_finding(args):
+async def cmd_review_jev_confirm(args):
     await judge_finding(args, JevVerdict.CONFIRMED)
 
 
-async def reject_finding(args):
+async def cmd_review_jev_reject(args):
     await judge_finding(args, JevVerdict.REJECTED)
 
 
@@ -594,7 +676,7 @@ async def judge_finding(args, verdict: JevVerdict):
     print(f"Finding {index} {verdict}")
 
 
-async def finish_review(args):
+async def cmd_review_finish(args):
     with open_review(args.state, args.lock_timeout) as store:
         task = store.load()
         task.require_status(ReviewStatus.OPEN)
@@ -608,27 +690,21 @@ async def finish_review(args):
             )
         task.status = ReviewStatus.FINISHED
         task.finished = now()
+        # Submitted before the review is saved as finished, so a review
+        # whose GitHub review fails stays open and finish can be run again.
+        on_github = args.github_review and isinstance(
+            task.source, GithubSource
+        )
+        submits = on_github and bool(confirmed(task.findings))
+        if submits:
+            await post_pr_comment(task, args.state)
         store.save(task)
         remove_clone(task)
     print("Review finished.")
-
-
-async def post_review(args):
-    with open_review(args.state, args.lock_timeout) as store:
-        task = store.load()
-        task.require_status(ReviewStatus.FINISHED)
-        if not isinstance(task.source, GithubSource):
-            raise UserError("The review has no pull request.")
-        if task.comment_url is not None:
-            raise UserError(
-                f"The review is already posted: {task.comment_url}"
-            )
-        if not confirmed(task.findings):
-            print("No confirmed findings; nothing posted.")
-            return
-        await post_pr_comment(task, args.state)
-        store.save(task)
-    print(task.comment_url)
+    if submits:
+        print(task.comment_url)
+    elif on_github:
+        print("No confirmed findings; no GitHub review submitted.")
 
 
 async def post_pr_comment(task: JevInlineReview, state: pathlib.Path):
@@ -636,23 +712,23 @@ async def post_pr_comment(task: JevInlineReview, state: pathlib.Path):
     pull_request = await github.gh.gh.pull_request(source.repo, source.pr)
     user = await github.gh.gh.current_user(source.repo.host)
     review = jev_inline_review(
-        task.result(state),
-        {
+        result=task.result(state),
+        hunks={
             path: [range(r.start, r.stop) for r in ranges]
             for path, ranges in task.github_hunks.items()
         },
         # GitHub refuses a request for changes on one's own pull request.
-        github.pull_request.ReviewEvent.COMMENT
+        event=github.pull_request.ReviewEvent.COMMENT
         if pull_request.author.login == user.login
         else github.pull_request.ReviewEvent.REQUEST_CHANGES,
     )
     url = await github.gh.gh.post_review(
         repo=source.repo, pr=source.pr, review=review
     )
-    task.comment_url = str(url)
+    task.comment_url = url
 
 
-async def cancel_review(args):
+async def cmd_review_cancel(args):
     with open_review(args.state, args.lock_timeout) as store:
         task = store.load()
         task.require_status(ReviewStatus.OPEN)
@@ -663,23 +739,26 @@ async def cancel_review(args):
     print("Review cancelled.")
 
 
-async def read_review(args):
+async def cmd_review_show(args):
     with open_review(args.state, args.lock_timeout) as store:
         task = store.load()
     task.require_status(ReviewStatus.FINISHED)
     print(jev_inline_text(task.result(args.state)))
 
 
-async def sandbox_bash(args):
+async def cmd_review_bash(args):
     command = sys.stdin.read()
     await in_sandbox(args, lambda sandbox: sandbox.run_bash(command))
 
 
-async def sandbox_read(args):
+async def cmd_review_file_read(args):
     await in_sandbox(
         args,
         lambda sandbox: sandbox.read_lines(
-            args.file_path, args.offset, args.limit, args.max_file_size
+            file_path=args.file_path,
+            offset=args.offset,
+            limit=args.limit,
+            max_file_size=args.max_file_size,
         ),
     )
 
@@ -692,14 +771,16 @@ async def in_sandbox(args, call):
         checkout = review_checkout(task)
         with (
             sandbox_home(task, store.read_file(JEV_FINDINGS)) as prepared,
-            opened_sandbox(store, prepared, {task.mount: checkout}) as sandbox,
+            opened_sandbox(
+                store=store, prepared=prepared, repos={task.mount: checkout}
+            ) as sandbox,
         ):
             output = call(sandbox)
     sys.stdout.write(output)
 
 
 def task_brief(task):
-    # What start-review prints: where the review's head is in the sandbox,
+    # What review start prints: where the review's head is in the sandbox,
     # then its input as YAML.
     given = yaml.safe_dump(
         {"input": task.input.model_dump(mode="json", exclude_none=True)},
@@ -712,8 +793,8 @@ def task_brief(task):
 
 async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     """Run jev-scan on root against the rule sets under rules and each of
-    extra_rules: its findings as JSON lines, and its summary line. Fails if
-    any jev request fails."""
+    extra_rules: its findings, and its summary line. Fails if any jev
+    request fails."""
     try:
         async with asyncio.timeout(JEV_SCAN_TIMEOUT):
             root, scanned = await jev_pr_review.jev_scan.scan_items(
@@ -724,7 +805,10 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
                 evaluate=evaluate,
             )
             found, failures = await jev_pr_review.jev_scan.review(
-                scanned, root, JEV_SCAN_CONCURRENCY, verbose=False
+                scanned=scanned,
+                root=root,
+                concurrency=JEV_SCAN_CONCURRENCY,
+                verbose=False,
             )
     except TimeoutError:
         raise UserError(f"jev-scan ran longer than {JEV_SCAN_TIMEOUT} seconds")
@@ -738,37 +822,10 @@ async def run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
             f"jev-scan: {len(failures)} jev requests failed:\n"
             + "\n".join(failures)
         )
-    lines = [
-        jev_pr_review.jev_scan.json_dumps(f.model_dump(exclude_none=True))
-        for f in found
-    ]
     summary = jev_pr_review.jev_scan.summary_line(
-        scanned, root, found, failures
+        scanned=scanned, root=root, found=found, failures=failures
     )
-    return "".join(f"{line}\n" for line in lines), summary
-
-
-def at_mount(findings, checkout, mount):
-    """Each line of jev-scan's findings, its file moved from the host
-    checkout to where the sandbox mounts it."""
-    for line in text_lines(findings):
-        item = json.loads(line)
-        if isinstance(file := item.get("file"), str):
-            path = pathlib.PurePosixPath(file)
-            if path.is_relative_to(checkout):
-                item["file"] = str(mount / path.relative_to(checkout))
-        yield json.dumps(item, sort_keys=True)
-
-
-async def checkout_detached(checkout: pathlib.Path, commit):
-    await git(
-        checkout / ".git",
-        f"--work-tree={checkout}",
-        "checkout",
-        "--quiet",
-        "--detach",
-        commit,
-    )
+    return found, summary
 
 
 async def pull_request_source(
@@ -778,17 +835,13 @@ async def pull_request_source(
 ):
     head_ref = f"refs/pr/{pr}/head"
     target_ref = f"refs/pr/{pr}/target"
-    target = (
-        (await git(git_dir, "symbolic-ref", target_ref))
-        .strip()
-        .removeprefix("refs/remotes/origin/")
+    target = (await git.symbolic_ref(git_dir, target_ref)).removeprefix(
+        "refs/remotes/origin/"
     )
-    head_sha, target_sha = (
-        await git(git_dir, "rev-parse", head_ref, target_ref)
-    ).split()
-    merge_base = (
-        await git(git_dir, "merge-base", head_sha, target_sha)
-    ).strip()
+    head_sha, target_sha = await git.rev_parse(git_dir, head_ref, target_ref)
+    merge_base = await git.merge_base(
+        git_dir=git_dir, first=head_sha, second=target_sha
+    )
     return GithubSource(
         repo=repo,
         pr=pr,
@@ -808,22 +861,15 @@ async def prepare_github_checkout(
     checkout = root / HEAD
     clone = checkout / ".git"
     await github.gh.gh.clone(repo, checkout, "--no-checkout")
-    await git(
-        clone,
-        "fetch",
-        "--quiet",
-        "origin",
-        f"+refs/pull/{pr}/head:refs/pr/{pr}/head",
+    await git.fetch(clone, f"+refs/pull/{pr}/head:refs/pr/{pr}/head")
+    await git.set_symbolic_ref(
+        git_dir=clone,
+        name=f"refs/pr/{pr}/target",
+        target=f"refs/remotes/origin/{target}",
     )
-    await git(
-        clone,
-        "symbolic-ref",
-        f"refs/pr/{pr}/target",
-        f"refs/remotes/origin/{target}",
-    )
-    source = await pull_request_source(clone, repo, pr)
+    source = await pull_request_source(git_dir=clone, repo=repo, pr=pr)
     source.clone = clone
-    await checkout_detached(checkout, source.head_sha)
+    await git.checkout_detached(checkout, source.head_sha)
     return source, checkout
 
 
@@ -835,14 +881,12 @@ async def prepare_local_checkout(
 ) -> tuple[LocalSource, pathlib.Path]:
     git_dir = git_dir.resolve()
     base_commit, head_commit = [
-        await resolve_commit(git_dir, rev) for rev in (base, head)
+        await git.resolve_commit(git_dir, rev) for rev in (base, head)
     ]
     checkout = root / HEAD
     clone = checkout / ".git"
-    await run(
-        "git", "clone", "--quiet", "--no-checkout", "--", git_dir, checkout
-    )
-    await checkout_detached(checkout, head_commit)
+    await git.clone(git_dir, checkout)
+    await git.checkout_detached(checkout, head_commit)
     source = LocalSource(
         git_dir=git_dir,
         clone=clone,
@@ -852,18 +896,6 @@ async def prepare_local_checkout(
         head_commit=head_commit,
     )
     return source, checkout
-
-
-async def resolve_commit(git_dir: pathlib.Path, rev: str) -> str:
-    return (
-        await git(
-            git_dir,
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            f"{rev}^{{commit}}",
-        )
-    ).strip()
 
 
 class Template(enum.StrEnum):
@@ -965,15 +997,12 @@ GITHUB_INTER_HUNK_CONTEXT = 1
 async def github_hunks(source: GithubSource) -> dict[str, list[range]]:
     """The head's lines of each hunk of the pull request's diff as GitHub
     shows it, by path: the lines a review comment can be left on."""
-    diff = await git(
-        source.clone,
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        f"-U{GITHUB_DIFF_CONTEXT}",
-        f"--inter-hunk-context={GITHUB_INTER_HUNK_CONTEXT}",
-        source.merge_base,
-        source.head_sha,
+    diff = await git.diff(
+        git_dir=source.clone,
+        base=source.merge_base,
+        head=source.head_sha,
+        context=GITHUB_DIFF_CONTEXT,
+        inter_hunk_context=GITHUB_INTER_HUNK_CONTEXT,
     )
     return {
         file.path: [
@@ -1108,25 +1137,23 @@ def jev_inline_review(
     )
 
 
-def positive_float(value):
-    number = float(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError(f"{value} is not positive")
-    return number
+def boolean(value):
+    match value.lower():
+        case "true":
+            return True
+        case "false":
+            return False
+    raise argparse.ArgumentTypeError(f"{value} is not true or false")
 
 
-def positive_int(value):
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError(f"{value} is not positive")
-    return number
-
-
-def non_negative_int(value):
-    number = int(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError(f"{value} is negative")
-    return number
+def add_judge_arguments(parser, reason_help):
+    parser.add_argument(
+        "index",
+        type=jev_pr_review.sandbox.positive_int,
+        metavar="INDEX",
+        help="Index of the finding in jev_scan's file, from 1",
+    )
+    parser.add_argument("reason", metavar="REASON", help=reason_help)
 
 
 def parser():
@@ -1145,64 +1172,65 @@ def parser():
     )
     parser.add_argument(
         "--lock-timeout",
-        type=positive_float,
+        type=jev_pr_review.sandbox.positive_float,
         default=3600,
         metavar="SECONDS",
         help="Seconds to wait for another command to release the state file "
         "[default: 3600]",
     )
-    commands = parser.add_subparsers(
+    subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"
     )
 
-    def command(name, handler, help):
-        sub = commands.add_parser(name, help=help, description=help)
-        sub.set_defaults(handler=handler)
-        return sub
+    description = "Start, judge, and finish the review in the state file"
+    review_parser = subparsers.add_parser(
+        "review", help=description, description=description
+    )
+    review_subparsers = review_parser.add_subparsers(
+        dest="review_command", required=True, metavar="COMMAND"
+    )
 
-    start = command(
-        "start-review",
-        start_review,
+    description = (
         "Prepare a jev review of a pull request or a local git dir in a new "
         "state file, run jev over its change, or every file of its head when "
-        "full, and print its brief and the scan's summary",
+        "full, and print its brief and the scan's summary"
     )
-    start.add_argument(
+    start_parser = review_subparsers.add_parser(
+        "start", help=description, description=description
+    )
+    pull_request_group = start_parser.add_argument_group("pull request")
+    pull_request_group.add_argument(
         "--repo",
         metavar="HOST/ORG/NAME",
         help="GitHub repo of the pull request; requires --pr; conflicts with "
         "--git-dir",
     )
-    start.add_argument(
+    pull_request_group.add_argument(
         "--pr",
-        type=positive_int,
+        type=jev_pr_review.sandbox.positive_int,
         metavar="N",
         help="Pull request number; requires --repo",
     )
-    start.add_argument(
-        "--cache-dir",
-        type=pathlib.Path,
-        metavar="DIR",
-        help="Directory the review's clone is kept in until the review "
-        "finishes or is cancelled [default: the temporary directory]",
-    )
-    start.add_argument(
+    local_group = start_parser.add_argument_group("local git dir")
+    local_group.add_argument(
         "--git-dir",
+        type=pathlib.Path,
         metavar="DIR",
         help="Git dir on the host; requires --head; conflicts with --repo",
     )
-    start.add_argument(
+    local_group.add_argument(
         "--base",
         metavar="REV",
         help="Revision to compare from; requires --git-dir; conflicts with "
         "--full",
     )
-    start.add_argument(
+    local_group.add_argument(
         "--head",
         metavar="REV",
         help="Revision to audit; requires --git-dir",
     )
-    start.add_argument(
+    rules_group = start_parser.add_argument_group("rule sets")
+    rules_group.add_argument(
         "--rules",
         type=pathlib.Path,
         default=jev_pr_review.jev_scan.env_path("JEV_RULES_DIR"),
@@ -1210,7 +1238,7 @@ def parser():
         help="Directory of rule sets jev-scan reviews against "
         "[default: $JEV_RULES_DIR]; required",
     )
-    start.add_argument(
+    rules_group.add_argument(
         "--extra-rules",
         type=jev_pr_review.jev_scan.path_list,
         default=jev_pr_review.jev_scan.path_list(
@@ -1220,89 +1248,99 @@ def parser():
         help=f"More directories of rule sets, separated by {os.pathsep!r} "
         "[default: $JEV_RULES_EXTRA]",
     )
-    start.add_argument(
+    start_parser.add_argument(
+        "--cache-dir",
+        type=pathlib.Path,
+        metavar="DIR",
+        help="Directory the review's clone is kept in until the review "
+        "finishes or is cancelled [default: the temporary directory]",
+    )
+    start_parser.add_argument(
         "--full",
         action="store_true",
         help="Audit every file of the head, not the change from the base",
     )
-    for name, handler, help, reason in (
-        (
-            "confirm-finding",
-            confirm_finding,
-            "Confirm one jev_scan finding of the review",
-            "One sentence on how the lines match the violation",
-        ),
-        (
-            "reject-finding",
-            reject_finding,
-            "Reject one jev_scan finding of the review",
-            "One sentence on why the lines do not break the rule",
-        ),
-    ):
-        judge = command(name, handler, help)
-        judge.add_argument(
-            "index",
-            type=positive_int,
-            metavar="INDEX",
-            help="Index of the finding in jev_scan's file, from 1",
-        )
-        judge.add_argument("reason", metavar="REASON", help=reason)
-    command(
-        "finish-review",
-        finish_review,
-        "Finish the review once every finding has a verdict",
+
+    description = "Confirm one jev_scan finding of the review"
+    confirm_parser = review_subparsers.add_parser(
+        "jev-confirm", help=description, description=description
     )
-    command(
-        "post-review",
-        post_review,
-        "Post the finished review's confirmed findings as a review on its "
-        "pull request",
+    add_judge_arguments(
+        confirm_parser, "One sentence on how the lines match the violation"
     )
-    command(
-        "cancel-review",
-        cancel_review,
-        "Mark the review cancelled, so no later command changes it",
+
+    description = "Reject one jev_scan finding of the review"
+    reject_parser = review_subparsers.add_parser(
+        "jev-reject", help=description, description=description
     )
-    command("read-review", read_review, "Print the finished review's result")
-    sandbox = commands.add_parser(
-        "sandbox",
-        help="Run a bashkit-sandbox command in the review's sandbox",
-        description="Run a bashkit-sandbox command in the review's sandbox",
-    ).add_subparsers(dest="sandbox_command", required=True, metavar="COMMAND")
-    bash = sandbox.add_parser(
-        "bash",
-        help="Run the shell command read from stdin",
-        description="Run the shell command read from stdin",
+    add_judge_arguments(
+        reject_parser, "One sentence on why the lines do not break the rule"
     )
-    bash.set_defaults(handler=sandbox_bash)
-    read = sandbox.add_parser(
-        "read",
-        help="Read a text file with numbered lines",
-        description="Read a text file with numbered lines",
+
+    description = (
+        "Finish the review once every finding has a verdict, submitting a "
+        "pull request review's confirmed findings as a review on the GitHub "
+        "pull request"
     )
-    read.set_defaults(handler=sandbox_read)
-    read.add_argument(
+    finish_parser = review_subparsers.add_parser(
+        "finish", help=description, description=description
+    )
+    finish_parser.add_argument(
+        "--github-review",
+        type=boolean,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="BOOL",
+        help="Submit the confirmed findings as a review on the GitHub pull "
+        "request [default: true]",
+    )
+
+    description = "Mark the review cancelled, so no later command changes it"
+    review_subparsers.add_parser(
+        "cancel", help=description, description=description
+    )
+
+    description = "Print the finished review's result"
+    review_subparsers.add_parser(
+        "show", help=description, description=description
+    )
+
+    description = (
+        "Run the shell command read from stdin in the review's sandbox"
+    )
+    review_subparsers.add_parser(
+        "bash", help=description, description=description
+    )
+
+    description = (
+        "Read a text file in the review's sandbox with numbered lines"
+    )
+    file_read_parser = review_subparsers.add_parser(
+        "file-read", help=description, description=description
+    )
+    file_read_parser.add_argument(
         "--file-path",
         type=pathlib.PurePosixPath,
         required=True,
         metavar="PATH",
         help="The file to read",
     )
-    read.add_argument(
+    file_read_parser.add_argument(
         "--offset",
-        type=positive_int,
+        type=jev_pr_review.sandbox.positive_int,
         metavar="N",
         help="The first line to read, from 1",
     )
-    read.add_argument(
+    file_read_parser.add_argument(
         "--limit",
-        type=non_negative_int,
+        type=jev_pr_review.sandbox.non_negative_int,
         metavar="N",
         help="The number of lines to read",
     )
-    read.add_argument(
+    file_read_parser.add_argument(
         "--max-file-size",
-        type=positive_int,
+        type=jev_pr_review.sandbox.positive_int,
         default=16 * 1024 * 1024,
         metavar="BYTES",
         help="The largest file, in bytes, to read a range of lines from "
@@ -1311,10 +1349,32 @@ def parser():
     return parser
 
 
-def cli():
+async def main():
     args = parser().parse_args()
+    match args.command:
+        case "review":
+            match args.review_command:
+                case "start":
+                    await cmd_review_start(args)
+                case "jev-confirm":
+                    await cmd_review_jev_confirm(args)
+                case "jev-reject":
+                    await cmd_review_jev_reject(args)
+                case "finish":
+                    await cmd_review_finish(args)
+                case "cancel":
+                    await cmd_review_cancel(args)
+                case "show":
+                    await cmd_review_show(args)
+                case "bash":
+                    await cmd_review_bash(args)
+                case "file-read":
+                    await cmd_review_file_read(args)
+
+
+def cli():
     try:
-        sys.exit(asyncio.run(args.handler(args)) or 0)
+        sys.exit(asyncio.run(main()))
     except (
         UserError,
         jev_pr_review.sandbox.UserError,

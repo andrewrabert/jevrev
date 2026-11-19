@@ -251,68 +251,43 @@ async def ask(request: Request, settings: Settings) -> dict:
     return summary(response)
 
 
-class Ask(pydantic_settings.BaseSettings):
-    """Ask TypeSafe's Jev whether the text on stdin breaks each rule of a rule set, and print one answer per rule as JSON."""
-
-    model_config = pydantic_settings.SettingsConfigDict(
-        cli_enforce_required=True,
-        cli_implicit_flags="toggle",
-        cli_kebab_case=True,
-        cli_shortcuts={"rules": "r"},
-    )
-
-    rules: pathlib.Path = pydantic.Field(
-        description="rule set file (YAML or JSON)"
-    )
-    dry_run: bool = pydantic.Field(
-        False,
-        description="print the request that would be sent, and exit without sending it",
-    )
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls,
-        init_settings,
-        env_settings,
-        dotenv_settings,
-        file_secret_settings,
-    ):
-        # Only the command line sets these; the environment holds `Settings`.
-        return (init_settings,)
-
-    def cli_cmd(self) -> None:
-        questions = load_questions(self.rules)
-        if sys.stdin.isatty():
-            raise UserError("no input given, and stdin is a terminal")
-        state = sys.stdin.read()
-        settings = load_settings()
-        request = build_request(questions, state, settings)
-        if self.dry_run:
-            print(request.to_json())
-            return
-        print(json_dumps(asyncio.run(ask(request, settings))))
-
-
-def main():
+async def main():
     parser = argparse.ArgumentParser(
         prog="jev-ask",
-        description=Ask.__doc__,
+        description=__doc__,
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    pydantic_settings.CliApp.run(
-        Ask,
-        cli_settings_source=pydantic_settings.CliSettingsSource(
-            Ask, root_parser=parser
-        ),
+    parser.add_argument(
+        "-r",
+        "--rules",
+        type=pathlib.Path,
+        required=True,
+        help="rule set file (YAML or JSON)",
     )
-    return 0
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the request that would be sent, and exit without sending it",
+    )
+    args = parser.parse_args()
+    questions = load_questions(args.rules)
+    if sys.stdin.isatty():
+        raise UserError("no input given, and stdin is a terminal")
+    state = sys.stdin.read()
+    settings = load_settings()
+    request = build_request(
+        questions=questions, state=state, settings=settings
+    )
+    if args.dry_run:
+        print(request.to_json())
+        return
+    print(json_dumps(await ask(request, settings)))
 
 
 def cli():
     try:
-        sys.exit(main())
+        sys.exit(asyncio.run(main()))
     except UserError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

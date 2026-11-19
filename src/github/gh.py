@@ -105,7 +105,7 @@ class gh:
     async def current_user(host: str) -> github.pull_request.User:
         """The user gh is logged in as on host."""
         return github.pull_request.User.model_validate_json(
-            await gh.api(host, HttpMethod.GET, "user")
+            await gh.api(host=host, method=HttpMethod.GET, path="user")
         )
 
     @staticmethod
@@ -120,10 +120,10 @@ class gh:
         reviews = f"repos/{repo.org}/{repo.name}/pulls/{pr}/reviews"
         pending = github.pull_request.PendingReview.model_validate_json(
             await gh.api(
-                repo.host,
-                HttpMethod.POST,
-                reviews,
-                github.pull_request.PendingReviewInput(
+                host=repo.host,
+                method=HttpMethod.POST,
+                path=reviews,
+                payload=github.pull_request.PendingReviewInput(
                     commit_id=review.commit_id,
                     body=review.body,
                     comments=[
@@ -141,10 +141,10 @@ class gh:
                 if isinstance(comment, github.pull_request.FileReviewComment):
                     github.pull_request.AddReviewThreadResponse.model_validate_json(
                         await gh.api(
-                            repo.host,
-                            HttpMethod.POST,
-                            "graphql",
-                            github.pull_request.GraphqlRequest(
+                            host=repo.host,
+                            method=HttpMethod.POST,
+                            path="graphql",
+                            payload=github.pull_request.GraphqlRequest(
                                 query=ADD_FILE_THREAD,
                                 variables=github.pull_request.AddFileThreadVariables(
                                     review=pending.node_id,
@@ -158,10 +158,12 @@ class gh:
                     )
             submitted = github.pull_request.Review.model_validate_json(
                 await gh.api(
-                    repo.host,
-                    HttpMethod.POST,
-                    f"{reviews}/{pending.id}/events",
-                    github.pull_request.ReviewEventInput(event=review.event)
+                    host=repo.host,
+                    method=HttpMethod.POST,
+                    path=f"{reviews}/{pending.id}/events",
+                    payload=github.pull_request.ReviewEventInput(
+                        event=review.event
+                    )
                     .model_dump_json()
                     .encode(),
                 )
@@ -169,7 +171,9 @@ class gh:
         except BaseException:
             with contextlib.suppress(GithubError):
                 await gh.api(
-                    repo.host, HttpMethod.DELETE, f"{reviews}/{pending.id}"
+                    host=repo.host,
+                    method=HttpMethod.DELETE,
+                    path=f"{reviews}/{pending.id}",
                 )
             raise
         return submitted.html_url

@@ -1,5 +1,6 @@
 """Run one tool call in a bashkit sandbox whose state persists between calls."""
 
+import argparse
 import contextlib
 import pathlib
 import sqlite3
@@ -9,7 +10,6 @@ import typing
 import annotated_types
 import bashkit
 import pydantic
-import pydantic_settings
 
 MAX_BYTES = 256 * 1024
 
@@ -139,7 +139,13 @@ class Sandbox:
         cwd: str | None,
     ):
         """The sandbox of an open state, saved to it on the way out."""
-        sandbox = cls(state, mounts, username, hostname, cwd)
+        sandbox = cls(
+            state=state,
+            mounts=mounts,
+            username=username,
+            hostname=hostname,
+            cwd=cwd,
+        )
         try:
             yield sandbox
         finally:
@@ -220,108 +226,159 @@ class Sandbox:
             raise UserError(str(e)) from None
 
 
-class Tool(pydantic.BaseModel):
-    state: pathlib.Path = pydantic.Field(
-        description="SQLite file holding the sandbox's state; created if missing"
+def positive_float(value):
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not positive")
+    return number
+
+
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not positive")
+    return number
+
+
+def non_negative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"{value} is negative")
+    return number
+
+
+def mount(value):
+    try:
+        return Mount.parse(value)
+    except pydantic.ValidationError as e:
+        problems = "; ".join(
+            problem["msg"] for problem in e.errors(include_url=False)
+        )
+        raise argparse.ArgumentTypeError(f"{value}: {problems}") from e
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def bashkit_path(value):
+    path = pathlib.PurePosixPath(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(f"{value} is not absolute")
+    return path
+
+
+def add_sandbox_arguments(parser):
+    group = parser.add_argument_group("sandbox")
+    group.add_argument(
+        "--state",
+        type=pathlib.Path,
+        required=True,
+        help="SQLite file holding the sandbox's state; created if missing",
     )
-    mount: list[
-        typing.Annotated[Mount, pydantic.BeforeValidator(Mount.parse)]
-    ] = pydantic.Field(
-        [],
-        description="HOST_PATH:BASHKIT_PATH[:rw], a host directory to mount "
-        "at BASHKIT_PATH, read-only unless :rw; repeatable",
+    group.add_argument(
+        "--mount",
+        action="append",
+        type=mount,
+        help="HOST_PATH:BASHKIT_PATH[:rw], a host directory to mount at "
+        "BASHKIT_PATH, read-only unless :rw; repeatable",
     )
-    username: str | None = pydantic.Field(None, description="the user name")
-    hostname: str | None = pydantic.Field(None, description="the host name")
-    cwd: str | None = pydantic.Field(
-        None, description="the initial working directory"
-    )
-    lock_timeout: pydantic.PositiveFloat = pydantic.Field(
-        3600,
-        description="seconds to wait for another run to release the state",
-    )
-
-    @contextlib.contextmanager
-    def sandbox(self):
-        """Hold the lock on the sandbox, saving it on the way out."""
-        with (
-            State.open(self.state, self.lock_timeout) as state,
-            Sandbox.opened(
-                state, self.mount, self.username, self.hostname, self.cwd
-            ) as sandbox,
-        ):
-            yield sandbox
-
-
-class BashTool(Tool):
-    """Run the shell command read from stdin."""
-
-    def cli_cmd(self) -> None:
-        command = sys.stdin.read()
-        with self.sandbox() as sandbox:
-            output = sandbox.run_bash(command)
-        sys.stdout.write(output)
-
-
-class ReadTool(Tool):
-    """Read a text file with numbered lines."""
-
-    file_path: BashkitPath = pydantic.Field(description="the file to read")
-    offset: pydantic.PositiveInt | None = pydantic.Field(
-        None, description="the first line to read, from 1"
-    )
-    limit: pydantic.NonNegativeInt | None = pydantic.Field(
-        None, description="the number of lines to read"
-    )
-    max_file_size: pydantic.PositiveInt = pydantic.Field(
-        16 * 1024 * 1024,
-        description="the largest file, in bytes, to read a range of lines from",
-    )
-
-    def cli_cmd(self) -> None:
-        with self.sandbox() as sandbox:
-            output = sandbox.read_lines(
-                self.file_path, self.offset, self.limit, self.max_file_size
-            )
-        sys.stdout.write(output)
-
-
-class Run(pydantic_settings.BaseSettings):
-    __doc__ = __doc__
-
-    model_config = pydantic_settings.SettingsConfigDict(
-        cli_enforce_required=True,
-        cli_implicit_flags="toggle",
-        cli_kebab_case=True,
-        cli_prog_name="bashkit-sandbox",
+    group.add_argument("--username", help="the user name")
+    group.add_argument("--hostname", help="the host name")
+    group.add_argument("--cwd", help="the initial working directory")
+    group.add_argument(
+        "--lock-timeout",
+        type=positive_float,
+        default=3600,
+        help="seconds to wait for another run to release the state "
+        "(default: 3600)",
     )
 
-    bash: pydantic_settings.CliSubCommand[BashTool]
-    read: pydantic_settings.CliSubCommand[ReadTool]
 
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls,
-        init_settings,
-        env_settings,
-        dotenv_settings,
-        file_secret_settings,
+@contextlib.contextmanager
+def args_sandbox(args):
+    """Hold the lock on the sandbox args names, saving it on the way out."""
+    with (
+        State.open(args.state, args.lock_timeout) as state,
+        Sandbox.opened(
+            state=state,
+            mounts=args.mount or [],
+            username=args.username,
+            hostname=args.hostname,
+            cwd=args.cwd,
+        ) as sandbox,
     ):
-        # Only the command line sets these.
-        return (init_settings,)
+        yield sandbox
 
-    def cli_cmd(self) -> None:
-        pydantic_settings.CliApp.run_subcommand(self)
+
+def cmd_bash(args):
+    command = sys.stdin.read()
+    with args_sandbox(args) as sandbox:
+        output = sandbox.run_bash(command)
+    sys.stdout.write(output)
+
+
+def cmd_read(args):
+    with args_sandbox(args) as sandbox:
+        output = sandbox.read_lines(
+            file_path=args.file_path,
+            offset=args.offset,
+            limit=args.limit,
+            max_file_size=args.max_file_size,
+        )
+    sys.stdout.write(output)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="bashkit-sandbox", description=__doc__
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    bash_help = "run the shell command read from stdin"
+    bash_parser = subparsers.add_parser(
+        "bash", help=bash_help, description=bash_help
+    )
+    add_sandbox_arguments(bash_parser)
+
+    read_help = "read a text file with numbered lines"
+    read_parser = subparsers.add_parser(
+        "read", help=read_help, description=read_help
+    )
+    add_sandbox_arguments(read_parser)
+    read_parser.add_argument(
+        "--file-path",
+        type=bashkit_path,
+        required=True,
+        help="the file to read",
+    )
+    read_parser.add_argument(
+        "--offset", type=positive_int, help="the first line to read, from 1"
+    )
+    read_parser.add_argument(
+        "--limit", type=non_negative_int, help="the number of lines to read"
+    )
+    read_parser.add_argument(
+        "--max-file-size",
+        type=positive_int,
+        default=16 * 1024 * 1024,
+        help="the largest file, in bytes, to read a range of lines from "
+        "(default: 16777216)",
+    )
+
+    args = parser.parse_args()
+    match args.command:
+        case "bash":
+            cmd_bash(args)
+        case "read":
+            cmd_read(args)
 
 
 def cli():
     try:
-        pydantic_settings.CliApp.run(Run)
+        sys.exit(main())
     # bashkit raises RuntimeError for its own errors, such as a read-only
     # filesystem.
-    except (UserError, pydantic.ValidationError, RuntimeError) as e:
-        print(e, file=sys.stderr)
+    except (UserError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
