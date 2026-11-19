@@ -10,15 +10,15 @@ A scan prints its findings as a linter does, in color when stdout is a terminal,
 jevrev scan src --rules example_rules
 ```
 
-A review is one SQLite file given by `--db`; a scan given `--db` saves its findings to it, and every other command requires it. No scan writes anything else: a git directory's files are read from its repository, and a GitHub repo's through the GitHub API. [cli.md](cli.md) is the CLI's surface.
+A review is one JSON file given by `-r`/`--review`, the same JSON `show` prints; a scan given `--review` creates it and saves its findings to it, and every other command requires it. A command holds the file locked while it runs, and another command fails at once rather than wait. No scan writes anything else: a git directory's files are read from its repository, and a GitHub repo's through the GitHub API.
 
 ```sh
-jevrev --db review.db scan-github ORG/NAME --pr 12 --rules example_rules
-jevrev --db review.db pending
-jevrev --db review.db confirm 1 "Why the lines break the rule"
-jevrev --db review.db reject 2 "Why the lines do not break the rule"
-jevrev --db review.db show --format md
-jevrev --db review.db submit-github
+jevrev --review review.json scan-github ORG/NAME --pr 12 --rules example_rules
+jevrev --review review.json pending
+jevrev --review review.json confirm 1 "Why the lines break the rule"
+jevrev --review review.json reject 2 "Why the lines do not break the rule"
+jevrev --review review.json show --format md
+jevrev --review review.json submit-github
 ```
 
 | command | reviews |

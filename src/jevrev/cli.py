@@ -1,5 +1,5 @@
 """Run jev over a directory or a GitHub pull request and print its findings, optionally into a
-review's db; confirm or reject each of its findings, and print the review or post it on the pull
+review's file; confirm or reject each of its findings, and print the review or post it on the pull
 request once every finding has a verdict."""
 
 import argparse
@@ -18,7 +18,6 @@ import rich.console
 import rich.text
 import yaml
 
-import jevrev.db
 import jevrev.files
 import jevrev.git
 import jevrev.github.api
@@ -29,6 +28,7 @@ import jevrev.jev.ask
 import jevrev.jev.scan
 import jevrev.settings
 import jevrev.state
+import jevrev.store
 import jevrev.templates
 
 # Seconds a jev scan may run.
@@ -58,30 +58,38 @@ class Format(enum.StrEnum):
     MD = "md"
 
 
-def _load_review(store: jevrev.db.Store) -> jevrev.db.Review:
-    review = store.load()
-    if review is None:
-        raise UserError("The db holds no review.")
-    return review
-
-
-def _db(args) -> pathlib.Path:
-    if args.db is None:
-        raise UserError(f"{args.command}: give --db")
-    return args.db
+def _review_path(args) -> pathlib.Path:
+    if args.review is None:
+        raise UserError(f"{args.command}: give --review")
+    return args.review
 
 
 @contextlib.contextmanager
 def _open_review(path: pathlib.Path):
     if not path.is_file():
-        raise UserError(f"{path}: no such db file")
-    with jevrev.db.open_db(path) as store:
+        raise UserError(f"{path}: no such review file")
+    with jevrev.store.open_review(path) as store:
         yield store
 
 
-def _judged_review(args) -> jevrev.db.Review:
-    with _open_review(_db(args)) as store:
-        review = _load_review(store)
+def _save_new(path: pathlib.Path, review: jevrev.store.Review):
+    """Save review into a new review file at path; a failure removes only the file this
+    created."""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+    except FileExistsError:
+        raise UserError(f"{path} already exists") from None
+    try:
+        with jevrev.store.open_review(path) as store:
+            store.save(review)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _judged_review(args) -> jevrev.store.Review:
+    with _open_review(_review_path(args)) as store:
+        review = store.load()
     if unjudged := [
         str(finding.index)
         for finding in review.findings
@@ -102,11 +110,11 @@ def _rules(args) -> list[pathlib.Path]:
 
 
 def _scan_metadata(args) -> dict[str, str]:
-    db: pathlib.Path | None = args.db
-    if db is not None and db.exists():
-        raise UserError(f"{db} already exists")
-    if db is None and args.metadata:
-        raise UserError("--metadata: give --db to store it in")
+    file: pathlib.Path | None = args.review
+    if file is not None and (file.exists() or file.is_symlink()):
+        raise UserError(f"{file} already exists")
+    if file is None and args.metadata:
+        raise UserError("--metadata: give --review to store it in")
     _rules(args)
     if any(key == "" for key, _ in args.metadata):
         raise UserError("--metadata: a key is empty")
@@ -147,7 +155,9 @@ async def _local_ignore(
 async def _scan_and_save(
     args,
     metadata: dict[str, str],
-    source: jevrev.db.LocalDir | jevrev.db.LocalGitDir | jevrev.db.GithubRepo,
+    source: jevrev.store.LocalDir
+    | jevrev.store.LocalGitDir
+    | jevrev.store.GithubRepo,
     name: str,
     files: jevrev.files.Files,
     ignore: jevrev.files.Ignore | None,
@@ -164,24 +174,18 @@ async def _scan_and_save(
         rules=_rules(args),
         name=name,
     )
-    review = jevrev.db.Review(
+    review = jevrev.store.Review(
         source=source,
         metadata=metadata,
         include=args.include,
         exclude=args.exclude,
         findings=[
-            jevrev.db.Finding(**finding.model_dump(), index=index)
+            jevrev.store.Finding(**finding.model_dump(), index=index)
             for index, finding in enumerate(found, 1)
         ],
     )
-    db: pathlib.Path | None = args.db
-    if db is not None:
-        try:
-            with jevrev.db.open_db(db) as store:
-                store.save(review)
-        except BaseException:
-            db.unlink(missing_ok=True)
-            raise
+    if args.review is not None:
+        _save_new(args.review, review)
     _print_findings(review.findings, summary)
     if review.findings and not args.exit_zero:
         return _EXIT_FINDINGS
@@ -196,7 +200,7 @@ def _probability_style(probability: float) -> str:
     return "default"
 
 
-def _print_findings(findings: list[jevrev.db.Finding], summary: str):
+def _print_findings(findings: list[jevrev.store.Finding], summary: str):
     """Print findings as a linter does, in order of file and line, then summary; in color only
     when stdout is a terminal."""
     console = rich.console.Console(soft_wrap=True, highlight=False)
@@ -240,7 +244,7 @@ async def _cmd_scan(args):
     return await _scan_and_save(
         args,
         metadata=metadata,
-        source=jevrev.db.LocalDir(path=root),
+        source=jevrev.store.LocalDir(path=root),
         name=str(root),
         files=files,
         ignore=ignore,
@@ -288,7 +292,7 @@ async def _cmd_scan_git(args):
     return await _scan_and_save(
         args,
         metadata=metadata,
-        source=jevrev.db.LocalGitDir(path=root, git=selection),
+        source=jevrev.store.LocalGitDir(path=root, git=selection),
         name=str(root),
         files=files,
         ignore=await _local_ignore(
@@ -365,7 +369,7 @@ async def _cmd_scan_github(args):
         return await _scan_and_save(
             args,
             metadata=metadata,
-            source=jevrev.db.GithubRepo(**repo.model_dump(), git=selection),
+            source=jevrev.store.GithubRepo(**repo.model_dump(), git=selection),
             name=f"{repo.host}/{repo.org}/{repo.name}",
             files=files,
             ignore=ignore,
@@ -441,8 +445,8 @@ async def _run_jev_scan(
 
 
 async def _cmd_pending(args):
-    with _open_review(_db(args)) as store:
-        review = _load_review(store)
+    with _open_review(_review_path(args)) as store:
+        review = store.load()
     sys.stdout.write(
         "".join(
             jevrev.jev.scan.json_dumps(
@@ -460,17 +464,17 @@ async def _cmd_pending(args):
 
 
 async def _cmd_confirm(args):
-    await _judge(args, jevrev.db.Verdict.CONFIRMED)
+    await _judge(args, jevrev.store.Verdict.CONFIRMED)
 
 
 async def _cmd_reject(args):
-    await _judge(args, jevrev.db.Verdict.REJECTED)
+    await _judge(args, jevrev.store.Verdict.REJECTED)
 
 
-async def _judge(args, verdict: jevrev.db.Verdict):
+async def _judge(args, verdict: jevrev.store.Verdict):
     index = args.index
-    with _open_review(_db(args)) as store:
-        review = _load_review(store)
+    with _open_review(_review_path(args)) as store:
+        review = store.load()
         count = len(review.findings)
         if not 1 <= index <= count:
             raise UserError(f"index: {index} is not in 1..{count}")
@@ -497,7 +501,7 @@ async def _cmd_show(args):
 async def _cmd_submit_github(args):
     review = _judged_review(args)
     source = review.source
-    if not isinstance(source, jevrev.db.GithubRepo) or not isinstance(
+    if not isinstance(source, jevrev.store.GithubRepo) or not isinstance(
         source.git, jevrev.github.pull_request.GithubPullRequest
     ):
         raise UserError("The review is not of a GitHub pull request.")
@@ -557,7 +561,7 @@ class ReportRule(pydantic.BaseModel):
     """A rule's confirmed findings."""
 
     flags: str
-    findings: list[jevrev.db.Finding]
+    findings: list[jevrev.store.Finding]
 
 
 class ReviewText(pydantic.BaseModel):
@@ -583,21 +587,23 @@ class PrComment(pydantic.BaseModel):
     flags: str
 
 
-def _confirmed(findings: list[jevrev.db.Finding]) -> list[jevrev.db.Finding]:
-    return [f for f in findings if f.verdict == jevrev.db.Verdict.CONFIRMED]
+def _confirmed(
+    findings: list[jevrev.store.Finding],
+) -> list[jevrev.store.Finding]:
+    return [f for f in findings if f.verdict == jevrev.store.Verdict.CONFIRMED]
 
 
 def _by_rule(
-    findings: list[jevrev.db.Finding],
-) -> dict[str, list[jevrev.db.Finding]]:
+    findings: list[jevrev.store.Finding],
+) -> dict[str, list[jevrev.store.Finding]]:
     """findings grouped by rule, each group in order of file and line."""
-    grouped: dict[str, list[jevrev.db.Finding]] = {}
+    grouped: dict[str, list[jevrev.store.Finding]] = {}
     for f in sorted(findings, key=lambda f: (f.file, f.start)):
         grouped.setdefault(f.flags, []).append(f)
     return grouped
 
 
-def _front_matter(review: jevrev.db.Review) -> str:
+def _front_matter(review: jevrev.store.Review) -> str:
     front = {
         **review.model_dump(
             mode="json",
@@ -610,7 +616,7 @@ def _front_matter(review: jevrev.db.Review) -> str:
         "findings": len(review.findings),
         "confirmed": len(_confirmed(review.findings)),
         "rejected": sum(
-            f.verdict == jevrev.db.Verdict.REJECTED for f in review.findings
+            f.verdict == jevrev.store.Verdict.REJECTED for f in review.findings
         ),
     }
     return yaml.safe_dump(front, allow_unicode=True, sort_keys=True).rstrip(
@@ -618,7 +624,7 @@ def _front_matter(review: jevrev.db.Review) -> str:
     )
 
 
-def _review_text(review: jevrev.db.Review) -> str:
+def _review_text(review: jevrev.store.Review) -> str:
     return _render(
         Template.REVIEW,
         ReviewText(
@@ -647,7 +653,7 @@ def _github_hunks(diff: jevrev.git.Diff) -> dict[str, list[range]]:
 
 
 def _pr_comment(
-    f: jevrev.db.Finding, hunks: dict[str, list[range]]
+    f: jevrev.store.Finding, hunks: dict[str, list[range]]
 ) -> jevrev.github.pull_request.ReviewComment:
     body = _render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
@@ -666,7 +672,7 @@ def _pr_comment(
 
 
 def _pr_review_body(
-    found: list[jevrev.db.Finding], outside: list[jevrev.db.Finding]
+    found: list[jevrev.store.Finding], outside: list[jevrev.store.Finding]
 ) -> str:
     """The body of the review of found, whose findings in outside, which
     are in files the pull request did not change, are listed grouped by
@@ -688,7 +694,7 @@ def _pr_review_body(
     for flags, group in _by_rule(outside).items():
         empty = size([ReportRule(flags=flags, findings=[])])
         heading = empty - base
-        kept: list[jevrev.db.Finding] = []
+        kept: list[jevrev.store.Finding] = []
         for f in group:
             item = size([ReportRule(flags=flags, findings=[f])]) - empty
             if used + heading + item > room:
@@ -707,7 +713,7 @@ def _pr_review_body(
 
 def _pr_review(
     head: jevrev.git.GitObjectId,
-    findings: list[jevrev.db.Finding],
+    findings: list[jevrev.store.Finding],
     hunks: dict[str, list[range]],
     event: jevrev.github.pull_request.ReviewEvent,
 ) -> jevrev.github.pull_request.NewReview:
@@ -815,7 +821,7 @@ def _add_scan_arguments(parser):
         default=[],
         metavar=("KEY", "VALUE"),
         help="Metadata stored with the review and printed by show; repeat "
-        "for more keys; requires --db",
+        "for more keys; requires --review",
     )
     parser.add_argument(
         "--exit-zero",
@@ -842,14 +848,17 @@ def _parser():
         "review or post it on the pull request. Exits 0 with no findings, 1 "
         "with findings, and 2 on any error.",
     )
-    db_group = parser.add_argument_group("db")
-    db_group.add_argument(
-        "--db",
+    review_group = parser.add_argument_group("review")
+    review_group.add_argument(
+        "-r",
+        "--review",
         type=pathlib.Path,
         metavar="FILE",
-        help="SQLite file holding one review: its source, the version of it "
-        "scanned, metadata, findings, and verdicts; a scan saves its review "
-        "to it when given, every other command requires it",
+        help="JSON file holding one review: its source, the version of it "
+        "scanned, metadata, findings, and verdicts; a scan given it creates "
+        "FILE, which must not exist (checked before any request), and leaves "
+        "no FILE it created when the scan or its save fails; every other "
+        "command requires it",
     )
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"
@@ -858,7 +867,7 @@ def _parser():
     description = (
         "Run jev over a file, or a directory's files, on disk, whether or not "
         "it is in a git repository; print its findings and summary, and save "
-        "them to a new db given --db"
+        "them to a new review file given --review"
     )
     scan_parser = subparsers.add_parser(
         "scan", help=description, description=description
@@ -875,7 +884,7 @@ def _parser():
 
     description = (
         "Run jev over a git directory at a revision, or over a diff; print "
-        "its findings and summary, and save them to a new db given --db"
+        "its findings and summary, and save them to a new review file given --review"
     )
     scan_git_parser = subparsers.add_parser(
         "scan-git", help=description, description=description
@@ -908,7 +917,7 @@ def _parser():
     description = (
         "Run jev over a GitHub repo, through the GitHub API on the host "
         "GH_HOST names (github.com when unset); print its findings and "
-        "summary, and save them to a new db given --db"
+        "summary, and save them to a new review file given --review"
     )
     scan_github_parser = subparsers.add_parser(
         "scan-github", help=description, description=description
@@ -1021,7 +1030,7 @@ def cli():
         jevrev.settings.UserError,
         jevrev.github.api.GithubError,
         jevrev.git.GitError,
-        jevrev.db.OperationalError,
+        jevrev.store.InvalidReview,
         OSError,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
