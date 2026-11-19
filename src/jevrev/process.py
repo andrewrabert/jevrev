@@ -24,7 +24,8 @@ class ProcessError(Exception):
 
     def __str__(self):
         text = f"{shlex.join(self.argv)}: exit {self.returncode}"
-        if stderr := self.stderr.decode().strip():
+        # The message is for a person to read, so bytes that are not UTF-8 are shown as escapes.
+        if stderr := self.stderr.decode(errors="backslashreplace").strip():
             text = f"{text} - {stderr}"
         return text
 
