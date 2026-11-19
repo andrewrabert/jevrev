@@ -74,7 +74,7 @@ The review file records the source and the commit ids the scan resolved. `submit
 | A GitHub repo's changes from A, or from merge-base(A, B), to B | `scan-github ORG/NAME --diff A..B` or `A...B` |
 | A GitHub pull request's changes | `scan-github ORG/NAME --pr N` |
 
-A rule set's `when` selects the files it reviews. Each selected file is reviewed whole. A diff scan also reviews each changed hunk, and all of a changed file's hunks together. A rule set whose `when` names a language also reviews each range of the file that language yields, such as each function: every range, or in a diff scan only the ranges the diff touches. A file that the language cannot parse gets no ranges.
+A rule set's `when` selects the files it reviews. Each selected file is reviewed whole. A diff scan also reviews each changed hunk, and all of a changed file's hunks together. Each of the file's languages also yields its ranges, such as each function: every range, or in a diff scan only the ranges the diff touches. A file that a language cannot parse gets no ranges in it. Every rule set that selects a file is asked about all of its states; `when` only selects files.
 
 No scan writes to the code it reads. `scan-git` reads files from the git repository without checking anything out, and `scan-github` reads them through the GitHub API without cloning.
 

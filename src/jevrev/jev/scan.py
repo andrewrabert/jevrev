@@ -1,7 +1,8 @@
-"""Scan text files with jev rule sets. A rule set's `when` selects the files it reviews. Each
-selected file is reviewed whole; with a diff, also each of its hunks and all of them together; and,
-for each language of the file that a selecting `when` names, each range of the file that language
-yields: every range without a diff, the ranges the diff touches with one."""
+"""Scan text files with jev rule sets. A rule set's `when` selects the files it reviews, and
+nothing else. Each selected file is reviewed whole; with a change, also each of its hunks and all of
+them together; and, for each of its languages that parses it, each range of the file that language
+yields: every range, or with a change the ranges it touches. Every rule set that selects a file is
+asked about all of its states."""
 
 import asyncio
 import collections.abc
@@ -125,52 +126,25 @@ def _sets_among(sets, paths):
 
 
 @dataclasses.dataclass(frozen=True)
-class SelectingRuleSet:
-    """A rule set whose `when` selects a file, and the languages of the file that a matching
-    `when` entry names: the set reviews those languages' ranges."""
-
-    path: pathlib.Path
-    languages: frozenset[Language]
-
-
-@dataclasses.dataclass(frozen=True)
 class Review:
-    """A file and the rule sets that select it."""
+    """A file and the rule sets whose `when` selects it."""
 
     file: ScanTargetFile
-    rule_sets: tuple[SelectingRuleSet, ...]
+    sets: tuple[pathlib.Path, ...]
 
     def __post_init__(self):
-        if not self.rule_sets:
+        if not self.sets:
             raise ValueError(f"no rule set selects {self.file.path}")
-
-    @property
-    def sets(self) -> tuple[pathlib.Path, ...]:
-        return tuple(s.path for s in self.rule_sets)
-
-    def sets_of(self, language: Language) -> tuple[pathlib.Path, ...]:
-        """The rule sets that review language's ranges of the file."""
-        return tuple(s.path for s in self.rule_sets if language in s.languages)
 
 
 def _review_of(file: ScanTargetFile, sets) -> Review | None:
     """file's review by the rule sets of sets that select it; None when none does."""
     selecting = tuple(
-        SelectingRuleSet(
-            path=rule_set.path,
-            languages=frozenset(
-                language
-                for language in file.languages
-                if any(
-                    c.matches(file) and language.name in c.languages
-                    for c in rule_set.conditions
-                )
-            ),
-        )
+        rule_set.path
         for rule_set in sets
         if any(c.matches(file) for c in rule_set.conditions)
     )
-    return Review(file=file, rule_sets=selecting) if selecting else None
+    return Review(file=file, sets=selecting) if selecting else None
 
 
 class UserError(Exception):
@@ -270,9 +244,6 @@ def _language_states(
 ) -> list[jevrev.state.LanguageState]:
     """The states of language's ranges of the file, before its test code: every range, or with a
     change only those it touches. None when text is not valid in language."""
-    sets = review.sets_of(language)
-    if not sets:
-        return []
     try:
         ranges = language.states(text)
     except jevrev.languages.base.ParseError:
@@ -295,7 +266,7 @@ def _language_states(
                 file=review.file.path,
                 start=r.start,
                 end=end,
-                sets=sets,
+                sets=review.sets,
                 text="\n".join(part),
                 language=language.name,
             )

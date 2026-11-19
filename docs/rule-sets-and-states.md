@@ -7,7 +7,7 @@ defect. A scan turns each file into states, and asks the judge whether each stat
 of each rule set that reviews it.
 
 This document specifies the rule set file format, how a scan selects the files a rule set reviews,
-which states a scan builds from each selected file, and which rule sets judge each state.
+which states a scan builds from each selected file, and which rule sets are asked about each state.
 
 The keywords MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be read as described in RFC 2119.
 
@@ -17,7 +17,7 @@ The keywords MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be read as descr
 
 1. A reader can write a valid rule set file, and predict which files it reviews.
 2. A reader can predict, for any file of a scan, every state the scan builds from it and every rule
-   set that judges each state.
+   set asked about each state.
 3. A reader can implement file selection and state building from this document alone.
 
 ### Non-goals
@@ -112,11 +112,8 @@ A selector matches a file when all of the following hold:
 `language` matches on detected languages only. A file matches a `language` selector whether or not
 the file is valid in that language; validity decides only its ranges (§7.4).
 
-A selector's **named languages for a file** are the languages in its `language` list that are
-detected languages of the file, when the selector matches the file, and none otherwise.
-
-A rule set's **named languages for a file** are the union of its selectors' named languages for the
-file.
+Selectors decide which files a rule set reviews, and nothing else. They MUST NOT affect which states
+a reviewed file has, or which of them a rule set is asked about.
 
 ## 5. Scans
 
@@ -197,7 +194,7 @@ For `rust`, `python` and `sh`:
 ## 7. States
 
 A scan builds three kinds of states from each reviewed file. The kinds are independent: no kind is
-built from another, and each has its own rule for which rule sets judge it (§8).
+built from another. Every rule set that reviews the file is asked about all of them (§8).
 
 | Kind | Name in findings | Holds |
 |---|---|---|
@@ -232,11 +229,8 @@ last line. Any other file MUST have none.
 
 ### 7.4 Language states
 
-For each language a reviewed file is in, the file has language states of that language only when
-all of the following hold:
-
-1. At least one rule set that reviews the file names the language for the file (§4).
-2. The file is valid in the language (§6.2).
+A reviewed file MUST have language states of each of its detected languages that it is valid in
+(§6.2), and of no other language.
 
 A file not valid in a language MUST have no language state of it. Its file, hunk and hunks states
 MUST NOT depend on that.
@@ -280,17 +274,12 @@ The judge receives each state as a unified diff of its file. File and language s
 lines as added, under a hunk header that gives their position in the file. A hunk state shows its
 hunk's lines without the hunk header. A hunks state shows every hunk with its header.
 
-## 8. Which rule sets judge each state
+## 8. Which rule sets are asked about each state
 
-| State kind | Judged by |
-|---|---|
-| File, hunk and hunks states | Every rule set that reviews the file. |
-| Language state of language L | Every rule set that reviews the file and names L for the file (§4). |
+Every rule set that reviews a file MUST be asked about every state of the file, of every kind
+(§7). How a rule set's selectors matched the file MUST NOT change which states it is asked about.
 
-A rule set that names no language judges only the file, hunk and hunks states of the files it
-reviews. A rule set that names a language judges those states too, and also that language's states.
-
-Each rule set judging a state MUST be asked about the state once, for all its rules together.
+Each rule set MUST be asked about a state once, for all its rules together.
 
 ## 9. Findings
 
@@ -310,7 +299,7 @@ A finding names:
 
 A scan MUST NOT report the same finding twice in either of these cases:
 
-1. Two rule sets judging one state have a rule with the same `flags`: only the first rule set's
+1. Two rule sets asked about one state have a rule with the same `flags`: only the first rule set's
    finding is reported.
 2. A file or hunks state's finding has the same `flags` as a hunk or language state's finding of the
    same file: only the hunk or language state's finding is reported, because it names the lines.
@@ -323,10 +312,11 @@ A caller MAY rely on all of the following.
    selectors, the same way in every kind of scan.
 2. **No silent skip.** A file a rule set selects is reviewed, or the scan fails naming it. It is
    never dropped for having no detected language or for not being text.
-3. **Every reviewed file is judged whole.** Every rule set that reviews a file judges its file
-   state.
-4. **Language states only on request.** A file is parsed in a language only for a rule set that
-   names that language, and a rule set sees a language's states only if it names that language.
+3. **Every reviewed file is asked about whole.** Every rule set that reviews a file is asked about
+   its file state.
+4. **Selection only selects.** Which states a reviewed file has, and which rule sets are asked
+   about them, depend only on the file, its change and its detected languages, never on which
+   selector matched it.
 5. **A broken file still gets reviewed.** A file not valid in a language loses only that language's
    states.
 6. **Removals count.** A range that lost lines to a change is reviewed as it is after the change,
@@ -353,7 +343,7 @@ An implementation MAY:
 An implementation MUST NOT:
 
 - Drop a selected file without failing the scan.
-- Send a language state to a rule set that does not name its language.
+- Ask a rule set about only some of the states of a file it reviews.
 - Build a language state from a file not valid in its language.
 
 ## 12. Deferred
