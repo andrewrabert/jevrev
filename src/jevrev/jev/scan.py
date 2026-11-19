@@ -1,6 +1,7 @@
-"""Scan code and text with jev rule sets: every top-level item of the files in a known language
-under a root, or the hunks of any text file changed since a revision. Each file is reviewed
-against the rule sets under the rules directory whose `when` matches it."""
+"""Scan code and text with jev rule sets: each definition, run of top-level code or whole file of
+the files in a known language under a root, or the hunks of any text file changed since a
+revision. Each file is reviewed against the rule sets under the rules directory whose `when`
+matches it."""
 
 import asyncio
 import dataclasses
@@ -14,110 +15,16 @@ import sys
 
 import pathspec
 import pydantic
-import tree_sitter
-import tree_sitter_bash
-import tree_sitter_python
-import tree_sitter_rust
 import unidiff
 import yaml
 
 import jevrev.jev.api
 import jevrev.jev.ask
+import jevrev.languages
+import jevrev.languages.base
 import jevrev.process
 import jevrev.rules
-
-# Siblings that belong to the item after them.
-_LEADING = {"line_comment", "block_comment", "attribute_item"}
-_PYTHON_LEADING = {"comment"}
-
-# Items with nothing for the rule set to judge.
-_SKIPPED = {
-    "use_declaration",
-    "extern_crate_declaration",
-    "inner_attribute_item",
-    "line_comment",
-    "block_comment",
-    "attribute_item",
-    "empty_statement",
-}
-
-_PYTHON_SKIPPED = {
-    "import_statement",
-    "import_from_statement",
-    "future_import_statement",
-    "comment",
-    "pass_statement",
-}
-
-# Top-level sh commands that change how every other part of the script runs; each item of a
-# script carries the ones outside it as context.
-_SHELL_SETUP = {"set", "trap"}
-
-_RUST = tree_sitter.Language(tree_sitter_rust.language())
-_PYTHON = tree_sitter.Language(tree_sitter_python.language())
-_BASH = tree_sitter.Language(tree_sitter_bash.language())
-
-
-@dataclasses.dataclass(frozen=True)
-class Syntax:
-    # Splits a whole file into items; with none, the whole file is one item.
-    parser: tree_sitter.Language | None = None
-    # A line marking where test code starts; it and everything after it is left out.
-    test_marker: str | None = None
-
-
-_LanguageName = jevrev.rules.Language
-
-# The languages a rule set's `when.language` can name.
-_SYNTAXES = {
-    _LanguageName.RUST: Syntax(parser=_RUST, test_marker="#[cfg(test)]"),
-    _LanguageName.PYTHON: Syntax(parser=_PYTHON),
-    _LanguageName.SH: Syntax(parser=_BASH),
-    _LanguageName.JUST: Syntax(),
-    _LanguageName.MARKDOWN: Syntax(),
-}
-
-_PLAIN = Syntax()
-
-_SUFFIXES = {
-    ".rs": _LanguageName.RUST,
-    ".py": _LanguageName.PYTHON,
-    ".just": _LanguageName.JUST,
-    ".md": _LanguageName.MARKDOWN,
-}
-
-_JUSTFILE_NAMES = ("justfile", "Justfile", ".justfile")
-
-# A first line that matches one of these marks a Python script, or failing that a POSIX sh
-# script.
-_PYTHON_SHEBANGS = (
-    re.compile(r"^#!\S*/python[\d.]*(\s|$)"),
-    re.compile(r"^#!\S*/env\s+(-\S+\s+)*python[\d.]*(\s|$)"),
-    re.compile(r"^#!/usr/bin/env.*uv.*run"),
-)
-_SHELL_SHEBANGS = (
-    re.compile(r"^#!\S*/sh(\s|$)"),
-    re.compile(r"^#!\S*/env\s+(-\S+\s+)*sh(\s|$)"),
-)
-
-
-def _has_shebang(source, patterns):
-    first = source.split(b"\n", 1)[0].decode(errors="replace")
-    return any(pattern.search(first) for pattern in patterns)
-
-
-def _detect_language(name, source) -> _LanguageName | None:
-    """The language of a file, a key of SYNTAXES, or None."""
-    path = pathlib.PurePath(name)
-    if path.name in _JUSTFILE_NAMES:
-        return _LanguageName.JUST
-    if path.suffix in _SUFFIXES:
-        return _SUFFIXES[path.suffix]
-    if _has_shebang(source, _PYTHON_SHEBANGS):
-        return _LanguageName.PYTHON
-    if _has_shebang(source, _SHELL_SHEBANGS):
-        return _LanguageName.SH
-    return None
+import jevrev.state
 
 
 @functools.cache
@@ -134,7 +41,7 @@ def _read_set(path):
 class Condition:
     """One `when` entry; an empty field matches every file."""
 
-    languages: frozenset[_LanguageName]
+    languages: frozenset[jevrev.rules.Language]
     patterns: pathspec.GitIgnoreSpec | None
     # Each matches at least one path under the root.
     exists: tuple[pathspec.Pattern, ...]
@@ -215,127 +122,41 @@ def _sets_under(sets, root):
 
 
 @dataclasses.dataclass(frozen=True)
-class Language:
-    # The rule sets every item of the file is reviewed against.
+class Review:
+    """How a file is reviewed."""
+
+    # The rule sets every state of the file is reviewed against.
     sets: tuple[pathlib.Path, ...]
-    # Splits a whole file into items; with none, the whole file is one item.
-    parser: tree_sitter.Language | None = None
-    # A line marking where test code starts; it and everything after it is left out.
-    test_marker: str | None = None
+    # How the file is split into states and where its test code starts.
+    language: type[jevrev.languages.base.Language]
 
 
-def _language_of(name, source, sets):
+def _review_of(name, source, sets):
     """How a file is reviewed against `sets`; `name` is its path from the root."""
-    detected = _detect_language(name, source)
-    syntax = _SYNTAXES.get(detected, _PLAIN)
-    return Language(
+    language = jevrev.languages.detect(name, source)
+    return Review(
         sets=tuple(
             rule_set.path
             for rule_set in sets
-            if any(c.matches(detected, name) for c in rule_set.conditions)
+            if any(c.matches(language.name, name) for c in rule_set.conditions)
         ),
-        parser=syntax.parser,
-        test_marker=syntax.test_marker,
+        language=language,
     )
 
 
 def _in_whole_scan(name, source):
     """Whether a whole-directory scan reviews the file: it has a language. With --base, every
     changed text file is reviewed."""
-    return _detect_language(name, source) is not None
+    return jevrev.languages.detect(name, source).name is not None
 
 
 class UserError(Exception):
     pass
 
 
-class Evaluation(enum.StrEnum):
-    """What one item of a change evaluates: the full diff, each file's diff, or each hunk of it."""
-
-    DIFF = "diff"
-    FILE = "file"
-    HUNK = "hunk"
-
-
-class ItemKind(enum.StrEnum):
-    """What an item is; MERGED kinds next to each other are reviewed as one item."""
-
-    CONST = "const"
-    STATIC = "static"
-    ASSIGNMENT = "assignment"
-    DEFINITION = "definition"
-    TOP_LEVEL = "top-level"
-    HUNK = "hunk"
-    FILE = "file"
-    DIFF = "diff"
-
-
-_MERGED = frozenset({ItemKind.CONST, ItemKind.STATIC, ItemKind.ASSIGNMENT})
-
-# The kind of each tree-sitter node type that is not a definition.
-_NODE_KINDS = {
-    "const_item": ItemKind.CONST,
-    "static_item": ItemKind.STATIC,
-    "assignment": ItemKind.ASSIGNMENT,
-}
-
-
 def _inside(root, path):
     """Whether path, its symlinks followed, is under root, which is resolved."""
     return path.resolve().is_relative_to(root)
-
-
-class DiffHunk(pydantic.BaseModel):
-    header: str
-    # The hunk's added and context lines, each with its `+` or ` ` prefix; removed lines are left
-    # out.
-    lines: list[str]
-
-
-class Item(pydantic.BaseModel):
-    file: str
-    start: int
-    end: int
-    name: str
-    kind: ItemKind = ItemKind.DEFINITION
-    context: str
-    text: str
-    # Changed hunks as git printed them; reviewed in place of `text` when there are any.
-    hunks: list[DiffHunk] = []
-    # Whether the diff leaves out its `@@` lines.
-    headless: bool = False
-    # The whole state jev is asked about, in place of the diff.
-    state: str | None = None
-    # The rule sets the item is reviewed against.
-    sets: tuple[pathlib.Path, ...] = ()
-    # How much of the diff the item evaluates: a hunk, a file's hunks, or the full diff.
-    evaluated: Evaluation | None = None
-
-    @property
-    def diff(self):
-        hunks = self.hunks or [
-            DiffHunk(
-                header=f"@@ -0,0 +{self.start},{len(self.text.splitlines())} @@ "
-                f"{self.context}".rstrip(),
-                lines=[f"+{line}" for line in self.text.splitlines()],
-            )
-        ]
-        return "\n".join(
-            [
-                f"diff --git a/{self.file} b/{self.file}",
-                f"--- a/{self.file}",
-                f"+++ b/{self.file}",
-                *(
-                    line
-                    for hunk in hunks
-                    for line in (
-                        hunk.lines
-                        if self.headless
-                        else [hunk.header, *hunk.lines]
-                    )
-                ),
-            ]
-        )
 
 
 class Finding(pydantic.BaseModel):
@@ -349,17 +170,17 @@ class Finding(pydantic.BaseModel):
     flags: str
     violation: str
     accepted: str
-    evaluated: Evaluation | None = None
+    evaluated: jevrev.state.Evaluation | None = None
 
 
 class AskFailed(Exception):
-    def __init__(self, item, stderr):
-        super().__init__(item, stderr)
-        self.item = item
+    def __init__(self, state, stderr):
+        super().__init__(state, stderr)
+        self.state = state
         self.stderr = stderr
 
     def __str__(self):
-        return f"{self.item.file}:{self.item.start} {self.item.name}: {self.stderr.strip()}"
+        return f"{self.state.file}:{self.state.start} {self.state.name}: {self.stderr.strip()}"
 
 
 def json_dumps(data):
@@ -455,296 +276,36 @@ class git:
         return [name for name in stdout.split("\0") if name]
 
 
-def _is_test(node, source):
-    return node.type == "attribute_item" and b"cfg(test)" in source[
-        node.start_byte : node.end_byte
-    ].replace(b" ", b"")
-
-
-def _leading(node, kinds=_LEADING):
-    """The comments and attributes directly above `node`, top first."""
-    found = []
-    sibling = node.prev_sibling
-    while sibling is not None and sibling.type in kinds:
-        below = found[0] if found else node
-        if below.start_point[0] - sibling.end_point[0] > 1:
-            break
-        found.insert(0, sibling)
-        sibling = sibling.prev_sibling
-    return found
-
-
-def _name_of(node, source):
-    name = node.child_by_field_name("name")
-    if name is None:
-        name = node.child_by_field_name("type")
-    label = source[name.start_byte : name.end_byte].decode() if name else ""
-    return f"{node.type.removesuffix('_item')} {label}".strip()
-
-
-def _header_of(node, source):
-    body = node.child_by_field_name("body")
-    end = body.start_byte if body is not None else node.end_byte
-    return " ".join(source[node.start_byte : end].decode().split())
-
-
-def _items(nodes, source, path, context=""):
-    lines = source.decode().splitlines()
-    for node in nodes:
-        if node.type in _SKIPPED:
-            continue
-        above = _leading(node)
-        if any(_is_test(a, source) for a in above):
-            continue
-        body = node.child_by_field_name("body")
-        if node.type == "mod_item" and body is not None:
-            yield from _items(
-                nodes=body.named_children,
-                source=source,
-                path=path,
-                context=_header_of(node, source),
-            )
-            continue
-        if node.type in ("impl_item", "trait_item") and body is not None:
-            methods = [
-                c
-                for c in body.named_children
-                if c.type in ("function_item", "function_signature_item")
-            ]
-            if methods:
-                yield from _items(
-                    nodes=methods,
-                    source=source,
-                    path=path,
-                    context=_header_of(node, source),
-                )
-                continue
-        start = (above[0] if above else node).start_point[0]
-        end = node.end_point[0]
-        yield Item(
-            file=path,
-            start=start + 1,
-            end=end + 1,
-            name=_name_of(node, source),
-            kind=_NODE_KINDS.get(node.type, ItemKind.DEFINITION),
-            context=context,
-            text="\n".join(lines[start : end + 1]),
-        )
-
-
-def _python_name_of(node, source):
-    if node.type == "expression_statement" and node.named_children:
-        statement = node.named_children[0]
-        target = statement.child_by_field_name("left")
-        if statement.type == "assignment" and target is not None:
-            return f"assignment {source[target.start_byte : target.end_byte].decode()}"
-        return statement.type
-    name = node.child_by_field_name("name")
-    label = source[name.start_byte : name.end_byte].decode() if name else ""
-    return f"{node.type.removesuffix('_definition')} {label}".strip()
-
-
-def _python_kind_of(node):
-    if node.type == "expression_statement" and node.named_children:
-        return _NODE_KINDS.get(
-            node.named_children[0].type, ItemKind.DEFINITION
-        )
-    return ItemKind.DEFINITION
-
-
-def _python_items(nodes, source, path, context=""):
-    """Each top-level statement of a Python file, and each method of a class apart from its head."""
-    lines = source.decode().splitlines()
-
-    def item(first, last, name, kind=ItemKind.DEFINITION):
-        return Item(
-            file=path,
-            start=first + 1,
-            end=last + 1,
-            name=name,
-            kind=kind,
-            context=context,
-            text="\n".join(lines[first : last + 1]),
-        )
-
-    for node in nodes:
-        if node.type in _PYTHON_SKIPPED:
-            continue
-        above = _leading(node, _PYTHON_LEADING)
-        start = (above[0] if above else node).start_point[0]
-        definition = node.child_by_field_name("definition") or node
-        name = _python_name_of(definition, source)
-        body = definition.child_by_field_name("body")
-        if definition.type == "class_definition" and body is not None:
-            methods = [
-                c
-                for c in body.named_children
-                if (c.child_by_field_name("definition") or c).type
-                == "function_definition"
-            ]
-            if methods:
-                first = _leading(methods[0], _PYTHON_LEADING) or [methods[0]]
-                yield item(
-                    first=start, last=first[0].start_point[0] - 1, name=name
-                )
-                yield from _python_items(
-                    nodes=methods,
-                    source=source,
-                    path=path,
-                    context=_header_of(definition, source),
-                )
-                continue
-        yield item(
-            first=start,
-            last=node.end_point[0],
-            name=name,
-            kind=_python_kind_of(definition),
-        )
-
-
-def _shell_items(nodes, source, path):
-    """Each function of a sh script, and each run of top-level code between them. Every item
-    carries the script's top-level set and trap commands that lie outside it as context."""
-    lines = source.decode().splitlines()
-    # The shebang is not a comment for the rule sets to judge.
-    first_line = 1 if lines and lines[0].startswith("#!") else 0
-    setup = []
-    for node in nodes:
-        name = (
-            node.child_by_field_name("name")
-            if node.type == "command"
-            else None
-        )
-        if (
-            name is not None
-            and source[name.start_byte : name.end_byte].decode()
-            in _SHELL_SETUP
-        ):
-            setup.append(node)
-
-    def item(first, last, name, kind=ItemKind.DEFINITION):
-        start = max(
-            (_leading(first, _PYTHON_LEADING) or [first])[0].start_point[0],
-            first_line,
-        )
-        end = last.end_point[0]
-        return Item(
-            file=path,
-            start=start + 1,
-            end=end + 1,
-            name=name,
-            kind=kind,
-            context="; ".join(
-                " ".join(source[n.start_byte : n.end_byte].decode().split())
-                for n in setup
-                if not start <= n.start_point[0] <= end
-            ),
-            text="\n".join(lines[start : end + 1]),
-        )
-
-    run = []
-    for node in nodes:
-        if node.type == "comment":
-            continue
-        if node.type != "function_definition":
-            run.append(node)
-            continue
-        if run:
-            yield item(
-                first=run[0],
-                last=run[-1],
-                name=ItemKind.TOP_LEVEL,
-                kind=ItemKind.TOP_LEVEL,
-            )
-            run = []
-        name = node.child_by_field_name("name")
-        label = (
-            source[name.start_byte : name.end_byte].decode() if name else ""
-        )
-        yield item(first=node, last=node, name=f"function {label}".strip())
-    if run:
-        yield item(
-            first=run[0],
-            last=run[-1],
-            name=ItemKind.TOP_LEVEL,
-            kind=ItemKind.TOP_LEVEL,
-        )
-
-
-def _file_items(name, source, language):
+def _file_contents(name, source, review):
     return [
-        item.model_copy(update={"sets": language.sets})
-        for item in _parsed_items(name=name, source=source, language=language)
+        content.model_copy(update={"sets": review.sets})
+        for content in review.language.contents(source, name)
     ]
 
 
-def _parsed_items(name, source, language):
-    match language.parser:
-        case None:
-            lines = source.decode().splitlines()
-            return [
-                Item(
-                    file=name,
-                    start=1,
-                    end=max(len(lines), 1),
-                    name=ItemKind.FILE,
-                    kind=ItemKind.FILE,
-                    context="",
-                    text="\n".join(lines),
-                )
-            ]
-        case parser if parser is _PYTHON:
-            tree = tree_sitter.Parser(parser).parse(source)
-            return list(
-                _python_items(
-                    nodes=tree.root_node.named_children,
-                    source=source,
-                    path=name,
-                )
-            )
-        case parser if parser is _BASH:
-            tree = tree_sitter.Parser(parser).parse(source)
-            return list(
-                _shell_items(
-                    nodes=tree.root_node.named_children,
-                    source=source,
-                    path=name,
-                )
-            )
-        case parser:
-            tree = tree_sitter.Parser(parser).parse(source)
-            return list(
-                _items(
-                    nodes=tree.root_node.named_children,
-                    source=source,
-                    path=name,
-                )
-            )
-
-
-def _merge_constants(scanned):
-    """Consecutive const, static and assignment items as one item, so each costs one review together."""
+def _merge_constants(contents):
+    """Consecutive const, static and assignment contents as one, so they cost one review together."""
     merged = []
-    for item in scanned:
+    for content in contents:
         previous = merged[-1] if merged else None
         if (
             previous is not None
-            and previous.file == item.file
-            and previous.context == item.context
-            and previous.kind in _MERGED
-            and item.kind in _MERGED
-            and item.start - previous.end <= 2
+            and previous.file == content.file
+            and previous.context == content.context
+            and previous.kind in jevrev.state.MERGED
+            and content.kind in jevrev.state.MERGED
+            and content.start - previous.end <= 2
         ):
-            gap = "\n" * (item.start - previous.end)
+            gap = "\n" * (content.start - previous.end)
             merged[-1] = previous.model_copy(
                 update={
-                    "end": item.end,
-                    "name": f"{previous.name}, {item.name}",
-                    "text": previous.text + gap + item.text,
+                    "end": content.end,
+                    "name": f"{previous.name}, {content.name}",
+                    "text": previous.text + gap + content.text,
                 }
             )
         else:
-            merged.append(item)
+            merged.append(content)
     return merged
 
 
@@ -761,9 +322,9 @@ def _test_cutoff(source, marker):
     )
 
 
-async def _changed_items(root, pathspecs, base, context, sets):
-    """The hunks changed since `base`'s merge-base with HEAD, each with `context` as git diff
-    options for its context lines, and the untracked files."""
+async def _changed_hunks(root, pathspecs, base, context, sets):
+    """Each hunk changed since `base`'s merge-base with HEAD, with `context` as git diff options
+    for its context lines, as a diff of its file; and the untracked files."""
     if base.startswith("-"):
         raise UserError(f"base {base!r} is not a revision")
     merge_base = await git.merge_base(root, base)
@@ -779,8 +340,8 @@ async def _changed_items(root, pathspecs, base, context, sets):
         if not (root / name).is_file() or not _inside(root, root / name):
             continue
         source = (root / name).read_bytes()
-        language = _language_of(name=name, source=source, sets=sets)
-        cutoff = _test_cutoff(source, language.test_marker)
+        review = _review_of(name=name, source=source, sets=sets)
+        cutoff = _test_cutoff(source, review.language.test_marker)
         for hunk in patched:
             lines = [
                 line
@@ -795,17 +356,14 @@ async def _changed_items(root, pathspecs, base, context, sets):
                 f"+{hunk.target_start},{hunk.target_length} @@ {hunk.section_header}"
             )
             changed.append(
-                Item(
+                jevrev.state.FileDiff(
                     file=name,
                     start=hunk.target_start,
                     end=lines[-1].target_line_no,
-                    name=hunk.section_header or ItemKind.HUNK,
-                    kind=ItemKind.HUNK,
-                    context="",
-                    text="",
-                    sets=language.sets,
+                    name=hunk.section_header or jevrev.state.Evaluation.HUNK,
+                    sets=review.sets,
                     hunks=[
-                        DiffHunk(
+                        jevrev.state.DiffHunk(
                             header=header.rstrip(),
                             lines=[
                                 f"{line.line_type}{line.value.removesuffix('\n')}"
@@ -821,109 +379,90 @@ async def _changed_items(root, pathspecs, base, context, sets):
 _DEFAULT_CONTEXT = 20
 
 
-def _added_everywhere(item):
-    """`item` with every context line of its hunks marked as added, so it is judged too."""
-    return item.model_copy(
+def _added_everywhere(diff):
+    """`diff` with every context line of its hunks marked as added, so it is judged too."""
+    return diff.model_copy(
         update={
             "hunks": [
                 hunk.model_copy(
                     update={"lines": [f"+{line[1:]}" for line in hunk.lines]}
                 )
-                for hunk in item.hunks
+                for hunk in diff.hunks
             ]
         }
     )
 
 
 def _file_diffs(hunks):
-    """One item per file holding all of the file's hunks."""
+    """One diff per file holding all of the file's hunks."""
     by_file = {}
     for hunk in hunks:
         by_file.setdefault(hunk.file, []).append(hunk)
     return [
-        Item(
+        jevrev.state.FileDiff(
             file=name,
             start=file_hunks[0].start,
             end=file_hunks[-1].end,
-            name=ItemKind.FILE,
-            kind=ItemKind.FILE,
-            context="",
-            text="",
+            name=jevrev.state.Evaluation.FILE,
             sets=file_hunks[0].sets,
-            hunks=[hunk for item in file_hunks for hunk in item.hunks],
+            hunks=[hunk for diff in file_hunks for hunk in diff.hunks],
         )
         for name, file_hunks in by_file.items()
     ]
 
 
-def _change_items(hunks, untracked, evaluations, all_added, sets):
-    """The items that evaluate the change's `hunks` as each of `evaluations` says. An untracked
-    file is all added, so its diff is the whole file, and its hunks are its top-level items."""
+def _change_states(hunks, untracked, evaluations, all_added, sets):
+    """The states that evaluate the change's `hunks` as each of `evaluations` says. An untracked
+    file is all added, so its diff is the whole file, and its hunks are its top-level contents."""
     if all_added:
         hunks = [_added_everywhere(hunk) for hunk in hunks]
-    new_files = []
-    for name, source in untracked.items():
-        language = _language_of(name=name, source=source, sets=sets)
-        lines = source.decode(errors="replace").splitlines()
-        lines = lines[: _test_cutoff(source, language.test_marker) - 1]
-        new_files.append(
-            Item(
-                file=name,
-                start=1,
-                end=max(len(lines), 1),
-                name=ItemKind.FILE,
-                kind=ItemKind.FILE,
-                context="",
-                text="\n".join(lines),
-                sets=language.sets,
-            )
-        )
-
-    def evaluated(items, evaluation):
-        return [
-            item.model_copy(update={"evaluated": evaluation}) for item in items
-        ]
-
-    scanned = []
-    if Evaluation.DIFF in evaluations:
-        files = _file_diffs(hunks) + new_files
-        if files:
-            scanned.append(
-                Item(
-                    file=".",
-                    start=0,
-                    end=0,
-                    name=ItemKind.DIFF,
-                    kind=ItemKind.DIFF,
+    states = []
+    if jevrev.state.Evaluation.FILE in evaluations:
+        new_files = []
+        for name, source in untracked.items():
+            review = _review_of(name=name, source=source, sets=sets)
+            lines = source.decode(errors="replace").splitlines()
+            lines = lines[
+                : _test_cutoff(source, review.language.test_marker) - 1
+            ]
+            new_files.append(
+                jevrev.state.FileContent(
+                    file=name,
+                    start=1,
+                    end=max(len(lines), 1),
+                    name=jevrev.state.ContentKind.FILE,
+                    kind=jevrev.state.ContentKind.FILE,
                     context="",
-                    text="",
-                    state="\n".join(item.diff for item in files),
-                    sets=tuple(
-                        dict.fromkeys(s for item in files for s in item.sets)
-                    ),
-                    evaluated=Evaluation.DIFF,
+                    text="\n".join(lines),
+                    sets=review.sets,
                 )
             )
-    if Evaluation.FILE in evaluations:
-        scanned += evaluated(_file_diffs(hunks) + new_files, Evaluation.FILE)
-    if Evaluation.HUNK in evaluations:
+        states += [
+            state.model_copy(
+                update={"evaluated": jevrev.state.Evaluation.FILE}
+            )
+            for state in _file_diffs(hunks) + new_files
+        ]
+    if jevrev.state.Evaluation.HUNK in evaluations:
         new = [
-            item
+            content
             for name, source in untracked.items()
-            for item in _file_items(
+            for content in _file_contents(
                 name=name,
                 source=source,
-                language=_language_of(name=name, source=source, sets=sets),
+                review=_review_of(name=name, source=source, sets=sets),
             )
         ]
-        scanned += evaluated(
-            [
-                item.model_copy(update={"headless": True})
-                for item in hunks + _merge_constants(new)
-            ],
-            Evaluation.HUNK,
-        )
-    return scanned
+        states += [
+            state.model_copy(
+                update={
+                    "headless": True,
+                    "evaluated": jevrev.state.Evaluation.HUNK,
+                }
+            )
+            for state in hunks + _merge_constants(new)
+        ]
+    return states
 
 
 def _all_files(root, targets):
@@ -947,8 +486,8 @@ def _all_files(root, targets):
     return sorted(files)
 
 
-def _findings(item, root, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
-    """The rules of `rule_set` that jev's answers for `item` meet its error threshold on, as findings."""
+def _findings(state, root, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
+    """The rules of `rule_set` that jev's answers for `state` meet its error threshold on, as findings."""
     parsed = _read_set(rule_set)
     for position, rule in enumerate(parsed.rules, 1):
         name = jevrev.jev.ask.question_name(position)
@@ -956,40 +495,39 @@ def _findings(item, root, answers: list[jevrev.jev.api.NoulAnswer], rule_set):
         if answer is None or answer.probability < parsed.error_threshold:
             continue
         yield Finding(
-            file=str(root / item.file),
-            start=item.start,
-            end=item.end,
-            item=item.name,
+            file=str(root / state.file),
+            start=state.start,
+            end=state.end,
+            item=state.name,
             rule=f"{rule_set.name}#{position}",
             probability=round(answer.probability, 2),
             flags=rule.flags,
             violation=" ".join(rule.bad),
             accepted=" ".join(rule.good),
-            evaluated=item.evaluated,
+            evaluated=state.evaluated,
         )
 
 
-async def _ask(item, rule_set, gate, verbose, client, model):
-    state = item.state if item.state is not None else item.diff
+async def _ask(state, rule_set, gate, verbose, client, model):
     async with gate:
         try:
             request = jevrev.jev.ask.build_request(
                 questions=jevrev.jev.ask.load_questions(rule_set),
-                state=state,
+                state=state.render(),
                 model=model,
             )
         except jevrev.jev.ask.UserError as e:
-            raise AskFailed(item, str(e))
+            raise AskFailed(state, str(e))
         except jevrev.jev.ask.Rejected as e:
-            raise AskFailed(item, "\n".join(jevrev.jev.ask.rejected_lines(e)))
+            raise AskFailed(state, "\n".join(jevrev.jev.ask.rejected_lines(e)))
         if verbose:
             print(
                 json_dumps(
                     {
-                        "file": item.file,
-                        "start": item.start,
-                        "item": item.name,
-                        "evaluated": item.evaluated,
+                        "file": state.file,
+                        "start": state.start,
+                        "item": state.name,
+                        "evaluated": state.evaluated,
                         "request": request.model_dump(
                             mode="json", exclude_none=True
                         ),
@@ -1000,11 +538,11 @@ async def _ask(item, rule_set, gate, verbose, client, model):
         try:
             answers = await client.ask(request)
         except jevrev.jev.api.UserError as e:
-            raise AskFailed(item, str(e))
+            raise AskFailed(state, str(e))
     return answers
 
 
-async def scan_items(
+async def scan_states(
     rules,
     root=None,
     paths=(),
@@ -1015,9 +553,9 @@ async def scan_items(
     context=None,
     all_added=False,
 ):
-    """The resolved root, and the items of it to ask jev about, as main's
+    """The resolved root, and the states of it to ask jev about, as main's
     flags of the same names select them."""
-    evaluations = evaluate or [Evaluation.HUNK]
+    evaluations = evaluate or [jevrev.state.Evaluation.HUNK]
 
     root = (await git.current_repository() if root is None else root).resolve()
     if not root.is_dir():
@@ -1066,7 +604,7 @@ async def scan_items(
             raise UserError(f"{', '.join(ignored)} ignored by git")
     else:
         lines = _DEFAULT_CONTEXT if context is None else context
-        hunks, whole = await _changed_items(
+        hunks, whole = await _changed_hunks(
             root=root,
             pathspecs=pathspecs,
             base=base,
@@ -1095,17 +633,17 @@ async def scan_items(
     if base is None:
         scanned = _merge_constants(
             [
-                item
+                state
                 for name, source in sources.items()
-                for item in _file_items(
+                for state in _file_contents(
                     name=name,
                     source=source,
-                    language=_language_of(name=name, source=source, sets=sets),
+                    review=_review_of(name=name, source=source, sets=sets),
                 )
             ]
         )
     else:
-        scanned = _change_items(
+        scanned = _change_states(
             hunks=hunks,
             untracked=sources,
             evaluations=evaluations,
@@ -1113,11 +651,11 @@ async def scan_items(
             sets=sets,
         )
     scanned = [
-        item.model_copy(
-            update={"sets": (rule_set,) if rule_set else item.sets}
+        state.model_copy(
+            update={"sets": (rule_set,) if rule_set else state.sets}
         )
-        for item in scanned
-        if rule_set or item.sets
+        for state in scanned
+        if rule_set or state.sets
     ]
     return root, scanned
 
@@ -1132,19 +670,19 @@ async def review(
 ):
     """The findings jev, asked through client with model, reports on scanned,
     and the requests that failed."""
-    asked = [(item, s) for item in scanned for s in item.sets]
+    asked = [(state, s) for state in scanned for s in state.sets]
     gate = asyncio.Semaphore(concurrency)
     results = await asyncio.gather(
         *(
             _ask(
-                item=item,
+                state=state,
                 rule_set=s,
                 gate=gate,
                 verbose=verbose,
                 client=client,
                 model=model,
             )
-            for item, s in asked
+            for state, s in asked
         ),
         return_exceptions=True,
     )
@@ -1152,42 +690,42 @@ async def review(
         raise UserError(f"every jev request failed; the first: {results[0]}")
     found = []
     failures = []
-    # A rule two of an item's sets both ask, word for word, is reported once, from the first set.
+    # A rule two of a state's sets both ask, word for word, is reported once, from the first set.
     reported = set()
-    for (item, rule_set), result in zip(asked, results):
+    for (state, rule_set), result in zip(asked, results):
         if isinstance(result, AskFailed):
             failures.append(f"{rule_set.name}: {result}")
             continue
         if isinstance(result, BaseException):
             raise result
         for finding in _findings(
-            item=item, root=root, answers=result, rule_set=rule_set
+            state=state, root=root, answers=result, rule_set=rule_set
         ):
-            if (id(item), finding.flags) in reported:
+            if (id(state), finding.flags) in reported:
                 continue
-            reported.add((id(item), finding.flags))
+            reported.add((id(state), finding.flags))
             found.append(finding)
     return _without_file_repeats(found), failures
 
 
 def summary_line(scanned, root, found, failures):
     return (
-        f"{len(scanned)} items reviewed in {root}, {len(found)} findings, "
+        f"{len(scanned)} states reviewed in {root}, {len(found)} findings, "
         f"{len(failures)} failures"
     )
 
 
 def _without_file_repeats(found):
-    """`found` without each file item's finding whose rule also fired on a hunk of the same file,
+    """`found` without each file finding whose rule also fired on a hunk of the same file,
     as the hunk's finding names the lines."""
     in_hunks = {
         (finding.file, finding.flags)
         for finding in found
-        if finding.evaluated == Evaluation.HUNK
+        if finding.evaluated == jevrev.state.Evaluation.HUNK
     }
     return [
         finding
         for finding in found
-        if finding.evaluated != Evaluation.FILE
+        if finding.evaluated != jevrev.state.Evaluation.FILE
         or (finding.file, finding.flags) not in in_hunks
     ]

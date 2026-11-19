@@ -11,6 +11,7 @@ import pydantic
 import jevrev.github.pull_request
 import jevrev.github.repo
 import jevrev.jev.scan
+import jevrev.state
 
 # Raised when the db can't be opened, read, or locked in time.
 OperationalError = sqlite3.OperationalError
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS finding (
     flags TEXT NOT NULL,
     violation TEXT NOT NULL,
     accepted TEXT NOT NULL,
-    evaluated TEXT CHECK ({_one_of("evaluated", jevrev.jev.scan.Evaluation)}),
+    evaluated TEXT CHECK ({_one_of("evaluated", jevrev.state.Evaluation)}),
     verdict TEXT CHECK ({_one_of("verdict", Verdict)}),
     reason TEXT,
     CHECK ((verdict IS NULL) = (reason IS NULL))

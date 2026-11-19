@@ -26,6 +26,7 @@ import jevrev.jev.ask
 import jevrev.jev.scan
 import jevrev.process
 import jevrev.settings
+import jevrev.state
 import jevrev.templates
 
 # Seconds a jev scan may run.
@@ -200,8 +201,8 @@ async def _cmd_scan(args):
     evaluate = None
     if base is not None:
         evaluate = [
-            jevrev.jev.scan.Evaluation.HUNK,
-            jevrev.jev.scan.Evaluation.FILE,
+            jevrev.state.Evaluation.HUNK,
+            jevrev.state.Evaluation.FILE,
         ]
     found, summary = await _run_jev_scan(
         root=root,
@@ -250,7 +251,7 @@ async def _run_jev_scan(root, rules, extra_rules, base=None, evaluate=None):
     )
     try:
         async with asyncio.timeout(_JEV_SCAN_TIMEOUT):
-            root, scanned = await jevrev.jev.scan.scan_items(
+            root, scanned = await jevrev.jev.scan.scan_states(
                 rules,
                 root=root,
                 extra_rules=extra_rules,
@@ -497,7 +498,7 @@ def _pr_comment(
     body = _render(
         Template.PR_COMMENT, PrComment(reason=f.reason or "", flags=f.flags)
     )
-    if f.evaluated != jevrev.jev.scan.Evaluation.FILE:
+    if f.evaluated != jevrev.state.Evaluation.FILE:
         for hunk in hunks.get(f.file, []):
             start, end = max(f.start, hunk.start), min(f.end, hunk.stop - 1)
             if start <= end:
