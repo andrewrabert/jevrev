@@ -14,7 +14,6 @@ type SourcePath = typing.Annotated[
     str, pydantic.StringConstraints(min_length=1)
 ]
 
-# A line's number in a file, from 1.
 type LineNumber = typing.Annotated[int, pydantic.Field(ge=1)]
 
 # The ignore files of a directory, lowest precedence first.

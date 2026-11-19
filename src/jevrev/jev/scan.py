@@ -362,7 +362,6 @@ class Finding(pydantic.BaseModel):
     violation: RuleExamples
     # The rule's examples of what keeps it.
     accepted: RuleExamples
-    # What of the file jev was given.
     state: jevrev.state.StateKind
 
 
