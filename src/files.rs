@@ -1,6 +1,7 @@
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::string::FromUtf8Error;
 
 use crate::Error;
 use crate::git::CommitFiles;
@@ -55,8 +56,12 @@ pub enum Files {
     Blobs(Blobs),
 }
 
-fn read_file(path: &Path, name: &str) -> Result<Vec<u8>, Error> {
-    std::fs::read(path).with_context(|| name.to_string())
+#[derive(Debug, thiserror::Error)]
+pub enum ReadTextError {
+    #[error("not UTF-8 text")]
+    NotUtf8(#[from] FromUtf8Error),
+    #[error(transparent)]
+    Read(#[from] Error),
 }
 
 impl Files {
@@ -70,17 +75,25 @@ impl Files {
         }
     }
 
-    pub async fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
+    pub async fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
         match self {
-            Files::OnDisk(files) => read_file(&files.root.join(path), path),
-            Files::OneFile(file) => read_file(&file.path, path),
-            Files::Commit(files) => files.read(path),
-            Files::InMemory(files) => files
-                .contents
-                .get(path)
-                .cloned()
-                .ok_or_else(|| anyhow!("{path}: no such file")),
-            Files::Blobs(blobs) => blobs.read(path).await,
+            Files::OnDisk(files) => {
+                let contents = std::fs::read(files.root.join(path)).map_err(Error::from)?;
+                Ok(String::from_utf8(contents)?)
+            }
+            Files::OneFile(file) => {
+                let contents = std::fs::read(&file.path).map_err(Error::from)?;
+                Ok(String::from_utf8(contents)?)
+            }
+            Files::Commit(files) => files.read_text(path),
+            Files::InMemory(files) => {
+                let contents = files
+                    .contents
+                    .get(path)
+                    .ok_or_else(|| anyhow!("no such file"))?;
+                Ok(String::from_utf8(contents.clone())?)
+            }
+            Files::Blobs(blobs) => blobs.read_text(path).await,
         }
     }
 }

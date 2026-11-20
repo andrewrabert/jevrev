@@ -124,10 +124,6 @@ fn patterns_match_as_git_does() {
             &[("dir/a.txt", Check::Included), ("dir/", Check::Excluded)],
         ),
         (
-            &["[a-"],
-            &[("[a-", Check::Unmatched), ("a", Check::Unmatched)],
-        ),
-        (
             &["a[--z]b"],
             &[
                 ("a-b", Check::Included),
@@ -164,10 +160,11 @@ fn patterns_match_as_git_does() {
         (&["#c"], &[("#c", Check::Unmatched)]),
     ];
     for (patterns, expected) in cases {
-        let spec = Spec::from_lines(patterns.iter().copied());
+        let spec = Spec::from_lines(patterns.iter().copied()).unwrap();
         for (path, check) in *expected {
             assert_eq!(spec.check(path), *check, "{patterns:?} against {path:?}");
         }
     }
     assert_eq!(Pattern::new("*.py").as_str(), "*.py");
+    assert!(Spec::from_lines(["[a-"]).is_err());
 }

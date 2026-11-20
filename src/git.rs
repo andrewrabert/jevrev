@@ -1,4 +1,5 @@
-use anyhow::{Context, anyhow};
+use crate::files::ReadTextError;
+use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -231,14 +232,14 @@ pub struct Diff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Side {
     Absent,
-    Present(Vec<u8>),
+    Present(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentPair {
     pub path: String,
     pub old: Side,
-    pub new: Vec<u8>,
+    pub new: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,8 +282,10 @@ impl GitRepo {
     }
 
     pub fn discover(root: &Path) -> Result<Option<GitRepo>, Error> {
-        let Ok(repo) = gix::discover(root) else {
-            return Ok(None);
+        let repo = match gix::discover(root) {
+            Ok(repo) => repo,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
         let workdir = repo
             .workdir()
@@ -324,29 +327,39 @@ impl GitRepo {
         if self.prefix.is_empty() {
             return Ok(Some(tree));
         }
-        Ok(tree
-            .lookup_entry_by_path(self.prefix.trim_end_matches('/'))
-            .ok()
-            .flatten()
-            .filter(|entry| entry.mode().is_tree())
-            .and_then(|entry| entry.object().ok())
-            .and_then(|object| object.try_into_tree().ok()))
+        let directory = self.prefix.trim_end_matches('/');
+        let Some(entry) = tree.lookup_entry_by_path(directory)? else {
+            return Ok(None);
+        };
+        if !entry.mode().is_tree() {
+            bail!(
+                "{directory} is a {} in {commit}, not a directory",
+                entry.mode().as_str()
+            );
+        }
+        Ok(Some(entry.object()?.try_into_tree()?))
     }
 
-    fn blob(&self, id: gix::hash::ObjectId) -> Result<Vec<u8>, Error> {
-        let mut blob = self.repo.find_blob(id)?;
-        Ok(std::mem::take(&mut blob.data))
+    pub fn read_file_text(
+        &self,
+        commit: &GitObjectId,
+        path: &str,
+    ) -> Result<String, ReadTextError> {
+        let contents = (|| -> Result<Vec<u8>, Error> {
+            let missing = || anyhow!("no such file in {commit}");
+            let tree = self.root_tree(commit)?.ok_or_else(missing)?;
+            let entry = tree.lookup_entry_by_path(path)?.ok_or_else(missing)?;
+            if !entry.mode().is_blob() {
+                bail!("a {} in {commit}, not a file", entry.mode().as_str());
+            }
+            Ok(entry.object()?.try_into_blob()?.detach().data)
+        })()?;
+        Ok(String::from_utf8(contents)?)
     }
 
     fn relative<'p>(&self, path: &'p str) -> Option<&'p str> {
         path.strip_prefix(self.prefix.as_str())
     }
-}
-
-fn blob_at(tree: &gix::Tree<'_>, path: &str) -> Option<Vec<u8>> {
-    let entry = tree.lookup_entry_by_path(Path::new(path)).ok()??;
-    let mut blob = entry.object().ok()?.try_into_blob().ok()?;
-    Some(std::mem::take(&mut blob.data))
 }
 
 fn tree_entries(tree: Option<&gix::Tree<'_>>) -> Result<TreeEntries, Error> {
@@ -361,10 +374,6 @@ fn tree_entries(tree: Option<&gix::Tree<'_>>) -> Result<TreeEntries, Error> {
         .filter(|entry| !entry.mode.is_tree())
         .map(|entry| (Vec::from(entry.filepath), (entry.mode, entry.oid)))
         .collect())
-}
-
-fn is_binary(data: &[u8]) -> bool {
-    data[..data.len().min(8000)].contains(&0)
 }
 
 fn is_git_space(byte: u8) -> bool {
@@ -403,16 +412,13 @@ impl ConsumeHunk for Collect {
 
 fn changed_file(
     path: &str,
-    old: &[u8],
-    new: &[u8],
+    old: &str,
+    new: &str,
     context: u32,
     inter_hunk_context: u32,
-) -> Option<FileDiff> {
+) -> Result<Option<FileDiff>, Error> {
     use gix::diff::blob::{Algorithm, InternedInput, UnifiedDiff, unified_diff::ContextSize};
 
-    if is_binary(old) || is_binary(new) {
-        return None;
-    }
     let input = InternedInput::new(old, new);
     let mut diff = gix::diff::blob::Diff::compute(Algorithm::Myers, &input);
     diff.postprocess_lines(&input);
@@ -422,8 +428,7 @@ fn changed_file(
         Collect(Vec::new()),
         ContextSize::symmetrical(context),
     )
-    .consume()
-    .ok()?;
+    .consume()?;
 
     let mut joined: Vec<(HunkHeader, Vec<DiffLineKind>)> = Vec::new();
     for (header, kinds) in emitted {
@@ -448,16 +453,16 @@ fn changed_file(
         let old_start = header.before_hunk_start - 1;
         let new_start = header.after_hunk_start - 1;
         for l in ((searched_to + 1)..i64::from(old_start)).rev() {
-            if let Some(found) = function_line(text(input.before[l as usize])) {
+            if let Some(found) = function_line(text(input.before[l as usize]).as_bytes()) {
                 function = found;
                 break;
             }
         }
         searched_to = i64::from(old_start) - 1;
-        let section = str::trim(std::str::from_utf8(function).ok()?).to_string();
+        let section = String::from_utf8_lossy(function).trim().to_string();
         let line_text = |token| {
             let line = text(token);
-            line.strip_suffix(b"\n").unwrap_or(line).to_vec()
+            line.strip_suffix('\n').unwrap_or(line).as_bytes().to_vec()
         };
         let mut before_index = old_start;
         let mut after_index = new_start;
@@ -482,12 +487,15 @@ fn changed_file(
                 }
             });
         }
-        hunks.push(Hunk::new(path, header, section, NonEmpty::from_vec(lines)?));
+        let Some(lines) = NonEmpty::from_vec(lines) else {
+            continue;
+        };
+        hunks.push(Hunk::new(path, header, section, lines));
     }
-    NonEmpty::from_vec(hunks).map(|hunks| FileDiff {
+    Ok(NonEmpty::from_vec(hunks).map(|hunks| FileDiff {
         path: path.to_string(),
         hunks,
-    })
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -503,32 +511,16 @@ impl CommitFiles {
 
     pub fn paths(&self) -> Result<Vec<String>, Error> {
         let entries = tree_entries(self.repo.root_tree(&self.commit)?.as_ref())?;
-        Ok(entries
+        entries
             .into_iter()
             .filter(|(_, (mode, _))| mode.is_blob())
-            .filter_map(|(path, _)| {
-                String::from_utf8(path)
-                    .inspect_err(|e| {
-                        tracing::info!("skipping {}: not a UTF-8 path", e.as_bytes().escape_ascii())
-                    })
-                    .ok()
-            })
-            .collect())
+            .map(|(path, _)| Ok(String::from_utf8(path)?))
+            .collect()
     }
 
-    pub fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
-        let missing = || anyhow!("{path} is not in {}", self.commit);
-        let tree = self.repo.root_tree(&self.commit)?.ok_or_else(missing)?;
-        blob_at(&tree, path).ok_or_else(missing)
+    pub fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
+        self.repo.read_file_text(&self.commit, path)
     }
-}
-
-fn read_if_file(path: &Path) -> Option<Vec<u8>> {
-    std::fs::read(path).ok()
-}
-
-pub fn global_excludes() -> Vec<Spec> {
-    vec![Spec::global()]
 }
 
 impl GitRepo {
@@ -577,29 +569,33 @@ impl GitRepo {
         let old = tree_entries(self.root_tree(base)?.as_ref())?;
         let new = tree_entries(self.root_tree(head)?.as_ref())?;
         let mut files = Vec::new();
-        for (raw, &(mode, id)) in &new {
-            let Ok(path) = std::str::from_utf8(raw) else {
-                tracing::info!("skipping {}: not a UTF-8 path", raw.escape_ascii());
-                continue;
-            };
+        for (raw, &(mode, _)) in &new {
+            let path = std::str::from_utf8(raw)?;
             if !mode.is_blob() {
                 continue;
             }
-            let old_side = old
-                .get(raw)
-                .copied()
-                .filter(|(old_mode, _)| old_mode.is_blob());
-            let changed = match old_side {
-                Some((_, old_id)) => changed_file(
+            let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
+            let texts = (|| -> Result<(String, String), ReadTextError> {
+                let old_text = if in_base {
+                    self.read_file_text(base, path)?
+                } else {
+                    String::new()
+                };
+                Ok((old_text, self.read_file_text(head, path)?))
+            })();
+            match texts {
+                Ok((old_text, new_text)) => files.extend(changed_file(
                     path,
-                    &self.blob(old_id)?,
-                    &self.blob(id)?,
+                    &old_text,
+                    &new_text,
                     context,
                     inter_hunk_context,
-                ),
-                None => changed_file(path, &[], &self.blob(id)?, context, inter_hunk_context),
-            };
-            files.extend(changed);
+                )?),
+                Err(ReadTextError::NotUtf8(e)) => {
+                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
+                }
+                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
+            }
         }
         Ok(Diff { files })
     }
@@ -615,31 +611,35 @@ impl GitRepo {
         let directory = self.top.join(&self.prefix);
         let mut files = Vec::new();
         for raw in tracked {
-            let Ok(path) = std::str::from_utf8(raw) else {
-                tracing::info!("skipping {}: not a UTF-8 path", raw.escape_ascii());
-                continue;
-            };
+            let path = std::str::from_utf8(raw)?;
             let file = directory.join(path);
             let metadata = match std::fs::symlink_metadata(&file) {
                 Ok(metadata) => metadata,
-                Err(e) => {
-                    tracing::info!("skipping {path}: {e}");
-                    continue;
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(anyhow!("{}: {e}", file.display())),
             };
             if !metadata.is_file() {
                 continue;
             }
-            let new = std::fs::read(&file).with_context(|| file.display().to_string())?;
-            let old_side = old
-                .get(raw)
-                .copied()
-                .filter(|(old_mode, _)| old_mode.is_blob());
-            let changed = match old_side {
-                Some((_, old_id)) => changed_file(path, &self.blob(old_id)?, &new, context, 0),
-                None => changed_file(path, &[], &new, context, 0),
-            };
-            files.extend(changed);
+            let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
+            let texts = (|| -> Result<(String, String), ReadTextError> {
+                let old_text = if in_base {
+                    self.read_file_text(base, path)?
+                } else {
+                    String::new()
+                };
+                let new = std::fs::read(&file).map_err(Error::from)?;
+                Ok((old_text, String::from_utf8(new)?))
+            })();
+            match texts {
+                Ok((old_text, new_text)) => {
+                    files.extend(changed_file(path, &old_text, &new_text, context, 0)?)
+                }
+                Err(ReadTextError::NotUtf8(e)) => {
+                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
+                }
+                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
+            }
         }
         Ok(Diff { files })
     }
@@ -684,13 +684,7 @@ impl GitRepo {
                     {
                         continue;
                     }
-                    let Ok(full) = std::str::from_utf8(&entry.rela_path) else {
-                        tracing::info!(
-                            "skipping {}: not a UTF-8 path",
-                            entry.rela_path.escape_ascii()
-                        );
-                        continue;
-                    };
+                    let full = std::str::from_utf8(&entry.rela_path)?;
                     if let Some(path) = self.relative(full) {
                         found.push(path.to_string());
                     }
@@ -698,13 +692,17 @@ impl GitRepo {
             }
         }
         let base = self.top.join(&self.prefix);
-        Ok(found
-            .into_iter()
-            .filter(|path| {
-                let joined = base.join(path);
-                std::fs::canonicalize(&joined).is_ok_and(|real| real == joined)
-            })
-            .collect())
+        let mut kept = Vec::new();
+        for path in found {
+            let joined = base.join(&path);
+            match std::fs::canonicalize(&joined) {
+                Ok(real) if real == joined => kept.push(path),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("{}: {e}", joined.display())),
+            }
+        }
+        Ok(kept)
     }
 
     pub fn ignore_files_above(&self, at: ReadFrom<'_>) -> Result<AboveSource, Error> {
@@ -729,10 +727,26 @@ impl GitRepo {
                 let contents = match &tree {
                     None => {
                         let file = self.top.join(&path);
-                        let regular = std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file());
-                        if regular { read_if_file(&file) } else { None }
+                        match std::fs::symlink_metadata(&file) {
+                            Ok(metadata) if metadata.is_file() => Some(std::fs::read(&file)?),
+                            Ok(_) => bail!(
+                                "{}: an ignore file must be a regular file, as git does not follow a symlink to one",
+                                file.display()
+                            ),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => return Err(anyhow!("{}: {e}", file.display())),
+                        }
                     }
-                    Some(tree) => blob_at(tree, &path),
+                    Some(tree) => match tree.lookup_entry_by_path(&path)? {
+                        None => None,
+                        Some(entry) if entry.mode().is_blob() => {
+                            Some(entry.object()?.try_into_blob()?.detach().data)
+                        }
+                        Some(entry) => bail!(
+                            "{path} is a {}, not a file; an ignore file must be a file",
+                            entry.mode().as_str()
+                        ),
+                    },
                 };
                 if let Some(contents) = contents {
                     ignore_files.push(IgnoreFile {
@@ -748,22 +762,29 @@ impl GitRepo {
         })
     }
 
-    pub fn excludes(&self) -> Vec<Spec> {
-        let mut found = global_excludes();
-        found.extend(
-            read_if_file(&self.repo.git_dir().join("info").join("exclude"))
-                .map(|c| Spec::from_bytes(&c)),
-        );
-        found
+    pub fn excludes(&self) -> Result<Vec<Spec>, Error> {
+        let mut found = vec![Spec::global()?];
+        let exclude = self.repo.git_dir().join("info").join("exclude");
+        match std::fs::read(&exclude) {
+            Ok(contents) => found
+                .push(Spec::from_bytes(&contents).with_context(|| exclude.display().to_string())?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(found)
     }
 }
 
-pub fn diff_contents(pairs: &[ContentPair], context: u32, inter_hunk_context: u32) -> Diff {
+pub fn diff_contents(
+    pairs: &[ContentPair],
+    context: u32,
+    inter_hunk_context: u32,
+) -> Result<Diff, Error> {
     let mut files = Vec::new();
     for pair in pairs {
-        let old: &[u8] = match &pair.old {
-            Side::Absent => &[],
-            Side::Present(old) => old,
+        let old = match &pair.old {
+            Side::Absent => "",
+            Side::Present(old) => old.as_str(),
         };
         files.extend(changed_file(
             &pair.path,
@@ -771,7 +792,7 @@ pub fn diff_contents(pairs: &[ContentPair], context: u32, inter_hunk_context: u3
             &pair.new,
             context,
             inter_hunk_context,
-        ));
+        )?);
     }
-    Diff { files }
+    Ok(Diff { files })
 }

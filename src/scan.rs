@@ -20,13 +20,14 @@ pub struct Finding {
     pub state: StateKind,
 }
 
+use anyhow::Context;
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::files::Files;
+use crate::files::{Files, ReadTextError};
 use crate::git::{Diff, FileDiff, Line};
 use crate::gitignore::{Check, Pattern, Spec};
 use crate::ignore_rules::{Fate, Ignore};
@@ -81,11 +82,13 @@ enum PathFilter {
 }
 
 impl PathFilter {
-    fn new(patterns: Vec<Pattern>) -> PathFilter {
+    fn new(patterns: &[Pattern]) -> Result<PathFilter, Error> {
         if patterns.is_empty() {
-            PathFilter::Any
+            Ok(PathFilter::Any)
         } else {
-            PathFilter::Only(Spec::new(patterns))
+            Ok(PathFilter::Only(Spec::from_lines(
+                patterns.iter().map(Pattern::as_str),
+            )?))
         }
     }
 
@@ -122,22 +125,23 @@ struct SetConditions {
     conditions: Vec<Condition>,
 }
 
-fn yaml_files(directory: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = ignore::WalkBuilder::new(directory)
+fn yaml_files(directory: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut found = Vec::new();
+    for entry in ignore::WalkBuilder::new(directory)
         .standard_filters(false)
         .build()
-        .flatten()
-        .filter(|entry| entry.depth() > 0)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(".yaml"))
-        })
-        .map(ignore::DirEntry::into_path)
-        .collect();
+    {
+        let entry = entry?;
+        let is_yaml = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".yaml"));
+        if entry.depth() > 0 && is_yaml {
+            found.push(entry.into_path());
+        }
+    }
     found.sort_by(|a, b| a.components().cmp(b.components()));
-    found
+    Ok(found)
 }
 
 fn rule_sets(
@@ -147,16 +151,16 @@ fn rule_sets(
     let mut sets: Vec<SetConditions> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for directory in rules {
-        let directory = std::fs::canonicalize(directory)
-            .or_else(|_| std::path::absolute(directory))
-            .unwrap_or_else(|_| directory.clone());
+        let directory = std::fs::canonicalize(directory).map_err(|e| {
+            ScanError::Jev(format!("rule sets directory {}: {e}", directory.display()))
+        })?;
         if !directory.is_dir() {
             return Err(ScanError::Jev(format!(
                 "rule sets directory {} is not a directory",
                 directory.display()
             )));
         }
-        for path in yaml_files(&directory) {
+        for path in yaml_files(&directory)? {
             if !loaded.contains_key(&path) {
                 let parsed = RuleSet::load(&path).map_err(|e| ScanError::Jev(format!("{e:#}")))?;
                 loaded.insert(path.clone(), parsed);
@@ -167,21 +171,22 @@ fn rule_sets(
             if !seen.insert(path.clone()) {
                 continue;
             }
-            sets.push(SetConditions {
-                path,
-                conditions: when
-                    .iter()
-                    .map(|w| Condition {
+            let conditions = when
+                .iter()
+                .map(|w| {
+                    Ok(Condition {
                         languages: w.language.clone(),
-                        patterns: PathFilter::new(w.matches.clone()),
+                        patterns: PathFilter::new(&w.matches)?,
                         exists: w
                             .exists
                             .iter()
-                            .map(|pattern| Spec::new(vec![pattern.clone()]))
-                            .collect(),
+                            .map(|pattern| Spec::from_lines([pattern.as_str()]))
+                            .collect::<Result<_, Error>>()?,
                     })
-                    .collect(),
-            });
+                })
+                .collect::<Result<_, Error>>()
+                .with_context(|| path.display().to_string())?;
+            sets.push(SetConditions { path, conditions });
         }
     }
     Ok(sets)
@@ -446,9 +451,12 @@ impl<'s> ScanRun<'s> {
         let included = if scope.include.is_empty() {
             PathFilter::Any
         } else {
-            PathFilter::Only(Spec::from_lines(scope.include.iter().map(String::as_str)))
+            PathFilter::Only(
+                Spec::from_lines(scope.include.iter().map(String::as_str)).context("--include")?,
+            )
         };
-        let excluded = Spec::from_lines(scope.exclude.iter().map(String::as_str));
+        let excluded =
+            Spec::from_lines(scope.exclude.iter().map(String::as_str)).context("--exclude")?;
         let in_scope: HashSet<&str> = paths
             .iter()
             .map(String::as_str)
@@ -461,9 +469,17 @@ impl<'s> ScanRun<'s> {
             if !in_scope.contains(path) {
                 continue;
             }
+            let text = match source.read_text(path).await {
+                Ok(text) => text,
+                Err(ReadTextError::NotUtf8(e)) => {
+                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
+                    continue;
+                }
+                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string()).into()),
+            };
             let file = File {
                 path: path.to_string(),
-                languages: languages::detect(path, &source.read(path).await?),
+                languages: languages::detect(path, &text),
             };
             let selecting = sets
                 .iter()
@@ -479,11 +495,6 @@ impl<'s> ScanRun<'s> {
             rule_sets,
             selection,
         })
-    }
-
-    async fn contents(&self, file: &File) -> Result<String, ScanError> {
-        String::from_utf8(self.source.read(&file.path).await?)
-            .map_err(|e| ScanError::Jev(format!("{} is not UTF-8 text: {e}", file.path)))
     }
 
     fn scanned(self, states: Vec<State>) -> Scanned {
@@ -523,14 +534,11 @@ pub async fn scan(
     let run = ScanRun::select(rules, source, scope, &candidates).await?;
     let mut states = Vec::new();
     for (file, sets) in &run.selection {
-        let text = match run.contents(file).await {
-            Ok(text) => text,
-            Err(ScanError::Jev(e)) => {
-                tracing::debug!("skipping {e}");
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
+        let text = run
+            .source
+            .read_text(&file.path)
+            .await
+            .map_err(|e| Error::from(e).context(file.path.clone()))?;
         let added = changes
             .filter(|_| !changed.contains_key(file.path.as_str()))
             .and_then(|_| FileDiff::added(&file.path, &text));

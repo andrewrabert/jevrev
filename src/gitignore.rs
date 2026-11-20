@@ -1,5 +1,8 @@
+use anyhow::Context;
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+use crate::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern(String);
@@ -31,30 +34,26 @@ impl Default for Spec {
 }
 
 impl Spec {
-    pub fn new(patterns: Vec<Pattern>) -> Spec {
-        Spec::from_lines(patterns.iter().map(Pattern::as_str))
-    }
-
-    pub fn from_lines<'line>(lines: impl IntoIterator<Item = &'line str>) -> Spec {
+    pub fn from_lines<'line>(lines: impl IntoIterator<Item = &'line str>) -> Result<Spec, Error> {
         let mut builder = GitignoreBuilder::new(".");
         builder.allow_unclosed_class(false);
         for line in lines {
-            if let Err(e) = builder.add_line(None, line) {
-                tracing::warn!("ignoring the pattern {line:?}: {e}");
-            }
+            builder
+                .add_line(None, line)
+                .with_context(|| format!("the ignore pattern {line:?}"))?;
         }
-        Spec(builder.build().unwrap_or_else(|e| {
-            tracing::warn!("ignoring every pattern: {e}");
-            Gitignore::empty()
-        }))
+        Ok(Spec(builder.build()?))
     }
 
-    pub fn from_bytes(contents: &[u8]) -> Spec {
-        Spec::from_lines(String::from_utf8_lossy(contents).lines())
+    pub fn from_bytes(contents: &[u8]) -> Result<Spec, Error> {
+        Spec::from_lines(std::str::from_utf8(contents)?.lines())
     }
 
-    pub fn global() -> Spec {
-        Spec(Gitignore::global().0)
+    pub fn global() -> Result<Spec, Error> {
+        match Gitignore::global() {
+            (spec, None) => Ok(Spec(spec)),
+            (_, Some(e)) => Err(Error::new(e).context("the global git excludes file")),
+        }
     }
 
     pub fn check_entry(&self, path: &str, is_dir: bool) -> Check {

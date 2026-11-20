@@ -6,13 +6,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use octocrab::Octocrab;
 
 use crate::Error;
-use crate::files::InMemory;
+use crate::files::{InMemory, ReadTextError};
 use crate::git::{self, ContentPair, Diff, GitObjectId, GitRevision, Side};
 use crate::github::credentials::Token;
 use crate::github::pull_request::{GithubPullRequest, PullRequest, User};
@@ -62,7 +62,7 @@ pub struct Blobs {
     client: Client,
     repo: GithubRepo,
     blobs: BTreeMap<String, GitObjectId>,
-    read: Mutex<HashMap<String, Vec<u8>>>,
+    read: Mutex<HashMap<String, String>>,
 }
 
 impl Blobs {
@@ -70,24 +70,24 @@ impl Blobs {
         self.blobs.keys().cloned().collect()
     }
 
-    pub async fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
-        if let Some(found) = self
-            .read
-            .lock()
-            .ok()
-            .and_then(|read| read.get(path).cloned())
-        {
+    pub async fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
+        let cached = self.cache()?.get(path).cloned();
+        if let Some(found) = cached {
             return Ok(found);
         }
         let sha = self
             .blobs
             .get(path)
-            .ok_or_else(|| anyhow!("{path}: no such file"))?;
-        let contents = self.client.blob(&self.repo, sha).await?;
-        if let Ok(mut read) = self.read.lock() {
-            read.insert(path.to_string(), contents.clone());
-        }
-        Ok(contents)
+            .ok_or_else(|| anyhow!("no such file"))?;
+        let text = String::from_utf8(self.client.blob(&self.repo, sha).await?)?;
+        self.cache()?.insert(path.to_string(), text.clone());
+        Ok(text)
+    }
+
+    fn cache(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, String>>, Error> {
+        self.read
+            .lock()
+            .map_err(|_| anyhow!("a thread panicked while it held the read files"))
     }
 }
 
@@ -344,9 +344,7 @@ impl Client {
             if !regular {
                 continue;
             }
-            let Ok(name) = String::from_utf8(entry.path_bytes().into_owned()) else {
-                continue;
-            };
+            let name = String::from_utf8(entry.path_bytes().into_owned())?;
             let path = name
                 .split_once('/')
                 .map_or("", |(_, rest)| rest)
@@ -429,19 +427,33 @@ impl Client {
         let read = |sha: Option<GitObjectId>| async move {
             match sha {
                 None => Ok(Side::Absent),
-                Some(sha) => self.blob(repo, &sha).await.map(Side::Present),
+                Some(sha) => Ok::<_, ReadTextError>(Side::Present(String::from_utf8(
+                    self.blob(repo, &sha).await?,
+                )?)),
             }
         };
-        let pairs: Vec<ContentPair> = futures::stream::iter(changed)
+        let read_new = |sha: GitObjectId| async move {
+            Ok::<_, ReadTextError>(String::from_utf8(self.blob(repo, &sha).await?)?)
+        };
+        let read_pairs: Vec<_> = futures::stream::iter(changed)
             .map(|(path, before, after)| async move {
-                let (old, new) =
-                    futures::future::try_join(read(before), self.blob(repo, &after)).await?;
-                Ok::<_, Error>(ContentPair { path, old, new })
+                let sides = futures::future::try_join(read(before), read_new(after)).await;
+                (path, sides)
             })
             .buffered(BLOB_CONCURRENCY / 2)
-            .try_collect()
-            .await?;
-        Ok(git::diff_contents(&pairs, context, inter_hunk_context))
+            .collect()
+            .await;
+        let mut pairs = Vec::new();
+        for (path, sides) in read_pairs {
+            match sides {
+                Ok((old, new)) => pairs.push(ContentPair { path, old, new }),
+                Err(ReadTextError::NotUtf8(e)) => {
+                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
+                }
+                Err(ReadTextError::Read(e)) => return Err(e.context(path)),
+            }
+        }
+        git::diff_contents(&pairs, context, inter_hunk_context)
     }
 
     pub async fn submit_review(
@@ -475,7 +487,7 @@ impl Client {
         match finished {
             Ok(url) => Ok(url),
             Err(error) => {
-                if let Err(e) = self
+                match self
                     .rest
                     ._delete(
                         with_segments(&reviews, &[&pending.id.to_string()]).as_str(),
@@ -483,12 +495,14 @@ impl Client {
                     )
                     .await
                 {
-                    tracing::warn!(
-                        "could not delete pending review {} after the failed submit: {e}",
-                        pending.id
-                    );
+                    Ok(_) => Err(error.into()),
+                    Err(e) => Err(error
+                        .context(format!(
+                            "the submit failed, and deleting its pending review {} failed too: {e}",
+                            pending.id
+                        ))
+                        .into()),
                 }
-                Err(error.into())
             }
         }
     }

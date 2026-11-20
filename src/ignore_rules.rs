@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use anyhow::Context;
+
 use crate::Error;
 use crate::files::Files;
 use crate::git::AboveSource;
@@ -41,10 +43,10 @@ impl Ignore {
     ) -> Result<Ignore, Error> {
         let mut by_dir: HashMap<String, Vec<Spec>> = HashMap::new();
         for file in &above.ignore_files {
-            by_dir
-                .entry(file.directory.clone())
-                .or_default()
-                .push(Spec::from_bytes(&file.contents));
+            by_dir.entry(file.directory.clone()).or_default().push(
+                Spec::from_bytes(&file.contents)
+                    .with_context(|| format!("an ignore file in {:?}", file.directory))?,
+            );
         }
         let mut found: Vec<String> = files
             .paths()?
@@ -61,7 +63,10 @@ impl Ignore {
             by_dir
                 .entry(directory_of(&full).to_string())
                 .or_default()
-                .push(Spec::from_bytes(&files.read(&path).await?));
+                .push(
+                    Spec::from_lines(files.read_text(&path).await?.lines())
+                        .with_context(|| path.clone())?,
+                );
         }
         Ok(Ignore {
             prefix: above.prefix.clone(),

@@ -29,14 +29,16 @@ fn language_name(language: Language) -> &'static str {
 fn files_tile_into_the_captured_ranges() {
     for name in ["sample.py", "sample.rs", "script.sh"] {
         let directory = fixtures().join("states");
-        let source = std::fs::read(directory.join(name)).unwrap();
+        let source = std::fs::read_to_string(directory.join(name)).unwrap();
         let expected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join(format!("{name}.json"))).unwrap())
                 .unwrap();
         let found: serde_json::Map<String, serde_json::Value> = languages::detect(name, &source)
             .into_iter()
             .map(|language| {
-                let languages::Syntax::Valid(ranges) = languages::ranges(language, &source) else {
+                let languages::Syntax::Valid(ranges) =
+                    languages::ranges(language, source.as_bytes())
+                else {
                     panic!("{name} is not valid {}", language_name(language));
                 };
                 let ranges = ranges

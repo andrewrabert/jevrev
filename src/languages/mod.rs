@@ -165,7 +165,7 @@ static SHEBANGS: LazyLock<Vec<(Language, Vec<regex::Regex>)>> = LazyLock::new(||
     ]
 });
 
-pub fn detect(name: &str, source: &[u8]) -> BTreeSet<Language> {
+pub fn detect(name: &str, source: &str) -> BTreeSet<Language> {
     let file_name = name.rsplit('/').next().unwrap_or(name);
     let mut found = BTreeSet::new();
     if matches!(file_name, "justfile" | "Justfile" | ".justfile") {
@@ -189,12 +189,11 @@ pub fn detect(name: &str, source: &[u8]) -> BTreeSet<Language> {
         }
         _ => {}
     }
-    let first_bytes = source.split(|b| *b == b'\n').next().unwrap_or_default();
-    let first = String::from_utf8_lossy(first_bytes);
+    let first = source.lines().next().unwrap_or_default();
     found.extend(
         SHEBANGS
             .iter()
-            .filter(|(_, patterns)| patterns.iter().any(|p| p.is_match(&first)))
+            .filter(|(_, patterns)| patterns.iter().any(|p| p.is_match(first)))
             .map(|(language, _)| *language),
     );
     found

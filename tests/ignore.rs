@@ -32,7 +32,7 @@ async fn ignore_files_apply_with_dot_ignore_winning() {
     ]);
     let ignore = Ignore::load(
         &source,
-        vec![Spec::from_bytes(b"secret.txt\n")],
+        vec![Spec::from_bytes(b"secret.txt\n").unwrap()],
         &AboveSource::default(),
     )
     .await

@@ -4,14 +4,13 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
 use clap::builder::{OsStringValueParser, TypedValueParser};
 
 use crate::files::{Files, OnDisk, OneFile};
 use crate::git::{
-    self, AboveSource, CommitFiles, DiffBase, DiffRange, GitDiff, GitDiffSpec, GitRepo, GitRev,
+    AboveSource, CommitFiles, DiffBase, DiffRange, GitDiff, GitDiffSpec, GitRepo, GitRev,
     GitRevision, IgnoredFiles, LocalSelection, ReadFrom,
 };
 use crate::github::api;
@@ -27,8 +26,6 @@ use crate::jev::{
 use crate::scan::{self, Changes, Concurrency, IgnoreRules, ScanError, ScanScope};
 use crate::store::{self, Finding, GithubSelection, Judgment, Review, Source, Stored, Verdict};
 use crate::{Error, output};
-
-const JEV_SCAN_TIMEOUT: u64 = 600;
 
 const EXIT_CLEAN: u8 = 0;
 const EXIT_FINDINGS: u8 = 1;
@@ -70,13 +67,6 @@ EXIT STATUS:
   0  No findings, or --exit-zero
   1  Findings
   2  Any error"
-    )
-}
-
-fn scan_notes() -> String {
-    format!(
-        "A scan fails once it has run {} minutes.",
-        JEV_SCAN_TIMEOUT / 60
     )
 }
 
@@ -130,7 +120,6 @@ struct Cli {
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Run jev over a file, or a directory's files, on disk, whether or not it is in a git repository; print its findings and summary, and save them to a new review file given --review
-    #[command(after_help = scan_notes())]
     Scan {
         /// File or directory to scan, symlinks followed; findings are relative to the directory, or the file's own; a file is scanned even when an ignore file matches it
         #[arg(value_name = "PATH")]
@@ -146,7 +135,6 @@ enum Command {
     },
     /// Run jev over a git directory at a revision, or over a diff; print its findings and summary, and save them to a new review file given --review
     #[command(
-        after_help = scan_notes(),
         group(clap::ArgGroup::new("selection").required(true).multiple(false).args(["rev", "diff"]))
     )]
     ScanGit {
@@ -170,7 +158,6 @@ enum Command {
     },
     /// Run jev over a GitHub repo, through the GitHub API; print its findings and summary, and save them to a new review file given --review
     #[command(
-        after_help = scan_notes(),
         group(clap::ArgGroup::new("selection").multiple(false).args(["rev", "diff", "pr"]))
     )]
     ScanGithub {
@@ -372,12 +359,6 @@ fn shown(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn print(text: &str) {
-    let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(text.as_bytes());
-    let _ = stdout.flush();
-}
-
 fn review_path<'a>(file: Option<&'a Path>, command: &str) -> Result<&'a Path, Error> {
     file.ok_or_else(|| anyhow!("{command}: give --review"))
 }
@@ -520,15 +501,11 @@ async fn run_jev_scan(
         let reviewed = scan::review(&scanned, &scan.client, scan.concurrency).await?;
         Ok::<_, ScanError>((scanned, reviewed))
     };
-    let (scanned, reviewed) =
-        match tokio::time::timeout(Duration::from_secs(JEV_SCAN_TIMEOUT), run).await {
-            Err(_) => {
-                bail!("jev-scan ran longer than {JEV_SCAN_TIMEOUT} seconds");
-            }
-            Ok(Err(ScanError::Jev(text))) => bail!("jev-scan: {text}"),
-            Ok(Err(ScanError::Source(error))) => return Err(error),
-            Ok(Ok(done)) => done,
-        };
+    let (scanned, reviewed) = match run.await {
+        Err(ScanError::Jev(text)) => bail!("jev-scan: {text}"),
+        Err(ScanError::Source(error)) => return Err(error),
+        Ok(done) => done,
+    };
     if !reviewed.failures.is_empty() {
         bail!(
             "jev-scan: {} jev requests failed:\n{}",
@@ -556,12 +533,13 @@ fn save_new(path: &Path, review: &Review) -> Result<(), Error> {
             }
             _ => anyhow!("{}: {e}", shown(path)),
         })?;
-    store::open(path, |store| store.save(review)).inspect_err(|_| {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!(
-                "could not remove {} after the failed save: {e}",
+    store::open(path, |store| store.save(review)).map_err(|error| {
+        match std::fs::remove_file(path) {
+            Ok(()) => error,
+            Err(e) => error.context(format!(
+                "the save failed, and removing the partial {} failed too: {e}",
                 shown(path)
-            );
+            )),
         }
     })
 }
@@ -608,8 +586,8 @@ async fn local_ignore(
     at: ReadFrom<'_>,
 ) -> Result<IgnoreRules, Error> {
     let (above, excludes) = match repo {
-        Some(repo) => (repo.ignore_files_above(at)?, repo.excludes()),
-        None => (AboveSource::default(), git::global_excludes()),
+        Some(repo) => (repo.ignore_files_above(at)?, repo.excludes()?),
+        None => (AboveSource::default(), vec![Spec::global()?]),
     };
     Ok(IgnoreRules::Apply(
         Ignore::load(files, excludes, &above).await?,
@@ -664,7 +642,7 @@ async fn cmd_scan_git(
     diff: Option<&GitDiffSpec>,
     no_ignore: bool,
 ) -> Result<u8, Error> {
-    let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let root = std::fs::canonicalize(dir).with_context(|| shown(dir))?;
     if !root.is_dir() {
         bail!("{} is not a directory", shown(dir));
     }
@@ -794,7 +772,7 @@ async fn cmd_scan_github(
         IgnoreRules::Off
     } else {
         IgnoreRules::Apply(
-            Ignore::load(&files, vec![Spec::global()], &AboveSource::default()).await?,
+            Ignore::load(&files, vec![Spec::global()?], &AboveSource::default()).await?,
         )
     };
     let name = format!("{}/{}", repo.host(), repo.name());
@@ -823,13 +801,13 @@ async fn cmd_submit_github(file: Option<&Path>, token: &Token) -> Result<(), Err
     };
     let client = api::Client::new(repo.host(), token)?;
     let url = client.submit_review(repo, pr, &review).await?;
-    print(&format!("{url}\n"));
+    writeln!(std::io::stdout(), "{url}")?;
     Ok(())
 }
 
 fn cmd_pending(file: Option<&Path>) -> Result<(), Error> {
     let review = with_review(review_path(file, "pending")?, |_, review| Ok(review))?;
-    print(&output::pending_lines(&review));
+    write!(std::io::stdout(), "{}", output::pending_lines(&review))?;
     Ok(())
 }
 
@@ -856,7 +834,7 @@ fn judge(
         });
         store.save(&review)
     })?;
-    print(&format!("Finding {index} {verdict}\n"));
+    writeln!(std::io::stdout(), "Finding {index} {verdict}")?;
     Ok(())
 }
 
@@ -866,7 +844,7 @@ fn cmd_show(file: Option<&Path>, format: Format) -> Result<(), Error> {
         Format::Json => output::review_json(&review),
         Format::Md => output::review_markdown(&review),
     };
-    print(&format!("{text}\n"));
+    writeln!(std::io::stdout(), "{text}")?;
     Ok(())
 }
 
@@ -946,7 +924,6 @@ async fn run(cli: Cli) -> Result<u8, Error> {
 }
 
 pub async fn main() -> ExitCode {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::from(cli.log_level))
@@ -954,6 +931,13 @@ pub async fn main() -> ExitCode {
         .with_target(false)
         .without_time()
         .init();
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("error: another TLS crypto provider is already installed");
+        return ExitCode::from(EXIT_ERROR);
+    }
     match run(cli).await {
         Ok(status) => ExitCode::from(status),
         Err(e) => {
