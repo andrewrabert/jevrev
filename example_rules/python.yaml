@@ -10,7 +10,6 @@ when:
     language: [python]
 error_threshold: 0.75
 rules:
-  # --- Errors ---------------------------------------------------------------------------------------
   - flags: Added Tornado handler code writes an HTTP error response in place and returns, instead of raising an error that the handler's exception hook renders.
     good:
       - >-
@@ -180,7 +179,6 @@ rules:
         ToolExecutionError(problem.detail), ToolExecutionError(e.response.body.decode()), or an f-string that
         puts error.message, detail or faults into the text the MCP client gets.
 
-  # --- Models and validation ------------------------------------------------------------------------
   - flags: An added pydantic field is declared optional with T | None = None, or a list holds Model | None, when the value is always present or a missing value must be an error.
     good:
       - >-
@@ -364,7 +362,6 @@ rules:
         return datetime.datetime.now(datetime.UTC) + self._value, does a conversion that builds a new object,
         or calls the network.
 
-  # --- Configuration, dependencies and layering ----------------------------------------------------
   - flags: Added code builds a URL from a hardcoded Aardwolf host instead of reading the host from configuration.
     good:
       - >-
@@ -463,7 +460,6 @@ rules:
         to read BYDAY or BYHOUR instead of dateutil.rrule.rrulestr; manual slicing of ISO datetimes instead of
         datetime.datetime.fromisoformat.
 
-  # --- Tool behavior --------------------------------------------------------------------------------
   - flags: One added tool call makes two separate mutating upstream calls, so a failure of the second leaves the first change applied while the tool reports an error.
     good:
       - >-
@@ -485,7 +481,6 @@ rules:
         if not meapi_ids: return {}, if not ids: return [] or a similar guard at the top of a function whose
         following batch request, loop or comprehension also works for the empty case.
 
-  # --- Comments, docs and naming --------------------------------------------------------------------
   - flags: An added comment or docstring sentence only says again what the nearby code or test assertions already show.
     good:
       - >-

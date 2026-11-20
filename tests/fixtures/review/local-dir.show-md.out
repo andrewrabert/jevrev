@@ -1,0 +1,93 @@
+---
+source:
+  path: /srv/jevrev fixtures/dir
+findings: 4
+confirmed: 3
+rejected: 1
+metadata:
+  "123": v
+  "No": "No"
+  "OFF": "OFF"
+  "True": "True"
+  "a: b": v
+  amp: "&a"
+  at: "@a"
+  bang: "!a"
+  bell: "bell\a"
+  blank-lines: |
+    line1
+
+    line3
+  bom: "\uFEFF"
+  braces: "{a}"
+  brackets: "[a]"
+  colon: "a: b"
+  comma: a,b
+  crlf: "a\r\nb"
+  dash: '-'
+  date: "2024-01-01"
+  dot: ".5"
+  double: "\"dq\""
+  emoji: 😀
+  empty: ""
+  equals: "="
+  exp: "1e3"
+  float: "1.0"
+  gt: ">a"
+  hash: "a #b"
+  hex: "0x1F"
+  key with space: v
+  lead: " lead"
+  leading-hash: "#a"
+  line-separator: "a\Lb"
+  long-mixed: >-
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbb
+  long-word: >-
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  long-words: >-
+    word word word word word word word word word word word word word word word word
+    word word word word word word word word word word word word word word
+  merge: "<<"
+  multi: |-
+    multi
+    line
+  nbsp: a b
+  nel: "a\Nb"
+  "null": "null"
+  octal: "017"
+  "on": "on"
+  percent: "%a"
+  pipe: a|b
+  plain: value
+  plus: "+1"
+  question: ?a
+  sexagesimal: "1:20"
+  single: "'q'"
+  space: " "
+  star: "*a"
+  tab: "tab\there"
+  tick: "`a"
+  tilde: "~"
+  trail: "trail "
+  "true": v
+  underscore: "1_000"
+  unicode: é ü 日本
+  "y": "y"
+  "yes": "yes"
+  é-key: v
+include:
+- "*.py"
+- src/
+exclude:
+- "!keep"
+- "#x"
+---
+
+### Added code swallows an error.
+
+- README.md:1-40
+- src/app.py:3-9
+
+### Tab	here and "quotes".
+
+- lib/ü.rs:5-6

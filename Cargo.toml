@@ -1,0 +1,51 @@
+[package]
+name = "jevrev"
+version = "0.1.0-dev"
+edition = "2024"
+description = "Run jev over a directory or a GitHub pull request, judge its findings, and print the review or post it on the pull request"
+publish = false
+
+[dependencies]
+anstream = { version = "1", default-features = false, features = ["auto"] }
+anstyle = "1"
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+flate2 = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+gix = { version = "0.90", default-features = false, features = ["blob-diff", "dirwalk", "revision", "sha1"] }
+http = "1"
+http-body-util = "0.1"
+ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+minijinja = { version = "3", features = ["serde"] }
+nutype = { version = "0.8", features = ["regex", "serde"] }
+octocrab = { version = "0.54", default-features = false, features = ["default-client", "follow-redirect", "rustls", "rustls-ring", "timeout"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+reqwest-middleware = { version = "0.5", default-features = false }
+reqwest-retry = { version = "0.9", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "serialize"] }
+strum = { version = "0.28", features = ["derive"] }
+tar = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tree-sitter = "0.27"
+tree-sitter-bash = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+url = { version = "2", features = ["serde"] }
+validator = { version = "0.21", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[build-dependencies]
+vergen-gix = { version = "10", features = ["emit_and_set"] }

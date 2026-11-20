@@ -1,0 +1,252 @@
+[
+ {
+  "file": "app.py",
+  "start": 1,
+  "end": 6,
+  "kind": "file",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -0,0 +1,6 @@\n+def a():\n+    return 1\n+\n+\n+def c():\n+    return 3"
+ },
+ {
+  "file": "app.py",
+  "start": 1,
+  "end": 6,
+  "kind": "hunk",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n-def a(:\n+def a():\n     return 1\n \n \n def c():\n     return 3"
+ },
+ {
+  "file": "app.py",
+  "start": 1,
+  "end": 6,
+  "kind": "hunks",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,6 +1,6 @@\n-def a(:\n+def a():\n     return 1\n \n \n def c():\n     return 3"
+ },
+ {
+  "file": "app.py",
+  "start": 1,
+  "end": 2,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -0,0 +1,2 @@\n+def a():\n+    return 1"
+ },
+ {
+  "file": "app.py",
+  "start": 5,
+  "end": 6,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -0,0 +5,2 @@\n+def c():\n+    return 3"
+ },
+ {
+  "file": "broken.py",
+  "start": 1,
+  "end": 2,
+  "kind": "file",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/broken.py b/broken.py\n--- a/broken.py\n+++ b/broken.py\n@@ -0,0 +1,2 @@\n+def ok(:\n+    return 1"
+ },
+ {
+  "file": "broken.py",
+  "start": 1,
+  "end": 2,
+  "kind": "hunk",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/broken.py b/broken.py\n--- a/broken.py\n+++ b/broken.py\n-def ok():\n+def ok(:\n     return 1"
+ },
+ {
+  "file": "broken.py",
+  "start": 1,
+  "end": 2,
+  "kind": "hunks",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/broken.py b/broken.py\n--- a/broken.py\n+++ b/broken.py\n@@ -1,2 +1,2 @@\n-def ok():\n+def ok(:\n     return 1"
+ },
+ {
+  "file": "lib.rs",
+  "start": 1,
+  "end": 18,
+  "kind": "file",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -0,0 +1,18 @@\n+pub fn one() -> u32 {\n+    1\n+}\n+\n+pub fn two() -> u32 {\n+    2\n+}\n+\n+pub fn three() -> u32 {\n+    3\n+}\n+\n+#[cfg(test)]\n+mod tests {\n+    #[test]\n+    fn t() {}\n+    fn u() {}\n+}"
+ },
+ {
+  "file": "lib.rs",
+  "start": 1,
+  "end": 18,
+  "kind": "hunk",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n pub fn one() -> u32 {\n-    0\n+    1\n }\n \n-#[must_use]\n pub fn two() -> u32 {\n     2\n }\n \n-fn gone() {}\n-\n pub fn three() -> u32 {\n     3\n }\n \n #[cfg(test)]\n mod tests {\n     #[test]\n     fn t() {}\n+    fn u() {}\n }"
+ },
+ {
+  "file": "lib.rs",
+  "start": 1,
+  "end": 18,
+  "kind": "hunks",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1,20 +1,18 @@\n pub fn one() -> u32 {\n-    0\n+    1\n }\n \n-#[must_use]\n pub fn two() -> u32 {\n     2\n }\n \n-fn gone() {}\n-\n pub fn three() -> u32 {\n     3\n }\n \n #[cfg(test)]\n mod tests {\n     #[test]\n     fn t() {}\n+    fn u() {}\n }"
+ },
+ {
+  "file": "lib.rs",
+  "start": 1,
+  "end": 3,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -0,0 +1,3 @@\n+pub fn one() -> u32 {\n+    1\n+}"
+ },
+ {
+  "file": "lib.rs",
+  "start": 5,
+  "end": 7,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -0,0 +5,3 @@\n+pub fn two() -> u32 {\n+    2\n+}"
+ },
+ {
+  "file": "new.sh",
+  "start": 1,
+  "end": 7,
+  "kind": "file",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +1,7 @@\n+#!/bin/sh\n+set -e\n+\n+f() {\n+  echo hi\n+}\n+f"
+ },
+ {
+  "file": "new.sh",
+  "start": 1,
+  "end": 7,
+  "kind": "hunk",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n+#!/bin/sh\n+set -e\n+\n+f() {\n+  echo hi\n+}\n+f"
+ },
+ {
+  "file": "new.sh",
+  "start": 1,
+  "end": 7,
+  "kind": "hunks",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +1,7 @@\n+#!/bin/sh\n+set -e\n+\n+f() {\n+  echo hi\n+}\n+f"
+ },
+ {
+  "file": "new.sh",
+  "start": 1,
+  "end": 1,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +1,1 @@\n+#!/bin/sh"
+ },
+ {
+  "file": "new.sh",
+  "start": 2,
+  "end": 2,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +2,1 @@\n+set -e"
+ },
+ {
+  "file": "new.sh",
+  "start": 4,
+  "end": 6,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +4,3 @@\n+f() {\n+  echo hi\n+}"
+ },
+ {
+  "file": "new.sh",
+  "start": 7,
+  "end": 7,
+  "kind": "language",
+  "sets": [
+   "all.yaml",
+   "lang.yaml"
+  ],
+  "render": "diff --git a/new.sh b/new.sh\n--- a/new.sh\n+++ b/new.sh\n@@ -0,0 +7,1 @@\n+f"
+ },
+ {
+  "file": "notes.txt",
+  "start": 1,
+  "end": 2,
+  "kind": "file",
+  "sets": [
+   "all.yaml"
+  ],
+  "render": "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -0,0 +1,2 @@\n+one\n+2"
+ },
+ {
+  "file": "notes.txt",
+  "start": 1,
+  "end": 2,
+  "kind": "hunk",
+  "sets": [
+   "all.yaml"
+  ],
+  "render": "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n one\n-two\n+2"
+ },
+ {
+  "file": "notes.txt",
+  "start": 1,
+  "end": 2,
+  "kind": "hunks",
+  "sets": [
+   "all.yaml"
+  ],
+  "render": "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+2"
+ }
+]

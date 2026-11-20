@@ -1,0 +1,2 @@
+{"accepted":"","end":12,"file":"src/app.py","flags":"A constant has no name.\nSecond line, with é.","index":2,"probability":0.7,"rule":"python.yaml#2","start":12,"state":"language","violation":""}
+{"accepted":"y","end":6,"file":"lib/ü.rs","flags":"Bell \u0007 and unit separator \u001f.","index":4,"probability":0.75,"rule":"standards.yaml#10","start":5,"state":"language","violation":"x"}
