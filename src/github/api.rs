@@ -17,12 +17,13 @@ use crate::files::{InMemory, ReadTextError};
 use crate::git::{self, ContentPair, Diff, GitObjectId, GitRevision, Side};
 use crate::github::credentials::Token;
 use crate::github::pull_request::{GithubPullRequest, PullRequest, User};
-use crate::github::repo::{DEFAULT_HOST, GithubHost, GithubRepo};
+use crate::github::repo::{GithubHost, GithubRepo};
 use crate::github::review;
 use crate::ignore_rules::Ignore;
 use crate::source_path::{SourcePath, SourcePathError};
 use crate::store::{Finding, Review};
 
+const DEFAULT_HOST: &str = "github.com";
 const DEFAULT_API: &str = "https://api.github.com";
 
 const ADD_THREAD: &str = "
@@ -56,6 +57,7 @@ pub enum SubmitError {
 
 #[derive(Clone)]
 pub struct Client {
+    host: GithubHost,
     rest: Octocrab,
     graphql: Octocrab,
     rest_base: url::Url,
@@ -213,7 +215,11 @@ fn with_segments(url: &url::Url, segments: &[&str]) -> url::Url {
 }
 
 impl Client {
-    pub fn new(host: &GithubHost, token: &Token) -> Result<Client, Error> {
+    pub fn new(host: Option<GithubHost>, token: &Token) -> Result<Client, Error> {
+        let host = match host {
+            Some(host) => host,
+            None => GithubHost::try_new(DEFAULT_HOST)?,
+        };
         let (rest, graphql) = if host.as_str() == DEFAULT_HOST {
             let api = url::Url::parse(DEFAULT_API).expect("a valid URL");
             (api.clone(), api)
@@ -236,10 +242,15 @@ impl Client {
                 .map_err(|e| failed("GitHub client", e))
         };
         Ok(Client {
+            host,
             rest: build(&rest)?,
             graphql: build(&graphql)?,
             rest_base: rest,
         })
+    }
+
+    pub fn host(&self) -> &GithubHost {
+        &self.host
     }
 
     fn route(&self, repo: &GithubRepo, segments: &[&str]) -> url::Url {

@@ -787,7 +787,7 @@ async fn cmd_submit_github(file: Option<&Path>, token: &Token) -> Result<(), Err
     else {
         bail!("The review is not of a GitHub pull request.");
     };
-    let client = api::Client::new(repo.host(), token)?;
+    let client = api::Client::new(Some(repo.host().clone()), token)?;
     let url = client.submit_review(repo, pr, &review).await?;
     writeln!(std::io::stdout(), "{url}")?;
     Ok(())
@@ -877,17 +877,15 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             ..
         } => {
             let scan = scan.resolve(file, &environment)?;
-            let repo = GithubRepo::new(
-                github_host
-                    .or_else(|| environment.github_host.clone())
-                    .unwrap_or_default(),
-                github,
-            );
-            let github = api::Client::new(repo.host(), &github_token(token)?)?;
+            let client = api::Client::new(
+                github_host.or_else(|| environment.github_host.clone()),
+                &github_token(token)?,
+            )?;
+            let repo = GithubRepo::new(client.host().clone(), github);
             cmd_scan_github(
                 scan,
                 &repo,
-                &github,
+                &client,
                 rev.as_ref(),
                 diff.as_ref(),
                 pr,

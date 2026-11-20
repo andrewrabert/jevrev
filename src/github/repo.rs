@@ -9,8 +9,6 @@ const HOST_PATTERN: &str = r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]
 static HOST: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(HOST_PATTERN).expect("a valid host pattern"));
 
-pub const DEFAULT_HOST: &str = "github.com";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubHost {
     text: String,
@@ -40,12 +38,6 @@ impl GithubHost {
 
     pub fn url(&self) -> &url::Url {
         &self.url
-    }
-}
-
-impl Default for GithubHost {
-    fn default() -> GithubHost {
-        GithubHost::try_new(DEFAULT_HOST).expect("the default host is valid")
     }
 }
 
