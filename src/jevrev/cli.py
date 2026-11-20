@@ -8,7 +8,7 @@ import collections.abc
 import contextlib
 import enum
 import json
-import math
+import logging
 import os
 import pathlib
 import sys
@@ -36,7 +36,7 @@ import jevrev.templates
 
 # Seconds a jev scan may run.
 _JEV_SCAN_TIMEOUT = 600
-# Requests to jev a scan has open at once.
+# Requests to jev a scan has open at once, unless -c gives another number.
 _JEV_SCAN_CONCURRENCY = 8
 
 # Lines of context around each change in a pull request's diff on GitHub,
@@ -51,6 +51,16 @@ _EXIT_CLEAN = 0
 _EXIT_FINDINGS = 1
 _EXIT_ERROR = 2
 
+# Below logging.DEBUG, as tracing's TRACE is below its DEBUG.
+_TRACE = 5
+logging.addLevelName(_TRACE, "TRACE")
+logging.addLevelName(logging.WARNING, "WARN")
+
+_log = logging.getLogger(__name__)
+
+_RULES = "JEVREV_RULES"
+_GITHUB_TOKEN = "GITHUB_TOKEN"
+
 
 class UserError(Exception):
     pass
@@ -59,6 +69,24 @@ class UserError(Exception):
 class Format(enum.StrEnum):
     JSON = "json"
     MD = "md"
+
+
+class LogLevel(enum.StrEnum):
+    ERROR = "error"
+    WARN = "warn"
+    INFO = "info"
+    DEBUG = "debug"
+    TRACE = "trace"
+
+    @property
+    def level(self) -> int:
+        return {
+            LogLevel.ERROR: logging.ERROR,
+            LogLevel.WARN: logging.WARNING,
+            LogLevel.INFO: logging.INFO,
+            LogLevel.DEBUG: logging.DEBUG,
+            LogLevel.TRACE: _TRACE,
+        }[self]
 
 
 def _review_path(args) -> pathlib.Path:
@@ -86,7 +114,12 @@ def _save_new(path: pathlib.Path, review: jevrev.store.Review):
         with jevrev.store.open_review(path) as store:
             store.save(review)
     except BaseException:
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            _log.warning(
+                "could not remove %s after the failed save: %s", path, e
+            )
         raise
 
 
@@ -103,12 +136,12 @@ def _judged_review(args) -> jevrev.store.Review:
 
 
 def _rules(args) -> list[pathlib.Path]:
-    """--rules, or JEV_RULES when no --rules is given."""
+    """--rules, or JEVREV_RULES when no --rules is given."""
     rules = args.rules
     if rules is None:
-        rules = jevrev.settings.load_settings().rules
+        rules = args.settings.rules or []
     if not rules:
-        raise UserError("Give --rules or set JEV_RULES.")
+        raise UserError(f"Give --rules or set {_RULES}.")
     return rules
 
 
@@ -126,7 +159,7 @@ def _scan_metadata(args) -> dict[str, str]:
 
 def _jev_client(args) -> jevrev.jev.api.Client:
     """A client from the TypeSafe flags, each falling back to its setting."""
-    settings = jevrev.settings.load_settings()
+    settings: jevrev.settings.Settings = args.settings
     api_key = args.api_key
     if api_key is None and settings.api_key is not None:
         api_key = settings.api_key.get_secret_value()
@@ -185,7 +218,8 @@ async def _scan_and_save(
         rules=_rules(args),
         name=name,
         client=_jev_client(args),
-        model=args.model or jevrev.settings.load_settings().default_model,
+        model=args.model or args.settings.default_model,
+        concurrency=args.concurrency,
     )
     review = jevrev.store.Review(
         source=source,
@@ -316,10 +350,14 @@ async def _cmd_scan_git(args):
     )
 
 
-async def _github_client(host: str) -> jevrev.github.api.Client:
-    return jevrev.github.api.Client(
-        host=host, token=await jevrev.github.api.token(host)
-    )
+def _github_client(args, host: str) -> jevrev.github.api.Client:
+    """A client of host with --github-token, else GITHUB_TOKEN."""
+    token = args.github_token
+    if token is None and args.settings.github_token is not None:
+        token = args.settings.github_token.get_secret_value()
+    if token is None:
+        raise UserError(f"Give --github-token or set {_GITHUB_TOKEN}.")
+    return jevrev.github.api.Client(host=host, token=token)
 
 
 async def _github_selection(
@@ -353,14 +391,17 @@ async def _github_selection(
 
 
 async def _cmd_scan_github(args):
-    """Review a GitHub repo through the GitHub API on the host GH_HOST names."""
+    """Review a GitHub repo through the GitHub API on the host --github-host or GITHUB_HOST
+    names."""
     metadata = _scan_metadata(args)
     if args.diff is not None and args.diff.head is None:
         raise UserError(
             "--diff: give A..B or A...B; a GitHub repo has no files on disk"
         )
-    repo: jevrev.github.repo.GithubRepo = args.github
-    async with await _github_client(repo.host) as client:
+    repo = jevrev.github.repo.GithubRepo(
+        host=args.github_host or args.settings.github_host, name=args.github
+    )
+    async with _github_client(args, repo.host) as client:
         selection = await _github_selection(args, client=client, repo=repo)
         diff = None
         if isinstance(selection, jevrev.git.GitRev):
@@ -383,7 +424,7 @@ async def _cmd_scan_github(args):
             args,
             metadata=metadata,
             source=jevrev.store.GithubRepo(**repo.model_dump(), git=selection),
-            name=f"{repo.host}/{repo.org}/{repo.name}",
+            name=f"{repo.host}/{repo.name}",
             files=files,
             ignore=ignore,
             diff=diff,
@@ -401,6 +442,7 @@ async def _run_jev_scan(
     name: str,
     client: jevrev.jev.api.Client,
     model: str,
+    concurrency: int,
 ):
     """Run jev-scan on files against the rule sets under each directory of rules: its
     findings, and its summary line. Fails if any jev request fails."""
@@ -417,7 +459,7 @@ async def _run_jev_scan(
             )
             found, failures = await jevrev.jev.scan.review(
                 scanned=scanned,
-                concurrency=_JEV_SCAN_CONCURRENCY,
+                concurrency=concurrency,
                 verbose=False,
                 client=client,
                 model=model,
@@ -508,7 +550,7 @@ async def _cmd_submit_github(args):
         print("No confirmed findings; no GitHub review submitted.")
         return
     pr = source.git
-    async with await _github_client(source.host) as client:
+    async with _github_client(args, source.host) as client:
         pull_request = await client.pull_request(source, pr.number)
         user = await client.current_user()
         diff = await client.diff(
@@ -729,11 +771,6 @@ def _pr_review(
     )
 
 
-def _path_list(value: str) -> list[pathlib.Path]:
-    """The ':'-separated directories of value, empty entries left out."""
-    return [pathlib.Path(entry) for entry in value.split(":") if entry]
-
-
 def _base_url(value: str) -> yarl.URL:
     try:
         url = yarl.URL(value)
@@ -750,12 +787,30 @@ def _timeout(value: str) -> float:
     try:
         timeout = float(value)
     except ValueError:
-        timeout = math.nan
+        timeout = float("nan")
     if not timeout > 0:
         raise argparse.ArgumentTypeError(
             f"{json.dumps(value)} is not a positive number"
         )
     return timeout
+
+
+def _not_empty(what: str):
+    def parse(value: str) -> str:
+        if not value:
+            raise argparse.ArgumentTypeError(f"the {what} is empty")
+        return value
+
+    return parse
+
+
+def _github_host(value: str) -> str:
+    if not jevrev.github.repo.HOST.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"host: {json.dumps(value)} does not match "
+            f"{jevrev.github.repo.HOST.pattern}"
+        )
+    return value
 
 
 def _metadata(value: str) -> tuple[str, str]:
@@ -783,20 +838,11 @@ def _git_revision(value) -> jevrev.git.GitRevision:
         raise argparse.ArgumentTypeError(f"{value!r} is not a revision") from e
 
 
-def _github_repo(value) -> jevrev.github.repo.GithubRepo:
-    """ORG/NAME, on the host GH_HOST names."""
-    org, slash, name = value.partition("/")
-    if not slash:
-        raise argparse.ArgumentTypeError(f"{value}: expected ORG/NAME")
+def _github_repo(value) -> jevrev.github.repo.GithubRepoName:
     try:
-        return jevrev.github.repo.GithubRepo(
-            host=jevrev.github.api.host(), org=org, name=name
-        )
-    except pydantic.ValidationError as e:
-        problems = "; ".join(
-            problem["msg"] for problem in e.errors(include_url=False)
-        )
-        raise argparse.ArgumentTypeError(f"{value}: {problems}") from e
+        return jevrev.github.repo.GithubRepoName.parse(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def _git_diff_spec(value) -> jevrev.git.GitDiffSpec:
@@ -810,16 +856,17 @@ def _add_scan_arguments(parser):
     rules_group = parser.add_argument_group("rules")
     rules_group.add_argument(
         "--rules",
-        type=_path_list,
-        action="extend",
+        type=pathlib.Path,
+        action="append",
         metavar="DIR",
         help="Directory of rule sets jev-scan reviews against; repeat for "
-        "more directories, or give a ':'-separated list in JEV_RULES [env: "
-        "JEV_RULES]",
+        f"more directories; replaces {_RULES}, a list of directories in the "
+        f"system's path-list syntax [env: {_RULES}]",
     )
     api_group = parser.add_argument_group("typesafe")
     api_group.add_argument(
         "--api-key",
+        type=_not_empty("API key"),
         metavar="API_KEY",
         help="TypeSafe API key [env: TYPESAFE_API_KEY]",
     )
@@ -832,6 +879,7 @@ def _add_scan_arguments(parser):
     )
     api_group.add_argument(
         "--model",
+        type=_not_empty("model"),
         metavar="MODEL",
         help="Jev model to ask [env: TYPESAFE_DEFAULT_MODEL] [default: "
         f"{jevrev.jev.api.DEFAULT_MODEL}]",
@@ -843,6 +891,15 @@ def _add_scan_arguments(parser):
         help="Seconds each connection and read to the TypeSafe API may take; "
         "inf for no limit [env: TYPESAFE_TIMEOUT] [default: "
         f"{jevrev.settings.Settings.model_fields['timeout'].default:g}]",
+    )
+    api_group.add_argument(
+        "-c",
+        "--concurrency",
+        type=_positive_int,
+        default=_JEV_SCAN_CONCURRENCY,
+        metavar="N",
+        help="Most jev requests in flight at once [default: "
+        f"{_JEV_SCAN_CONCURRENCY}]",
     )
     ignore_group = parser.add_argument_group("ignore")
     ignore_group.add_argument(
@@ -909,18 +966,15 @@ review flow:
      jevrev --review FILE submit-github
      Post the confirmed findings on the pull request.
 
-Run `jevrev COMMAND --help` for each command's options."""
+Run `jevrev COMMAND --help` for each command's options.
+
+environment:
+  Every [env: NAME] a flag shows is read when the flag is not given. --env-file or
+  JEVREV_ENV_FILE names a dotenv file of those variables; a variable the environment sets
+  wins over the file. A missing, unreadable or malformed file is an error."""
 
 _SCAN_NOTES = (
-    "TYPESAFE_ENV_FILE may name a dotenv file of the TYPESAFE_ variables; "
-    "the environment's own values win. A scan fails once it has run "
-    f"{_JEV_SCAN_TIMEOUT // 60} minutes."
-)
-
-_GITHUB_SCAN_NOTES = (
-    f"{_SCAN_NOTES} The GitHub token is GH_TOKEN or GITHUB_TOKEN for "
-    "github.com, GH_ENTERPRISE_TOKEN or GITHUB_ENTERPRISE_TOKEN for another "
-    "host, or else `gh auth token`'s."
+    f"A scan fails once it has run {_JEV_SCAN_TIMEOUT // 60} minutes."
 )
 
 _PENDING_FIELDS = """\
@@ -961,7 +1015,41 @@ def _add_judge_arguments(parser, reason_help):
     parser.add_argument("reason", metavar="REASON", help=reason_help)
 
 
+def _add_github_token(parser):
+    parser.add_argument(
+        "--github-token",
+        type=_not_empty("GitHub token"),
+        metavar="GITHUB_TOKEN",
+        help=f"GitHub token [env: {_GITHUB_TOKEN}]",
+    )
+
+
+def _add_global_arguments(parser, default):
+    """The flags every command takes, before or after it; default is each one's default, which
+    a subparser's is argparse.SUPPRESS so it keeps the main parser's."""
+    parser.add_argument(
+        "--env-file",
+        type=pathlib.Path,
+        metavar="PATH",
+        default=default,
+        help="Dotenv file of the variables the flags read [env: "
+        f"{jevrev.settings.ENV_FILE}]",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=LogLevel,
+        choices=list(LogLevel),
+        default=LogLevel.WARN if default is None else default,
+        metavar="LEVEL",
+        help="Least severe level of the log written to stderr: "
+        + ", ".join(LogLevel)
+        + " [default: warn]",
+    )
+
+
 def _parser():
+    common = argparse.ArgumentParser(add_help=False)
+    _add_global_arguments(common, argparse.SUPPRESS)
     parser = argparse.ArgumentParser(
         prog="jevrev",
         description="Run jev over a directory or a GitHub pull request and "
@@ -983,6 +1071,7 @@ def _parser():
         "no FILE it created when the scan or its save fails; every other "
         "command requires it",
     )
+    _add_global_arguments(parser, None)
     subparsers = parser.add_subparsers(
         dest="command", required=True, metavar="COMMAND"
     )
@@ -994,6 +1083,7 @@ def _parser():
     )
     scan_parser = subparsers.add_parser(
         "scan",
+        parents=[common],
         help=description,
         description=description,
         epilog=_SCAN_NOTES,
@@ -1014,6 +1104,7 @@ def _parser():
     )
     scan_git_parser = subparsers.add_parser(
         "scan-git",
+        parents=[common],
         help=description,
         description=description,
         epilog=_SCAN_NOTES,
@@ -1044,15 +1135,16 @@ def _parser():
     _add_scan_arguments(scan_git_parser)
 
     description = (
-        "Run jev over a GitHub repo, through the GitHub API on the host "
-        "GH_HOST names (github.com when unset); print its findings and "
-        "summary, and save them to a new review file given --review"
+        "Run jev over a GitHub repo, through the GitHub API; print its "
+        "findings and summary, and save them to a new review file given "
+        "--review"
     )
     scan_github_parser = subparsers.add_parser(
         "scan-github",
         help=description,
         description=description,
-        epilog=_GITHUB_SCAN_NOTES,
+        epilog=_SCAN_NOTES,
+        parents=[common],
     )
     scan_github_parser.add_argument(
         "github",
@@ -1061,6 +1153,13 @@ def _parser():
         help="GitHub repo to scan; findings are relative to its top",
     )
     github_group = scan_github_parser.add_argument_group("github")
+    github_group.add_argument(
+        "--github-host",
+        type=_github_host,
+        metavar="GITHUB_HOST",
+        help="GitHub host [default: github.com] [env: GITHUB_HOST]",
+    )
+    _add_github_token(github_group)
     github_selection = github_group.add_mutually_exclusive_group()
     github_selection.add_argument(
         "--rev",
@@ -1089,6 +1188,7 @@ def _parser():
     )
     subparsers.add_parser(
         "pending",
+        parents=[common],
         help=description,
         description=description,
         epilog=_PENDING_FIELDS,
@@ -1098,6 +1198,7 @@ def _parser():
     description = "Confirm one finding without a verdict"
     confirm_parser = subparsers.add_parser(
         "confirm",
+        parents=[common],
         help=description,
         description=description,
         epilog=_JUDGE_NOTES,
@@ -1109,6 +1210,7 @@ def _parser():
     description = "Reject one finding without a verdict"
     reject_parser = subparsers.add_parser(
         "reject",
+        parents=[common],
         help=description,
         description=description,
         epilog=_JUDGE_NOTES,
@@ -1122,7 +1224,7 @@ def _parser():
         "finding has none"
     )
     show_parser = subparsers.add_parser(
-        "show", help=description, description=description
+        "show", help=description, description=description, parents=[common]
     )
     show_parser.add_argument(
         "--format",
@@ -1138,17 +1240,25 @@ def _parser():
         "request and print its URL, once every finding has a verdict; fails "
         "while any finding has none"
     )
-    subparsers.add_parser(
+    submit_parser = subparsers.add_parser(
         "submit-github",
         help=description,
         description=description,
         epilog=_SUBMIT_NOTES,
+        parents=[common],
     )
+    _add_github_token(submit_parser)
     return parser
 
 
 async def _main():
     args = _parser().parse_args()
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=args.log_level.level,
+        format="%(levelname)s %(message)s",
+    )
+    args.settings = jevrev.settings.load_settings(args.env_file)
     match args.command:
         case "scan":
             return await _cmd_scan(args)

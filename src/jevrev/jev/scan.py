@@ -9,6 +9,7 @@ import collections.abc
 import dataclasses
 import functools
 import json
+import logging
 import pathlib
 import sys
 import typing
@@ -28,6 +29,8 @@ import jevrev.rules
 import jevrev.state
 
 type Language = type[jevrev.languages.base.Language]
+
+_log = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -151,11 +154,13 @@ class UserError(Exception):
     pass
 
 
-def _text(file: ScanTargetFile, source: bytes) -> str:
+def _text(file: ScanTargetFile, source: bytes) -> str | None:
+    """source as text; None, logged at debug, when it is not UTF-8."""
     try:
         return source.decode()
     except UnicodeDecodeError as e:
-        raise UserError(f"{file.path} is not UTF-8 text: {e}") from e
+        _log.debug("skipping %s: not UTF-8 text: %s", file.path, e)
+        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -213,6 +218,11 @@ def _changed_ranges(
     try:
         before_ranges = language.states(before.text)
     except jevrev.languages.base.ParseError:
+        _log.info(
+            "%s: the old side does not parse as %s, so every range counts as touched",
+            change.path,
+            language.name,
+        )
         return after
     touched = {
         line.number
@@ -247,6 +257,12 @@ def _language_states(
     try:
         ranges = language.states(text)
     except jevrev.languages.base.ParseError:
+        _log.info(
+            "%s: does not parse as %s, so it has no %s states",
+            review.file.path,
+            language.name,
+            language.name,
+        )
         return []
     if change is not None:
         ranges = _changed_ranges(language, ranges, text, change)
@@ -531,6 +547,8 @@ async def scan_states(
         if review is None:
             continue
         text = _text(file, source)
+        if text is None:
+            continue
         states += _states(review, text, target.change(text))
     return states
 

@@ -3,6 +3,7 @@ with paths and line text decoded from git's bytes."""
 
 import asyncio
 import enum
+import logging
 import os
 import pathlib
 import typing
@@ -29,6 +30,8 @@ type GitRevision = typing.Annotated[
 # git diff's defaults: its indent heuristic is on unless diff.indentHeuristic turns it off.
 _DIFF_FLAGS = pygit2.enums.DiffOption.INDENT_HEURISTIC
 
+_log = logging.getLogger(__name__)
+
 
 class GitError(Exception):
     pass
@@ -41,6 +44,18 @@ def _is_utf8(text):
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _utf8_path(path: str) -> bool:
+    """Whether path, decoded with surrogateescape, was valid UTF-8; one that was not is logged
+    as skipped."""
+    if _is_utf8(path):
+        return True
+    _log.info(
+        "skipping %s: not a UTF-8 path",
+        path.encode(errors="surrogateescape"),
+    )
+    return False
 
 
 def _decode(raw: bytes) -> str:
@@ -291,7 +306,7 @@ class CommitFiles:
                     elif (
                         isinstance(entry, pygit2.Blob)
                         and entry.filemode not in _NOT_FILES
-                        and _is_utf8(path)
+                        and _utf8_path(path)
                     ):
                         found.append(path)
             return sorted(found)
@@ -379,14 +394,14 @@ class _Repo:
                 for full in jevrev.files.walk(self.top)
                 if full not in tracked
                 and (path := self.relative(full, pathspecs)) is not None
-                and _is_utf8(path)
+                and _utf8_path(path)
             ]
         return [
             path
             for raw, flags in self.repo.status(untracked_files="all").items()
             if flags & pygit2.enums.FileStatus.WT_NEW
             and (path := self.relative(raw, pathspecs)) is not None
-            and _is_utf8(path)
+            and _utf8_path(path)
         ]
 
     def ignore_files_above(

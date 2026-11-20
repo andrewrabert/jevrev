@@ -1,11 +1,8 @@
-"""The GitHub REST and GraphQL APIs jevrev uses, through httpx2, on a host and with a token that
-gh's environment variables, or gh itself, give."""
+"""The GitHub REST and GraphQL APIs jevrev uses, through httpx2, on a host and with a token."""
 
 import asyncio
-import contextlib
 import io
-import os
-import shutil
+import logging
 import tarfile
 import typing
 
@@ -17,9 +14,6 @@ import jevrev.files
 import jevrev.git
 import jevrev.github.pull_request
 import jevrev.github.repo
-import jevrev.process
-
-_DEFAULT_HOST = "github.com"
 
 # Adds a file comment to a pending review; the REST API that creates a review takes only line
 # comments.
@@ -40,39 +34,11 @@ _TIMEOUT = 300.0
 # Tree entry modes that are a regular or executable file.
 _FILE_MODES = frozenset(("100644", "100755"))
 
+_log = logging.getLogger(__name__)
+
 
 class GithubError(Exception):
     pass
-
-
-def host() -> str:
-    """GH_HOST, or github.com when it is unset or empty."""
-    return os.environ.get("GH_HOST") or _DEFAULT_HOST
-
-
-def _token_variables(host: str) -> tuple[str, str]:
-    if host == _DEFAULT_HOST:
-        return ("GH_TOKEN", "GITHUB_TOKEN")
-    return ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
-
-
-async def token(host: str) -> str:
-    """The token for host: from gh's environment variables for it, then from `gh auth token`
-    when gh is on PATH."""
-    variables = _token_variables(host)
-    for variable in variables:
-        if value := os.environ.get(variable):
-            return value
-    if shutil.which("gh") is not None:
-        with contextlib.suppress(jevrev.process.ProcessError):
-            stdout = await jevrev.process.run(
-                ["gh", "auth", "token", "--hostname", host]
-            )
-            if value := stdout.decode().strip():
-                return value
-    raise GithubError(
-        f"no token for {host}: set {' or '.join(variables)}, or log in with gh"
-    )
 
 
 class _Commit(pydantic.BaseModel):
@@ -136,7 +102,7 @@ class Client:
     """The GitHub APIs of host, authenticated with token."""
 
     def __init__(self, host: str, token: str):
-        if host == _DEFAULT_HOST:
+        if host == jevrev.github.repo.DEFAULT_HOST:
             self.rest = yarl.URL("https://api.github.com")
             self.graphql = yarl.URL("https://api.github.com/graphql")
         else:
@@ -183,7 +149,7 @@ class Client:
     def _repo_url(
         self, repo: jevrev.github.repo.GithubRepo, *parts: str
     ) -> yarl.URL:
-        url = self.rest / "repos" / repo.org / repo.name
+        url = self.rest / "repos" / repo.name.org / repo.name.name
         for part in parts:
             url = url / part
         return url
@@ -265,7 +231,7 @@ class Client:
         tree = _Tree.model_validate_json(await self._request("GET", url))
         if tree.truncated:
             raise GithubError(
-                f"{repo.org}/{repo.name} has more files at {commit} than GitHub lists in one tree"
+                f"{repo.name} has more files at {commit} than GitHub lists in one tree"
             )
         return {
             entry.path: entry.sha
@@ -395,7 +361,13 @@ class Client:
                 )
             )
         except BaseException:
-            with contextlib.suppress(GithubError):
+            try:
                 await self._request("DELETE", reviews / str(pending.id))
+            except GithubError as e:
+                _log.warning(
+                    "could not delete pending review %s after the failed submit: %s",
+                    pending.id,
+                    e,
+                )
             raise
         return submitted.html_url

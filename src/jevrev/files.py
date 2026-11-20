@@ -3,6 +3,7 @@ them."""
 
 import asyncio
 import collections
+import logging
 import pathlib
 import typing
 
@@ -18,6 +19,8 @@ type LineNumber = typing.Annotated[int, pydantic.Field(ge=1)]
 
 # The ignore files of a directory, lowest precedence first.
 _IGNORE_FILES = (".gitignore", ".ignore")
+
+_log = logging.getLogger(__name__)
 
 
 class Files(typing.Protocol):
@@ -50,7 +53,15 @@ def walk(root: pathlib.Path) -> list[str]:
                 if path.name != ".git":
                     queue.append(path)
             elif path.is_file():
-                found.append(path.relative_to(root).as_posix())
+                relative = path.relative_to(root).as_posix()
+                try:
+                    relative.encode()
+                except UnicodeEncodeError:
+                    _log.info(
+                        "skipping %s: not a UTF-8 path under %s", path, root
+                    )
+                    continue
+                found.append(relative)
     return sorted(found)
 
 
@@ -82,9 +93,16 @@ class OneFile:
 
 
 def _spec(contents: bytes) -> pathspec.GitIgnoreSpec:
-    return pathspec.GitIgnoreSpec.from_lines(
-        contents.decode(errors="replace").splitlines()
-    )
+    """The gitignore patterns of contents; an invalid one is left out with a warning."""
+    lines = []
+    for line in contents.decode(errors="replace").splitlines():
+        try:
+            pathspec.GitIgnoreSpec.from_lines([line])
+        except pathspec.patterns.gitignore.GitIgnorePatternError as e:
+            _log.warning("ignoring the pattern %r: %s", line, e)
+            continue
+        lines.append(line)
+    return pathspec.GitIgnoreSpec.from_lines(lines)
 
 
 def _parent_dirs(path: str) -> list[str]:
