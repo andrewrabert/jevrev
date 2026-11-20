@@ -568,10 +568,40 @@ async fn ask_one(
         .map_err(|e| ask_failed(state, &format!("{e:#}")))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Concurrency(NonZeroUsize);
+
+impl Default for Concurrency {
+    fn default() -> Concurrency {
+        Concurrency(NonZeroUsize::new(8).expect("8 is positive"))
+    }
+}
+
+impl std::fmt::Display for Concurrency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Concurrency {
+    pub fn try_new(value: impl AsRef<std::ffi::OsStr>) -> Result<Concurrency, Error> {
+        let value = value.as_ref();
+        value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .map(Concurrency)
+            .ok_or_else(|| anyhow::anyhow!("invalid value: {value:?}"))
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 pub async fn review(
     scanned: &Scanned,
     client: &Client,
-    concurrency: NonZeroUsize,
+    concurrency: Concurrency,
 ) -> Result<Reviewed, ScanError> {
     let asked: Vec<(usize, &State, &PathBuf)> = scanned
         .states

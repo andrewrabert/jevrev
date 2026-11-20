@@ -94,7 +94,7 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 | `--base-url` | `TYPESAFE_BASE_URL` | TypeSafe API URL. |
 | `--model` | `TYPESAFE_DEFAULT_MODEL` | Jev model to ask. |
 | `--timeout` | `TYPESAFE_TIMEOUT` | Seconds each connection and read may take, 90 by default. `inf` means no limit. |
-| `-c`/`--concurrency N` | | Most jev requests in flight at once, 8 by default. |
+| `-c`/`--concurrency N` | `JEVREV_CONCURRENCY` | Most jev requests in flight at once, 8 by default. |
 
 `--env-file` or `JEVREV_ENV_FILE` names a dotenv file of the variables above. A flag wins over the environment, and a variable set in the environment wins over the file.
 

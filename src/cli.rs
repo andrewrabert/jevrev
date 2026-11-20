@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use crate::jev::{
     self,
     api::{ApiKey, BaseUrl, Model, Timeout},
 };
-use crate::scan::{self, Changes, IgnoreRules, ScanError, ScanScope};
+use crate::scan::{self, Changes, Concurrency, IgnoreRules, ScanError, ScanScope};
 use crate::store::{self, Finding, GithubSelection, Judgment, Review, Source, Stored, Verdict};
 use crate::{Error, output};
 
@@ -40,6 +40,7 @@ const API_KEY: &str = "TYPESAFE_API_KEY";
 const BASE_URL: &str = "TYPESAFE_BASE_URL";
 const MODEL: &str = "TYPESAFE_DEFAULT_MODEL";
 const TIMEOUT: &str = "TYPESAFE_TIMEOUT";
+const CONCURRENCY: &str = "JEVREV_CONCURRENCY";
 const GITHUB_HOST: &str = "GITHUB_HOST";
 const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
@@ -252,9 +253,8 @@ struct ScanArgs {
     model: Option<Model>,
     #[arg(long, value_parser = OsStringValueParser::new().try_map(Timeout::try_new), help = format!("Seconds each connection and read to the TypeSafe API may take; inf for no limit [default: 90] [env: {TIMEOUT}]"))]
     timeout: Option<Timeout>,
-    /// Most jev requests in flight at once
-    #[arg(short, long, value_name = "N", default_value = "8")]
-    concurrency: NonZeroUsize,
+    #[arg(short, long, value_name = "N", value_parser = OsStringValueParser::new().try_map(Concurrency::try_new), help = format!("Most jev requests in flight at once [default: {}] [env: {CONCURRENCY}]", Concurrency::default()))]
+    concurrency: Option<Concurrency>,
     /// Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
     #[arg(short = 'i', long, value_name = "PATTERN", action = clap::ArgAction::Append)]
     include: Vec<String>,
@@ -273,7 +273,7 @@ struct Scan<'a> {
     review: Option<&'a Path>,
     rules: Vec<PathBuf>,
     client: jev::api::Client,
-    concurrency: NonZeroUsize,
+    concurrency: Concurrency,
     metadata: BTreeMap<String, String>,
     include: Vec<String>,
     exclude: Vec<String>,
@@ -315,7 +315,10 @@ impl ScanArgs {
             review,
             rules,
             client,
-            concurrency: self.concurrency,
+            concurrency: self
+                .concurrency
+                .or(environment.concurrency)
+                .unwrap_or_default(),
             metadata: self.metadata.into_iter().collect(),
             include: self.include,
             exclude: self.exclude,
@@ -413,6 +416,7 @@ struct Environment {
     base_url: Option<BaseUrl>,
     model: Option<Model>,
     timeout: Option<Timeout>,
+    concurrency: Option<Concurrency>,
     github_host: Option<GithubHost>,
     github_token: Option<Token>,
 }
@@ -463,6 +467,12 @@ impl Environment {
             }
             .transpose()
             .context(TIMEOUT)?,
+            concurrency: match std::env::var_os(CONCURRENCY) {
+                Some(value) => Some(Concurrency::try_new(value)),
+                None => file.remove(CONCURRENCY).map(Concurrency::try_new),
+            }
+            .transpose()
+            .context(CONCURRENCY)?,
             github_host: match std::env::var_os(GITHUB_HOST) {
                 Some(value) => Some(GithubHost::try_new(value)),
                 None => file.remove(GITHUB_HOST).map(GithubHost::try_new),
