@@ -8,12 +8,12 @@ jevrev is a CLI that reviews code against rules you write and reports each place
 ## Setup
 
 ```sh
-uv tool install .
+just install
 export TYPESAFE_API_KEY=...
-export JEV_RULES=~/rules/python:~/rules/prose
+export JEVREV_RULES=~/rules/python:~/rules/prose
 ```
 
-jevrev asks jev whether code breaks the rules in your rule sets. A rule set is a YAML file of rules, each describing a defect with examples of code that has it and code that doesn't. `JEV_RULES` lists directories of rule sets, separated by `:`. Each rule set has a `when:` block that names the files it applies to, so a scan of a whole repo checks each file only against the rule sets that match it. [example_rules](example_rules) holds examples.
+jevrev asks jev whether code breaks the rules in your rule sets. A rule set is a YAML file of rules, each describing a defect with examples of code that has it and code that doesn't. `JEVREV_RULES` lists directories of rule sets, separated by `:`. Each rule set has a `when:` block that names the files it applies to, so a scan of a whole repo checks each file only against the rule sets that match it. [example_rules](example_rules) holds examples.
 
 To scan GitHub or post to it, jevrev needs a GitHub token. See [GitHub](#github).
 
@@ -84,7 +84,7 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 
 | Flag | Environment variable | Purpose |
 |---|---|---|
-| `--rules DIR` | `JEV_RULES` | Directory of rule sets. Repeat for more. Any `--rules` replaces `JEV_RULES`. |
+| `--rules DIR` | `JEVREV_RULES` | Directory of rule sets. Repeat for more. Any `--rules` replaces `JEVREV_RULES`. |
 | `-i`/`--include PATTERN` | | Scan only files PATTERN matches, in gitignore syntax. Repeat for more. |
 | `-e`/`--exclude PATTERN` | | Leave out files PATTERN matches. Repeat for more. Wins over `--include`. |
 | `--no-ignore` | | Also scan files that `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` match. `scan` given a single file scans it regardless. |
@@ -94,9 +94,26 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 | `--base-url` | `TYPESAFE_BASE_URL` | TypeSafe API URL. |
 | `--model` | `TYPESAFE_DEFAULT_MODEL` | Jev model to ask. |
 | `--timeout` | `TYPESAFE_TIMEOUT` | Seconds each connection and read may take, 90 by default. `inf` means no limit. |
+| `-c`/`--concurrency N` | `JEVREV_CONCURRENCY` | Most jev requests in flight at once, 8 by default. |
 
-`TYPESAFE_ENV_FILE` names a dotenv file of the `TYPESAFE_` variables. Variables set in the environment win over the file.
+`--env-file` or `JEVREV_ENV_FILE` names a dotenv file of the variables above. A flag wins over the environment, and a variable set in the environment wins over the file.
 
 ### GitHub
 
-jevrev reaches GitHub on the host `GH_HOST` names, or `github.com` when it's unset. On github.com it uses the token in `GH_TOKEN` or `GITHUB_TOKEN`. On another host it uses `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`. Without those, it uses the token `gh auth token` prints. A review file records its host, and `submit-github` posts there.
+jevrev reaches GitHub on the host `--github-host` or `GITHUB_HOST` names, or `github.com` when neither is set, with the token in `--github-token` or `GITHUB_TOKEN`. A review file records its host, and `submit-github` posts there.
+
+## Development
+
+Development tasks run through [just](https://github.com/casey/just). `just` with no recipe lists them.
+
+| Recipe | Purpose |
+|---|---|
+| `just ci` | Run the tests, clippy with warnings denied, the `cargo fmt` check, and check that `Cargo.lock` is up to date. Run it before you commit. |
+| `just test` | Run the tests. |
+| `just check` | Run `cargo check` on all targets. |
+| `just clippy` | Run clippy with warnings denied. |
+| `just fmt` | Format the code. |
+| `just build` | Build jevrev. |
+| `just run` | Run jevrev. |
+| `just install` | Install jevrev from this checkout with `cargo install`. |
+| `just outdated` | Fail if a direct dependency is outdated. Requires `cargo-outdated`. |

@@ -7,7 +7,6 @@ when:
   - language: [python]
 error_threshold: 0.75
 rules:
-  # --- Parse at the edge -----------------------------------------------------------------------------
   - flags: |-
       A value from outside the program (a response, a library result, a file, an environment variable, a request, a tool's or handler's arguments) is parsed whole into a type where it enters, before the code that uses it runs, so that code receives a typed value and never a raw one. A raw dict whose fields the code picks out one at a time, converting or validating each as it goes, is not correct by construction: nothing guarantees it is valid until partway through the code that uses it.
       Added code handles a value from outside the program in its raw form, as str, int, dict, list or tuple of them, reading or converting its parts where they are used, when the value has a known shape that a type could hold.
@@ -84,7 +83,6 @@ rules:
         receives it unchecked.
       - A separate, public value is defined and used separately from the type to validate constraints.
 
-  # --- Closed sets -----------------------------------------------------------------------------------
   - flags: Added code writes members of a fixed vocabulary as bare strings or string constants, instead of an enum or a single typing.Literal alias.
     good:
       - >-
@@ -134,7 +132,6 @@ rules:
         kinds or codes, and the lookup has a fallback: _LABELS.get(state, state), _LABELS.get(kind, 'Unknown')
         or _TYPES.get(name) or 'html'.
 
-  # --- Representable states --------------------------------------------------------------------------
   - flags: An added class, model or return type lets combinations of fields exist that the code treats as impossible, instead of a union of types where each holds only valid combinations.
     good:
       - >-
@@ -168,7 +165,6 @@ rules:
         that folds None back into "absent", such as {k: v for k, v in data if v is not None} or
         if items is None: items = [].
 
-  # --- Keeping the invariant -------------------------------------------------------------------------
   - flags: Added code builds or changes a validated object in a way that skips its validation.
     good:
       - >-
@@ -201,7 +197,6 @@ rules:
         call that the narrow type would reject, or assert isinstance(x, T) used in production code as the only
         thing that narrows a value from outside the program.
 
-  # --- Primitives for domain values ------------------------------------------------------------------
   - flags: An added function takes, returns or stores a dict with fixed keys as a record, instead of a model or dataclass.
     good:
       - >-
@@ -229,7 +224,6 @@ rules:
         a field the code already types with a constrained alias, such as def team_repo(org: str) -> Repo
         whose body passes org into Repo(org=...) where Repo.org is OrgName.
 
-  # --- Models travel whole ---------------------------------------------------------------------------
   - flags: |-
       Values that belong together travel as the model or dataclass that holds them. Functions, constructors and other models take that object whole, and code reads a field only where it uses that value, so the grouping and its invariants reach as far toward the program's edges as they can. Splitting the object into its fields, as separate parameters, local variables, a tuple or fields copied into another class, throws the grouping away.
       Added code splits a model or dataclass into several of its fields to pass, store or hold them separately, instead of passing the object itself.

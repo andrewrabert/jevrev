@@ -1,0 +1,15 @@
+[1msrc/a.py:1-2[0m [2m[4][0m [33mpython.yaml#3[0m [33m0.89[0m [36mlanguage[0m
+    Carriagereturn and bell.
+[1msrc/a.py:3-9[0m [2m[2][0m [33mpython.yaml#1[0m [1m[31m0.95[0m [36mhunk[0m
+    Added code swallows an error.
+[1msrc/a.py:3-9[0m [2m[3][0m [33mtext.yaml#1[0m [1m[31m0.90[0m [36mhunk[0m
+    Two lines
+of flags.
+[1msrc/a.py:3-9[0m [2m[6][0m [33mpython.yaml#4[0m 0.50 [36mlanguage[0m
+    Empty item.
+[1msrc/b.py:10[0m [2m[1][0m [33mpython.yaml#2[0m 0.69 [36mlanguage[0m
+    Flags with a tab	here.
+[1m日本/ü.rs:5-6[0m [2m[5][0m [33mstandards.yaml#10[0m [33m0.70[0m [36mlanguage[0m
+    Unicode é ü 日本	tab after wide text.
+
+3 states reviewed in /srv/jevrev fixtures/dir, 6 findings, 0 failures

@@ -228,7 +228,6 @@ rules:
         error would report the same failure; or the new type is converted into a catch-all error
         at its first caller.
 
-  # invented_value
   - flags: An added Option stands for something other than a value that is absent.
     good:
       - >-
@@ -254,7 +253,6 @@ rules:
         or device answering within that time, for example sleeping after asking a server to
         refresh before reading its state, or stopping a terminal read after some milliseconds.
 
-  # handrolled_format
   - flags: An added numeric literal stands for a named situation that the code does not name.
     good:
       - >-

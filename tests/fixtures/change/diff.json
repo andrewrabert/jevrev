@@ -1,0 +1,244 @@
+{
+ "before": {
+  "lib.rs": "pub fn one() -> u32 {\n    0\n}\n\n#[must_use]\npub fn two() -> u32 {\n    2\n}\n\nfn gone() {}\n\npub fn three() -> u32 {\n    3\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+  "app.py": "def a(:\n    return 1\n\n\ndef c():\n    return 3\n",
+  "broken.py": "def ok():\n    return 1\n",
+  "notes.txt": "one\ntwo\n"
+ },
+ "files": {
+  "lib.rs": "pub fn one() -> u32 {\n    1\n}\n\npub fn two() -> u32 {\n    2\n}\n\npub fn three() -> u32 {\n    3\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n    fn u() {}\n}\n",
+  "app.py": "def a():\n    return 1\n\n\ndef c():\n    return 3\n",
+  "broken.py": "def ok(:\n    return 1\n",
+  "notes.txt": "one\n2\n",
+  "new.sh": "#!/bin/sh\nset -e\n\nf() {\n  echo hi\n}\nf\n"
+ },
+ "diff": [
+  {
+   "path": "lib.rs",
+   "hunks": [
+    {
+     "source_start": 1,
+     "source_length": 20,
+     "target_start": 1,
+     "target_length": 18,
+     "section": "",
+     "lines": [
+      {
+       "text": "pub fn one() -> u32 {",
+       "kind": "context",
+       "number": 1
+      },
+      {
+       "text": "    0",
+       "kind": "removed"
+      },
+      {
+       "text": "    1",
+       "kind": "added",
+       "number": 2
+      },
+      {
+       "text": "}",
+       "kind": "context",
+       "number": 3
+      },
+      {
+       "text": "",
+       "kind": "context",
+       "number": 4
+      },
+      {
+       "text": "#[must_use]",
+       "kind": "removed"
+      },
+      {
+       "text": "pub fn two() -> u32 {",
+       "kind": "context",
+       "number": 5
+      },
+      {
+       "text": "    2",
+       "kind": "context",
+       "number": 6
+      },
+      {
+       "text": "}",
+       "kind": "context",
+       "number": 7
+      },
+      {
+       "text": "",
+       "kind": "context",
+       "number": 8
+      },
+      {
+       "text": "fn gone() {}",
+       "kind": "removed"
+      },
+      {
+       "text": "",
+       "kind": "removed"
+      },
+      {
+       "text": "pub fn three() -> u32 {",
+       "kind": "context",
+       "number": 9
+      },
+      {
+       "text": "    3",
+       "kind": "context",
+       "number": 10
+      },
+      {
+       "text": "}",
+       "kind": "context",
+       "number": 11
+      },
+      {
+       "text": "",
+       "kind": "context",
+       "number": 12
+      },
+      {
+       "text": "#[cfg(test)]",
+       "kind": "context",
+       "number": 13
+      },
+      {
+       "text": "mod tests {",
+       "kind": "context",
+       "number": 14
+      },
+      {
+       "text": "    #[test]",
+       "kind": "context",
+       "number": 15
+      },
+      {
+       "text": "    fn t() {}",
+       "kind": "context",
+       "number": 16
+      },
+      {
+       "text": "    fn u() {}",
+       "kind": "added",
+       "number": 17
+      },
+      {
+       "text": "}",
+       "kind": "context",
+       "number": 18
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "path": "app.py",
+   "hunks": [
+    {
+     "source_start": 1,
+     "source_length": 6,
+     "target_start": 1,
+     "target_length": 6,
+     "section": "",
+     "lines": [
+      {
+       "text": "def a(:",
+       "kind": "removed"
+      },
+      {
+       "text": "def a():",
+       "kind": "added",
+       "number": 1
+      },
+      {
+       "text": "    return 1",
+       "kind": "context",
+       "number": 2
+      },
+      {
+       "text": "",
+       "kind": "context",
+       "number": 3
+      },
+      {
+       "text": "",
+       "kind": "context",
+       "number": 4
+      },
+      {
+       "text": "def c():",
+       "kind": "context",
+       "number": 5
+      },
+      {
+       "text": "    return 3",
+       "kind": "context",
+       "number": 6
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "path": "broken.py",
+   "hunks": [
+    {
+     "source_start": 1,
+     "source_length": 2,
+     "target_start": 1,
+     "target_length": 2,
+     "section": "",
+     "lines": [
+      {
+       "text": "def ok():",
+       "kind": "removed"
+      },
+      {
+       "text": "def ok(:",
+       "kind": "added",
+       "number": 1
+      },
+      {
+       "text": "    return 1",
+       "kind": "context",
+       "number": 2
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "path": "notes.txt",
+   "hunks": [
+    {
+     "source_start": 1,
+     "source_length": 2,
+     "target_start": 1,
+     "target_length": 2,
+     "section": "",
+     "lines": [
+      {
+       "text": "one",
+       "kind": "context",
+       "number": 1
+      },
+      {
+       "text": "two",
+       "kind": "removed"
+      },
+      {
+       "text": "2",
+       "kind": "added",
+       "number": 2
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "untracked": [
+  "new.sh"
+ ]
+}

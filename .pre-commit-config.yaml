@@ -1,25 +1,33 @@
+exclude: ^tests/fixtures/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
-      - id: check-ast
       - id: check-toml
       - id: check-yaml
         args: [--allow-multiple-documents]
-      - id: debug-statements
       - id: end-of-file-fixer
       - id: mixed-line-ending
       - id: trailing-whitespace
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.4
+  - repo: local
     hooks:
-      - id: ruff-format
-      - id: ruff-check
-        args: [--fix]
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy -- -D warnings
+        language: system
+        types_or: [rust, toml]
+        pass_filenames: false
 
   - repo: https://github.com/tombi-toml/tombi-pre-commit
     rev: v1.11.2
     hooks:
       - id: tombi-format
-        exclude: "uv.lock"
+        files: ^Cargo\.toml$

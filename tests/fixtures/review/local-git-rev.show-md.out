@@ -1,0 +1,15 @@
+---
+source:
+  path: "/srv/repo: colon"
+  git:
+    commit: "0123456789012345678901234567890123456789"
+findings: 2
+confirmed: 1
+rejected: 1
+metadata:
+  ticket: ABC-1
+---
+
+### Added code swallows an error.
+
+- src/app.py:3-9

@@ -1,0 +1,15 @@
+src/a.py:1-2 [4] python.yaml#3 0.89 language
+    Carriagereturn and bell.
+src/a.py:3-9 [2] python.yaml#1 0.95 hunk
+    Added code swallows an error.
+src/a.py:3-9 [3] text.yaml#1 0.90 hunk
+    Two lines
+of flags.
+src/a.py:3-9 [6] python.yaml#4 0.50 language
+    Empty item.
+src/b.py:10 [1] python.yaml#2 0.69 language
+    Flags with a tab	here.
+日本/ü.rs:5-6 [5] standards.yaml#10 0.70 language
+    Unicode é ü 日本	tab after wide text.
+
+3 states reviewed in /srv/jevrev fixtures/dir, 6 findings, 0 failures

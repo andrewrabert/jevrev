@@ -1,0 +1,20 @@
+---
+source:
+  path: /srv/repo
+  git:
+    base: "0777777777777777777777777777777777777777"
+findings: 4
+confirmed: 3
+rejected: 1
+include:
+- "*.rs"
+---
+
+### Added code swallows an error.
+
+- README.md:1-40
+- src/app.py:3-9
+
+### Tab	here and "quotes".
+
+- lib/ü.rs:5-6
