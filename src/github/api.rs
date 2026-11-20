@@ -22,10 +22,14 @@ use crate::store::{Finding, Review};
 
 const DEFAULT_API: &str = "https://api.github.com";
 
-const ADD_FILE_THREAD: &str = "
-mutation($review: ID!, $path: String!, $body: String!) {
+const ADD_THREAD: &str = "
+mutation(
+  $review: ID!, $path: String!, $body: String!, $subjectType: PullRequestReviewThreadSubjectType!,
+  $line: Int, $startLine: Int, $side: DiffSide
+) {
   addPullRequestReviewThread(input: {
-    pullRequestReviewId: $review, path: $path, body: $body, subjectType: FILE
+    pullRequestReviewId: $review, path: $path, body: $body, subjectType: $subjectType,
+    line: $line, startLine: $startLine, side: $side
   }) { thread { id } }
 }
 ";
@@ -87,7 +91,8 @@ impl Blobs {
     }
 }
 
-fn failed(what: &str, error: impl std::fmt::Display) -> Error {
+fn failed(what: &str, error: impl std::fmt::Display + std::fmt::Debug) -> Error {
+    tracing::error!("{what}: {error:?}");
     anyhow!("{what}: {error}")
 }
 
@@ -132,17 +137,6 @@ enum ReviewEvent {
 struct StartReviewRequest<'r> {
     commit_id: &'r GitObjectId,
     body: String,
-    comments: Vec<ReviewComment<'r>>,
-}
-
-#[derive(serde::Serialize)]
-struct ReviewComment<'r> {
-    path: &'r str,
-    body: String,
-    line: NonZeroUsize,
-    side: ReviewSide,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start_line: Option<NonZeroUsize>,
 }
 
 #[derive(serde::Serialize)]
@@ -152,21 +146,33 @@ enum ReviewSide {
 }
 
 #[derive(serde::Serialize)]
-struct AddFileThreadRequest<'r> {
-    query: &'static str,
-    variables: AddFileThreadVariables<'r>,
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ThreadSubject {
+    Line,
+    File,
 }
 
 #[derive(serde::Serialize)]
-struct AddFileThreadVariables<'r> {
+struct AddThreadRequest<'r> {
+    query: &'static str,
+    variables: AddThreadVariables<'r>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddThreadVariables<'r> {
     review: &'r str,
     path: &'r str,
     body: String,
+    subject_type: ThreadSubject,
+    line: Option<NonZeroUsize>,
+    start_line: Option<NonZeroUsize>,
+    side: Option<ReviewSide>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AddFileThreadResponse {
+struct AddThreadResponse {
     add_pull_request_review_thread: AddedReviewThread,
 }
 
@@ -461,7 +467,7 @@ impl Client {
         let reviews = self.route(repo, &["pulls", &pr.number.to_string(), "reviews"]);
         let pending = self.start_review(&reviews, pr, review, &diff).await?;
         let finished = async {
-            self.add_file_threads(&pending, review, &diff).await?;
+            self.add_threads(&pending, review, &diff).await?;
             self.finish_review(&reviews, &pending, &pull_request.author, &reviewer)
                 .await
         }
@@ -500,56 +506,58 @@ impl Client {
             .copied()
             .filter(|f| !review::in_diff(f, diff))
             .collect();
-        let comments: Vec<ReviewComment> = confirmed
-            .iter()
-            .filter_map(|f| {
-                let lines = review::commented_lines(f, diff)?;
-                Some(ReviewComment {
-                    path: &f.finding.file,
-                    body: review::comment_body(f),
-                    line: lines.end(),
-                    side: ReviewSide::Right,
-                    start_line: (lines.start() != lines.end()).then(|| lines.start()),
-                })
-            })
-            .collect();
         self.rest
             .post(
                 reviews.as_str(),
                 Some(&StartReviewRequest {
                     commit_id: &pr.head,
                     body: review::review_body(confirmed.len(), &outside),
-                    comments,
                 }),
             )
             .await
             .map_err(|e| failed("starting the review", e))
     }
 
-    async fn add_file_threads(
+    async fn add_threads(
         &self,
         pending: &PendingReview,
         review: &Review,
         diff: &Diff,
     ) -> Result<(), Error> {
         for f in review.confirmed() {
-            if !review::in_diff(f, diff) || review::commented_lines(f, diff).is_some() {
+            if !review::in_diff(f, diff) {
                 continue;
             }
-            let added: AddFileThreadResponse = self
+            let variables = match review::commented_lines(f, diff) {
+                Some(lines) => AddThreadVariables {
+                    review: &pending.node_id,
+                    path: &f.finding.file,
+                    body: review::comment_body(f),
+                    subject_type: ThreadSubject::Line,
+                    line: Some(lines.end()),
+                    start_line: (lines.start() != lines.end()).then(|| lines.start()),
+                    side: Some(ReviewSide::Right),
+                },
+                None => AddThreadVariables {
+                    review: &pending.node_id,
+                    path: &f.finding.file,
+                    body: review::comment_body(f),
+                    subject_type: ThreadSubject::File,
+                    line: None,
+                    start_line: None,
+                    side: None,
+                },
+            };
+            let added: AddThreadResponse = self
                 .graphql
-                .graphql(&AddFileThreadRequest {
-                    query: ADD_FILE_THREAD,
-                    variables: AddFileThreadVariables {
-                        review: &pending.node_id,
-                        path: &f.finding.file,
-                        body: review::comment_body(f),
-                    },
+                .graphql(&AddThreadRequest {
+                    query: ADD_THREAD,
+                    variables,
                 })
                 .await
-                .map_err(|e| failed("adding a file comment", e))?;
+                .map_err(|e| failed("adding a comment", e))?;
             if added.add_pull_request_review_thread.thread.id.is_empty() {
-                return Err(failed("adding a file comment", "no thread was added"));
+                return Err(failed("adding a comment", "no thread was added"));
             }
         }
         Ok(())
