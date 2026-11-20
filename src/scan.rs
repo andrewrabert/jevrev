@@ -30,13 +30,14 @@ use crate::Error;
 use crate::files::{Files, ReadTextError};
 use crate::git::{Diff, FileDiff, Line};
 use crate::gitignore::{Check, Pattern, Spec};
-use crate::ignore_rules::{Fate, Ignore};
+use crate::ignore_rules::Ignore;
 use crate::jev::api::{Client, NoulAnswer};
 use crate::jev::ask;
 use crate::languages::{self, Syntax, TestMarker};
 use crate::lines::LineRange;
 use crate::non_empty::NonEmpty;
 use crate::rules::{Conditions, Language, RuleSet};
+use crate::source_path::SourcePath;
 use crate::state::{Body, DiffHunk, Extent, State, StateKind};
 
 pub enum IgnoreRules {
@@ -53,7 +54,7 @@ pub struct ScanScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Changes {
     pub diff: Diff,
-    pub untracked: Vec<String>,
+    pub untracked: Vec<SourcePath>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +93,7 @@ impl PathFilter {
         }
     }
 
-    fn admits(&self, path: &str) -> bool {
+    fn admits(&self, path: &SourcePath) -> bool {
         match self {
             PathFilter::Any => true,
             PathFilter::Only(spec) => spec.check(path) == Check::Included,
@@ -107,7 +108,7 @@ struct Condition {
 }
 
 impl Condition {
-    fn holds_among(&self, paths: &[String]) -> bool {
+    fn holds_among(&self, paths: &[SourcePath]) -> bool {
         self.exists
             .iter()
             .all(|spec| paths.iter().any(|path| spec.check(path) == Check::Included))
@@ -192,7 +193,7 @@ fn rule_sets(
     Ok(sets)
 }
 
-fn sets_among(sets: Vec<SetConditions>, paths: &[String]) -> Vec<SetConditions> {
+fn sets_among(sets: Vec<SetConditions>, paths: &[SourcePath]) -> Vec<SetConditions> {
     sets.into_iter()
         .map(|set| SetConditions {
             path: set.path,
@@ -208,7 +209,7 @@ fn sets_among(sets: Vec<SetConditions>, paths: &[String]) -> Vec<SetConditions> 
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct File {
-    path: String,
+    path: SourcePath,
     languages: BTreeSet<Language>,
 }
 
@@ -344,7 +345,7 @@ fn language_states(
             continue;
         }
         states.push(State {
-            file: file.path.clone(),
+            file: file.path.to_string(),
             line_range: range,
             sets: sets.clone(),
             body: Body::Language {
@@ -389,14 +390,14 @@ fn hunk_states(sets: &NonEmpty<PathBuf>, file_diff: &FileDiff) -> Vec<State> {
     let mut states: Vec<State> = hunks
         .iter()
         .map(|(line_range, hunk)| State {
-            file: file_diff.path.clone(),
+            file: file_diff.path.to_string(),
             line_range: *line_range,
             sets: sets.clone(),
             body: Body::Hunk(hunk.clone()),
         })
         .collect();
     states.push(State {
-        file: file_diff.path.clone(),
+        file: file_diff.path.to_string(),
         line_range: hunks.first().0.through(&hunks.last().0),
         sets: sets.clone(),
         body: Body::Hunks(hunks.map(|(_, hunk)| hunk.clone())),
@@ -411,7 +412,7 @@ fn states_of(
     file_diff: Option<&FileDiff>,
 ) -> Vec<State> {
     let mut states = vec![State {
-        file: file.path.clone(),
+        file: file.path.to_string(),
         line_range: LineRange::new(
             NonZeroUsize::MIN,
             NonZeroUsize::new(text.lines().count()).unwrap_or(NonZeroUsize::MIN),
@@ -442,12 +443,13 @@ impl<'s> ScanRun<'s> {
         rules: &[PathBuf],
         source: &'s Files,
         scope: &ScanScope,
-        candidates: &[&str],
+        candidates: &[&SourcePath],
     ) -> Result<ScanRun<'s>, ScanError> {
-        let mut paths = source.paths()?;
-        if let IgnoreRules::Apply(ignore) = &scope.ignore {
-            paths.retain(|path| ignore.fate(path) == Fate::Kept);
-        }
+        let ignore = match &scope.ignore {
+            IgnoreRules::Apply(ignore) => Some(ignore),
+            IgnoreRules::Off => None,
+        };
+        let paths = source.paths(ignore)?;
         let included = if scope.include.is_empty() {
             PathFilter::Any
         } else {
@@ -457,9 +459,8 @@ impl<'s> ScanRun<'s> {
         };
         let excluded =
             Spec::from_lines(scope.exclude.iter().map(String::as_str)).context("--exclude")?;
-        let in_scope: HashSet<&str> = paths
+        let in_scope: HashSet<&SourcePath> = paths
             .iter()
-            .map(String::as_str)
             .filter(|path| included.admits(path) && excluded.check(path) != Check::Included)
             .collect();
         let mut rule_sets = BTreeMap::new();
@@ -478,7 +479,7 @@ impl<'s> ScanRun<'s> {
                 Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string()).into()),
             };
             let file = File {
-                path: path.to_string(),
+                path: (*path).clone(),
                 languages: languages::detect(path, &text),
             };
             let selecting = sets
@@ -514,21 +515,21 @@ pub async fn scan(
     scope: &ScanScope,
     changes: Option<&Changes>,
 ) -> Result<Scanned, ScanError> {
-    let changed: BTreeMap<&str, &FileDiff> = changes
+    let changed: BTreeMap<&SourcePath, &FileDiff> = changes
         .iter()
         .flat_map(|changes| &changes.diff.files)
-        .map(|file_diff| (file_diff.path.as_str(), file_diff))
+        .map(|file_diff| (&file_diff.path, file_diff))
         .collect();
     let paths;
-    let candidates: Vec<&str> = match changes {
+    let candidates: Vec<&SourcePath> = match changes {
         None => {
-            paths = source.paths()?;
-            paths.iter().map(String::as_str).collect()
+            paths = source.paths(None)?;
+            paths.iter().collect()
         }
         Some(changes) => changed
             .keys()
             .copied()
-            .chain(changes.untracked.iter().map(String::as_str))
+            .chain(changes.untracked.iter())
             .collect(),
     };
     let run = ScanRun::select(rules, source, scope, &candidates).await?;
@@ -538,11 +539,11 @@ pub async fn scan(
             .source
             .read_text(&file.path)
             .await
-            .map_err(|e| Error::from(e).context(file.path.clone()))?;
+            .map_err(|e| Error::from(e).context(file.path.to_string()))?;
         let added = changes
-            .filter(|_| !changed.contains_key(file.path.as_str()))
+            .filter(|_| !changed.contains_key(&file.path))
             .and_then(|_| FileDiff::added(&file.path, &text));
-        let file_diff = changed.get(file.path.as_str()).copied().or(added.as_ref());
+        let file_diff = changed.get(&file.path).copied().or(added.as_ref());
         states.extend(states_of(file, sets, &text, file_diff));
     }
     Ok(run.scanned(states))

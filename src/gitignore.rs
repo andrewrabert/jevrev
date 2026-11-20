@@ -2,7 +2,10 @@ use anyhow::Context;
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+use std::path::Path;
+
 use crate::Error;
+use crate::source_path::SourcePath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern(String);
@@ -56,7 +59,7 @@ impl Spec {
         }
     }
 
-    pub fn check_entry(&self, path: &str, is_dir: bool) -> Check {
+    pub fn check_entry(&self, path: &Path, is_dir: bool) -> Check {
         match self.0.matched(path, is_dir) {
             Match::None => Check::Unmatched,
             Match::Ignore(_) => Check::Included,
@@ -64,22 +67,17 @@ impl Spec {
         }
     }
 
-    pub fn check(&self, path: &str) -> Check {
-        let path = path
-            .strip_prefix('/')
-            .or_else(|| path.strip_prefix("./"))
-            .unwrap_or(path);
-        let (path, is_dir) = match path.strip_suffix('/') {
-            Some(directory) => (directory, true),
-            None => (path, false),
-        };
+    pub fn check(&self, path: &SourcePath) -> Check {
+        let path = Path::new(path.to_str());
         let above_included = path
-            .match_indices('/')
-            .any(|(at, _)| self.check_entry(&path[..at], true) == Check::Included);
+            .ancestors()
+            .skip(1)
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .any(|directory| self.check_entry(directory, true) == Check::Included);
         if above_included {
             Check::Included
         } else {
-            self.check_entry(path, is_dir)
+            self.check_entry(path, false)
         }
     }
 }

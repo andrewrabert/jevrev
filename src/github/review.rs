@@ -20,7 +20,9 @@ struct PrReviewBody<'f> {
 }
 
 fn file_diff<'d>(f: &Finding, diff: &'d Diff) -> Option<&'d FileDiff> {
-    diff.files.iter().find(|file| file.path == f.finding.file)
+    diff.files
+        .iter()
+        .find(|file| file.path.to_str() == f.finding.file)
 }
 
 pub fn in_diff(f: &Finding, diff: &Diff) -> bool {

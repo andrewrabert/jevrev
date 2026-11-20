@@ -1,8 +1,11 @@
 use crate::files::ReadTextError;
+use crate::ignore_rules::Ignore;
+use crate::scan::Changes;
+use crate::source_path::{SourcePath, SourcePathError};
 use anyhow::{Context, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use gix::diff::blob::unified_diff::{ConsumeHunk, DiffLineKind, HunkHeader};
@@ -152,7 +155,7 @@ impl Line {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {
-    pub path: String,
+    pub path: SourcePath,
     pub old: Option<LineRange>,
     pub new: Option<LineRange>,
     pub section: String,
@@ -161,7 +164,7 @@ pub struct Hunk {
 
 impl Hunk {
     pub(crate) fn new(
-        path: &str,
+        path: &SourcePath,
         header: HunkHeader,
         section: String,
         lines: NonEmpty<Line>,
@@ -184,7 +187,7 @@ impl Hunk {
             )
         });
         Hunk {
-            path: path.to_string(),
+            path: path.clone(),
             old,
             new,
             section,
@@ -195,21 +198,21 @@ impl Hunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
-    pub path: String,
+    pub path: SourcePath,
     pub hunks: NonEmpty<Hunk>,
 }
 
 impl FileDiff {
-    pub fn added(path: &str, text: &str) -> Option<FileDiff> {
+    pub fn added(path: &SourcePath, text: &str) -> Option<FileDiff> {
         let lines = text
             .lines()
             .map(|line| Line::Added(line.as_bytes().to_vec()))
             .collect();
         NonEmpty::from_vec(lines).map(|lines: NonEmpty<Line>| FileDiff {
-            path: path.to_string(),
+            path: path.clone(),
             hunks: NonEmpty::new(
                 Hunk {
-                    path: path.to_string(),
+                    path: path.clone(),
                     old: None,
                     new: Some(
                         LineRange::new(NonZeroUsize::MIN, lines.len())
@@ -237,27 +240,21 @@ pub enum Side {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentPair {
-    pub path: String,
+    pub path: SourcePath,
     pub old: Side,
     pub new: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnoreFile {
-    pub directory: String,
+    pub directory: PathBuf,
     pub contents: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AboveSource {
-    pub prefix: String,
+    pub subfolder: Option<PathBuf>,
     pub ignore_files: Vec<IgnoreFile>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IgnoredFiles {
-    Included,
-    Excluded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,8 +268,9 @@ type TreeEntries = BTreeMap<Vec<u8>, (gix::objs::tree::EntryMode, gix::hash::Obj
 #[derive(Debug, Clone)]
 pub struct GitRepo {
     repo: gix::Repository,
-    top: std::path::PathBuf,
-    prefix: String,
+    top: PathBuf,
+    subfolder: Option<PathBuf>,
+    root: PathBuf,
 }
 
 impl GitRepo {
@@ -299,15 +297,17 @@ impl GitRepo {
                 top.display()
             )
         })?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| anyhow!("{}: the path is not valid UTF-8", root.display()))?;
-        let prefix = if relative.is_empty() {
-            String::new()
+        let subfolder = if relative.as_os_str().is_empty() {
+            None
         } else {
-            format!("{relative}/")
+            Some(relative.to_path_buf())
         };
-        Ok(Some(GitRepo { repo, top, prefix }))
+        Ok(Some(GitRepo {
+            repo,
+            top,
+            subfolder,
+            root: resolved,
+        }))
     }
 
     fn commit(&self, revision: &str) -> Result<gix::Commit<'_>, Error> {
@@ -324,16 +324,16 @@ impl GitRepo {
 
     fn root_tree(&self, commit: &GitObjectId) -> Result<Option<gix::Tree<'_>>, Error> {
         let tree = self.commit_tree(commit)?;
-        if self.prefix.is_empty() {
+        let Some(subfolder) = &self.subfolder else {
             return Ok(Some(tree));
-        }
-        let directory = self.prefix.trim_end_matches('/');
-        let Some(entry) = tree.lookup_entry_by_path(directory)? else {
+        };
+        let Some(entry) = tree.lookup_entry_by_path(subfolder)? else {
             return Ok(None);
         };
         if !entry.mode().is_tree() {
             bail!(
-                "{directory} is a {} in {commit}, not a directory",
+                "{} is a {} in {commit}, not a directory",
+                subfolder.display(),
                 entry.mode().as_str()
             );
         }
@@ -343,22 +343,20 @@ impl GitRepo {
     pub fn read_file_text(
         &self,
         commit: &GitObjectId,
-        path: &str,
+        path: &SourcePath,
     ) -> Result<String, ReadTextError> {
         let contents = (|| -> Result<Vec<u8>, Error> {
             let missing = || anyhow!("no such file in {commit}");
             let tree = self.root_tree(commit)?.ok_or_else(missing)?;
-            let entry = tree.lookup_entry_by_path(path)?.ok_or_else(missing)?;
+            let entry = tree
+                .lookup_entry_by_path(path.to_str())?
+                .ok_or_else(missing)?;
             if !entry.mode().is_blob() {
                 bail!("a {} in {commit}, not a file", entry.mode().as_str());
             }
             Ok(entry.object()?.try_into_blob()?.detach().data)
         })()?;
         Ok(String::from_utf8(contents)?)
-    }
-
-    fn relative<'p>(&self, path: &'p str) -> Option<&'p str> {
-        path.strip_prefix(self.prefix.as_str())
     }
 }
 
@@ -411,7 +409,7 @@ impl ConsumeHunk for Collect {
 }
 
 fn changed_file(
-    path: &str,
+    path: &SourcePath,
     old: &str,
     new: &str,
     context: u32,
@@ -493,7 +491,7 @@ fn changed_file(
         hunks.push(Hunk::new(path, header, section, lines));
     }
     Ok(NonEmpty::from_vec(hunks).map(|hunks| FileDiff {
-        path: path.to_string(),
+        path: path.clone(),
         hunks,
     }))
 }
@@ -509,16 +507,24 @@ impl CommitFiles {
         CommitFiles { repo, commit }
     }
 
-    pub fn paths(&self) -> Result<Vec<String>, Error> {
+    pub fn paths(&self, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
         let entries = tree_entries(self.repo.root_tree(&self.commit)?.as_ref())?;
-        entries
-            .into_iter()
-            .filter(|(_, (mode, _))| mode.is_blob())
-            .map(|(path, _)| Ok(String::from_utf8(path)?))
-            .collect()
+        let mut found = Vec::new();
+        for (raw, (mode, _)) in entries {
+            if !mode.is_blob() {
+                continue;
+            }
+            let text = std::str::from_utf8(&raw)?;
+            match SourcePath::new(text, ignore) {
+                Ok(path) => found.push(path),
+                Err(SourcePathError::Ignored) => {}
+                Err(e) => return Err(Error::from(e).context(text.to_string())),
+            }
+        }
+        Ok(found)
     }
 
-    pub fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
+    pub fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
         self.repo.read_file_text(&self.commit, path)
     }
 }
@@ -559,7 +565,25 @@ impl GitRepo {
         }))
     }
 
-    pub fn diff_commits(
+    pub fn changes(
+        &self,
+        selection: &LocalSelection,
+        context: u32,
+        ignore: Option<&Ignore>,
+    ) -> Result<Option<Changes>, Error> {
+        Ok(match selection {
+            LocalSelection::Rev(_) => None,
+            LocalSelection::Diff(diff) => Some(Changes {
+                diff: self.changes_between_commits(&diff.base, &diff.head, context, 0)?,
+                untracked: Vec::new(),
+            }),
+            LocalSelection::DiffToDisk(to_disk) => {
+                Some(self.changes_on_disk_since(&to_disk.base, context, ignore)?)
+            }
+        })
+    }
+
+    fn changes_between_commits(
         &self,
         base: &GitObjectId,
         head: &GitObjectId,
@@ -570,22 +594,23 @@ impl GitRepo {
         let new = tree_entries(self.root_tree(head)?.as_ref())?;
         let mut files = Vec::new();
         for (raw, &(mode, _)) in &new {
-            let path = std::str::from_utf8(raw)?;
             if !mode.is_blob() {
                 continue;
             }
+            let text = std::str::from_utf8(raw)?;
+            let path = SourcePath::new(text, None).with_context(|| text.to_string())?;
             let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
             let texts = (|| -> Result<(String, String), ReadTextError> {
                 let old_text = if in_base {
-                    self.read_file_text(base, path)?
+                    self.read_file_text(base, &path)?
                 } else {
                     String::new()
                 };
-                Ok((old_text, self.read_file_text(head, path)?))
+                Ok((old_text, self.read_file_text(head, &path)?))
             })();
             match texts {
                 Ok((old_text, new_text)) => files.extend(changed_file(
-                    path,
+                    &path,
                     &old_text,
                     &new_text,
                     context,
@@ -600,19 +625,32 @@ impl GitRepo {
         Ok(Diff { files })
     }
 
-    pub fn diff_work_tree(&self, base: &GitObjectId, context: u32) -> Result<Diff, Error> {
+    fn changes_on_disk_since(
+        &self,
+        base: &GitObjectId,
+        context: u32,
+        ignore: Option<&Ignore>,
+    ) -> Result<Changes, Error> {
         let old = tree_entries(self.root_tree(base)?.as_ref())?;
         let index = self.repo.index_or_empty()?;
-        let tracked: BTreeSet<&[u8]> = index
-            .entries()
-            .iter()
-            .filter_map(|entry| entry.path(&index).strip_prefix(self.prefix.as_bytes()))
-            .collect();
-        let directory = self.top.join(&self.prefix);
+        let mut tracked = BTreeSet::new();
+        for entry in index.entries() {
+            let text = std::str::from_utf8(entry.path(&index))?;
+            let built = match &self.subfolder {
+                Some(subfolder) => SourcePath::from_base(subfolder, Path::new(text), ignore),
+                None => SourcePath::new(text, ignore),
+            };
+            match built {
+                Ok(path) => {
+                    tracked.insert(path);
+                }
+                Err(SourcePathError::Outside | SourcePathError::Ignored) => {}
+                Err(e) => return Err(Error::from(e).context(text.to_string())),
+            }
+        }
         let mut files = Vec::new();
-        for raw in tracked {
-            let path = std::str::from_utf8(raw)?;
-            let file = directory.join(path);
+        for path in tracked {
+            let file = path.on_disk(&self.root);
             let metadata = match std::fs::symlink_metadata(&file) {
                 Ok(metadata) => metadata,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -621,10 +659,12 @@ impl GitRepo {
             if !metadata.is_file() {
                 continue;
             }
-            let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
+            let in_base = old
+                .get(path.to_str().as_bytes())
+                .is_some_and(|(old_mode, _)| old_mode.is_blob());
             let texts = (|| -> Result<(String, String), ReadTextError> {
                 let old_text = if in_base {
-                    self.read_file_text(base, path)?
+                    self.read_file_text(base, &path)?
                 } else {
                     String::new()
                 };
@@ -633,7 +673,7 @@ impl GitRepo {
             })();
             match texts {
                 Ok((old_text, new_text)) => {
-                    files.extend(changed_file(path, &old_text, &new_text, context, 0)?)
+                    files.extend(changed_file(&path, &old_text, &new_text, context, 0)?)
                 }
                 Err(ReadTextError::NotUtf8(e)) => {
                     tracing::debug!("skipping {path}: not UTF-8 text: {e}");
@@ -641,29 +681,34 @@ impl GitRepo {
                 Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
             }
         }
-        Ok(Diff { files })
-    }
 
-    pub fn untracked_files(&self, ignored: IgnoredFiles) -> Result<Vec<String>, Error> {
-        let index = self.repo.index_or_empty()?;
-        let mut found = Vec::new();
-        match ignored {
-            IgnoredFiles::Included => {
-                let tracked: HashSet<&[u8]> = index
+        let mut untracked = Vec::new();
+        let mut add_untracked = |text: &str| -> Result<(), Error> {
+            let built = match &self.subfolder {
+                Some(subfolder) => SourcePath::from_base(subfolder, Path::new(text), ignore),
+                None => SourcePath::new(text, ignore),
+            };
+            match built {
+                Ok(path) => untracked.push(path),
+                Err(SourcePathError::Outside | SourcePathError::Ignored) => {}
+                Err(e) => return Err(Error::from(e).context(text.to_string())),
+            }
+            Ok(())
+        };
+        match ignore {
+            None => {
+                let in_index: HashSet<&[u8]> = index
                     .entries()
                     .iter()
                     .map(|entry| &**entry.path(&index))
                     .collect();
-                for full in crate::walk::walk(&self.top)? {
-                    if tracked.contains(full.as_bytes()) {
-                        continue;
-                    }
-                    if let Some(path) = self.relative(&full) {
-                        found.push(path.to_string());
+                for full in crate::walk::walk(&self.top, None)? {
+                    if !in_index.contains(full.to_str().as_bytes()) {
+                        add_untracked(full.to_str())?;
                     }
                 }
             }
-            IgnoredFiles::Excluded => {
+            Some(_) => {
                 let options = self
                     .repo
                     .dirwalk_options()?
@@ -684,17 +729,13 @@ impl GitRepo {
                     {
                         continue;
                     }
-                    let full = std::str::from_utf8(&entry.rela_path)?;
-                    if let Some(path) = self.relative(full) {
-                        found.push(path.to_string());
-                    }
+                    add_untracked(std::str::from_utf8(&entry.rela_path)?)?;
                 }
             }
         }
-        let base = self.top.join(&self.prefix);
         let mut kept = Vec::new();
-        for path in found {
-            let joined = base.join(&path);
+        for path in untracked {
+            let joined = path.on_disk(&self.root);
             match std::fs::canonicalize(&joined) {
                 Ok(real) if real == joined => kept.push(path),
                 Ok(_) => {}
@@ -702,28 +743,23 @@ impl GitRepo {
                 Err(e) => return Err(anyhow!("{}: {e}", joined.display())),
             }
         }
-        Ok(kept)
+        Ok(Changes {
+            diff: Diff { files },
+            untracked: kept,
+        })
     }
 
     pub fn ignore_files_above(&self, at: ReadFrom<'_>) -> Result<AboveSource, Error> {
-        let parts: Vec<&str> = if self.prefix.is_empty() {
-            Vec::new()
-        } else {
-            self.prefix.trim_end_matches('/').split('/').collect()
-        };
+        let parts: Vec<&std::ffi::OsStr> = self.subfolder.iter().flat_map(|s| s.iter()).collect();
         let tree = match at {
             ReadFrom::Disk => None,
             ReadFrom::Commit(commit) => Some(self.commit_tree(commit)?),
         };
         let mut ignore_files = Vec::new();
         for n in 0..parts.len() {
-            let directory = parts[..n].join("/");
+            let directory: PathBuf = parts[..n].iter().collect();
             for name in [".gitignore", ".ignore"] {
-                let path = if directory.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{directory}/{name}")
-                };
+                let path = directory.join(name);
                 let contents = match &tree {
                     None => {
                         let file = self.top.join(&path);
@@ -743,7 +779,8 @@ impl GitRepo {
                             Some(entry.object()?.try_into_blob()?.detach().data)
                         }
                         Some(entry) => bail!(
-                            "{path} is a {}, not a file; an ignore file must be a file",
+                            "{} is a {}, not a file; an ignore file must be a file",
+                            path.display(),
                             entry.mode().as_str()
                         ),
                     },
@@ -757,7 +794,7 @@ impl GitRepo {
             }
         }
         Ok(AboveSource {
-            prefix: self.prefix.clone(),
+            subfolder: self.subfolder.clone(),
             ignore_files,
         })
     }

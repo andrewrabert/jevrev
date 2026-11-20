@@ -1,4 +1,5 @@
 use jevrev::gitignore::{Check, Pattern, Spec};
+use jevrev::source_path::SourcePath;
 
 type Case = (&'static [&'static str], &'static [(&'static str, Check)]);
 
@@ -25,7 +26,6 @@ fn patterns_match_as_git_does() {
             &["dir/"],
             &[
                 ("dir", Check::Unmatched),
-                ("dir/", Check::Included),
                 ("dir/x", Check::Included),
                 ("a/dir/x", Check::Included),
                 ("dirx/y", Check::Unmatched),
@@ -78,7 +78,6 @@ fn patterns_match_as_git_does() {
                 ("ax", Check::Included),
                 ("dx", Check::Unmatched),
                 ("a", Check::Unmatched),
-                ("b/", Check::Unmatched),
             ],
         ),
         (
@@ -97,20 +96,11 @@ fn patterns_match_as_git_does() {
         ),
         (
             &["*/"],
-            &[
-                ("a", Check::Unmatched),
-                ("a/", Check::Included),
-                ("a/b", Check::Included),
-                ("a/b/", Check::Included),
-            ],
+            &[("a", Check::Unmatched), ("a/b", Check::Included)],
         ),
         (
             &["**/"],
-            &[
-                ("a", Check::Unmatched),
-                ("a/", Check::Included),
-                ("a/b", Check::Included),
-            ],
+            &[("a", Check::Unmatched), ("a/b", Check::Included)],
         ),
         (
             &["dir/", "!dir/keep"],
@@ -119,10 +109,7 @@ fn patterns_match_as_git_does() {
                 ("dir/other", Check::Included),
             ],
         ),
-        (
-            &["*.txt", "!/dir/"],
-            &[("dir/a.txt", Check::Included), ("dir/", Check::Excluded)],
-        ),
+        (&["*.txt", "!/dir/"], &[("dir/a.txt", Check::Included)]),
         (
             &["a[--z]b"],
             &[
@@ -162,7 +149,11 @@ fn patterns_match_as_git_does() {
     for (patterns, expected) in cases {
         let spec = Spec::from_lines(patterns.iter().copied()).unwrap();
         for (path, check) in *expected {
-            assert_eq!(spec.check(path), *check, "{patterns:?} against {path:?}");
+            assert_eq!(
+                spec.check(&SourcePath::new(path, None).unwrap()),
+                *check,
+                "{patterns:?} against {path:?}"
+            );
         }
     }
     assert_eq!(Pattern::new("*.py").as_str(), "*.py");

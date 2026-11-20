@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -9,30 +10,11 @@ use crate::gitignore::{Check, Spec};
 
 const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fate {
-    Ignored,
-    Kept,
-}
-
-fn parent_dirs(path: &str) -> Vec<String> {
-    let parts: Vec<&str> = path.split('/').collect();
-    let mut found = vec![String::new()];
-    for n in 1..parts.len() {
-        found.push(parts[..n].join("/"));
-    }
-    found
-}
-
-fn directory_of(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(directory, _)| directory)
-}
-
 #[derive(Debug, Clone)]
 pub struct Ignore {
-    prefix: String,
+    subfolder: Option<PathBuf>,
     excludes: Vec<Spec>,
-    by_dir: HashMap<String, Vec<Spec>>,
+    by_dir: HashMap<PathBuf, Vec<Spec>>,
 }
 
 impl Ignore {
@@ -41,41 +23,52 @@ impl Ignore {
         excludes: Vec<Spec>,
         above: &AboveSource,
     ) -> Result<Ignore, Error> {
-        let mut by_dir: HashMap<String, Vec<Spec>> = HashMap::new();
+        let mut by_dir: HashMap<PathBuf, Vec<Spec>> = HashMap::new();
         for file in &above.ignore_files {
-            by_dir.entry(file.directory.clone()).or_default().push(
-                Spec::from_bytes(&file.contents)
-                    .with_context(|| format!("an ignore file in {:?}", file.directory))?,
-            );
-        }
-        let mut found: Vec<String> = files
-            .paths()?
-            .into_iter()
-            .filter(|path| IGNORE_FILES.contains(&path.rsplit('/').next().unwrap_or(path)))
-            .collect();
-        let rank = |path: &str| {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            IGNORE_FILES.iter().position(|n| *n == name).unwrap_or(0)
-        };
-        found.sort_by(|a, b| (directory_of(a), rank(a)).cmp(&(directory_of(b), rank(b))));
-        for path in found {
-            let full = format!("{}{path}", above.prefix);
             by_dir
-                .entry(directory_of(&full).to_string())
+                .entry(PathBuf::from(&file.directory))
                 .or_default()
                 .push(
-                    Spec::from_lines(files.read_text(&path).await?.lines())
-                        .with_context(|| path.clone())?,
+                    Spec::from_bytes(&file.contents)
+                        .with_context(|| format!("an ignore file in {:?}", file.directory))?,
                 );
         }
+        let in_repository = |path: &Path| match &above.subfolder {
+            Some(subfolder) => subfolder.join(path),
+            None => path.to_path_buf(),
+        };
+        let mut found: Vec<(PathBuf, usize, _)> = files
+            .paths(None)?
+            .into_iter()
+            .filter_map(|path| {
+                let rank = IGNORE_FILES.iter().position(|n| *n == path.file_name())?;
+                let full = in_repository(Path::new(path.to_str()));
+                let directory = full
+                    .parent()
+                    .expect("a file path has a parent")
+                    .to_path_buf();
+                Some((directory, rank, path))
+            })
+            .collect();
+        found.sort();
+        for (directory, _, path) in found {
+            let text = files
+                .read_text(&path)
+                .await
+                .map_err(|e| Error::from(e).context(path.to_string()))?;
+            by_dir
+                .entry(directory)
+                .or_default()
+                .push(Spec::from_lines(text.lines()).with_context(|| path.to_string())?);
+        }
         Ok(Ignore {
-            prefix: above.prefix.clone(),
+            subfolder: above.subfolder.clone(),
             excludes,
             by_dir,
         })
     }
 
-    fn ignored(&self, path: &str, is_dir: bool) -> bool {
+    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
         let mut result = Check::Unmatched;
         let mut apply = |check: Check| {
             if check != Check::Unmatched {
@@ -85,26 +78,28 @@ impl Ignore {
         for spec in &self.excludes {
             apply(spec.check_entry(path, is_dir));
         }
-        for directory in parent_dirs(path) {
-            let relative = if directory.is_empty() {
-                path
-            } else {
-                path.get(directory.len() + 1..).unwrap_or("")
-            };
-            for spec in self.by_dir.get(&directory).into_iter().flatten() {
+        let mut directories: Vec<&Path> = path.ancestors().skip(1).collect();
+        directories.reverse();
+        for directory in directories {
+            let relative = path
+                .strip_prefix(directory)
+                .expect("an ancestor of a path is its prefix");
+            for spec in self.by_dir.get(directory).into_iter().flatten() {
                 apply(spec.check_entry(relative, is_dir));
             }
         }
         result == Check::Included
     }
 
-    pub fn fate(&self, path: &str) -> Fate {
-        let path = format!("{}{path}", self.prefix);
-        let dirs = parent_dirs(&path);
-        if dirs[1..].iter().any(|d| self.ignored(d, true)) || self.ignored(&path, false) {
-            Fate::Ignored
-        } else {
-            Fate::Kept
-        }
+    pub fn ignores(&self, path: &Path) -> bool {
+        let path = match &self.subfolder {
+            Some(subfolder) => subfolder.join(path),
+            None => path.to_path_buf(),
+        };
+        path.ancestors()
+            .skip(1)
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .any(|directory| self.ignored(directory, true))
+            || self.ignored(&path, false)
     }
 }

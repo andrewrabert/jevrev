@@ -3,13 +3,21 @@ use std::collections::BTreeMap;
 use jevrev::files::{Files, InMemory};
 use jevrev::git::{AboveSource, IgnoreFile};
 use jevrev::gitignore::Spec;
-use jevrev::ignore_rules::{Fate, Ignore};
+use std::path::PathBuf;
+
+use jevrev::ignore_rules::Ignore;
+use jevrev::source_path::{SourcePath, SourcePathError};
 
 fn files(entries: &[(&str, &str)]) -> Files {
     Files::InMemory(InMemory::new(
         entries
             .iter()
-            .map(|(path, text)| (path.to_string(), text.as_bytes().to_vec()))
+            .map(|(path, text)| {
+                (
+                    SourcePath::new(path, None).unwrap(),
+                    text.as_bytes().to_vec(),
+                )
+            })
             .collect::<BTreeMap<_, _>>(),
     ))
 }
@@ -28,7 +36,6 @@ async fn ignore_files_apply_with_dot_ignore_winning() {
         ("build/x.txt", ""),
         ("secret.txt", ""),
         ("x.py", ""),
-        (".git/config", ""),
     ]);
     let ignore = Ignore::load(
         &source,
@@ -37,40 +44,41 @@ async fn ignore_files_apply_with_dot_ignore_winning() {
     )
     .await
     .unwrap();
-    let fate = |path: &str| ignore.fate(path);
-    assert_eq!(fate("a.log"), Fate::Ignored);
-    assert_eq!(fate("keep.log"), Fate::Ignored);
-    assert_eq!(fate("sub/b.log"), Fate::Kept);
-    assert_eq!(fate("sub/local.txt"), Fate::Ignored);
-    assert_eq!(fate("build/keep.log"), Fate::Ignored);
-    assert_eq!(fate("build/x.txt"), Fate::Ignored);
-    assert_eq!(fate("secret.txt"), Fate::Ignored);
-    assert_eq!(fate("x.py"), Fate::Kept);
-    assert!(
-        !source
-            .paths()
-            .unwrap()
-            .iter()
-            .any(|p| p.starts_with(".git/"))
-    );
+    let kept = |ignore: &Ignore, path: &str| match SourcePath::new(path, Some(ignore)) {
+        Ok(_) => true,
+        Err(SourcePathError::Ignored) => false,
+        Err(e) => panic!("{path}: {e}"),
+    };
+    assert!(!kept(&ignore, "a.log"));
+    assert!(!kept(&ignore, "keep.log"));
+    assert!(kept(&ignore, "sub/b.log"));
+    assert!(!kept(&ignore, "sub/local.txt"));
+    assert!(!kept(&ignore, "build/keep.log"));
+    assert!(!kept(&ignore, "build/x.txt"));
+    assert!(!kept(&ignore, "secret.txt"));
+    assert!(kept(&ignore, "x.py"));
+    assert!(matches!(
+        SourcePath::new(".git/config", None),
+        Err(SourcePathError::InsideGitDirectory)
+    ));
 
     let below = files(&[("a.txt", ""), ("b.md", ""), (".gitignore", "!c.txt\n")]);
     let above = AboveSource {
-        prefix: "pkg/".into(),
+        subfolder: Some(PathBuf::from("pkg")),
         ignore_files: vec![
             IgnoreFile {
-                directory: String::new(),
+                directory: PathBuf::new(),
                 contents: b"pkg/a.txt\nc.txt\n".to_vec(),
             },
             IgnoreFile {
-                directory: String::new(),
+                directory: PathBuf::new(),
                 contents: b"*.md\n".to_vec(),
             },
         ],
     };
     let ignore = Ignore::load(&below, Vec::new(), &above).await.unwrap();
-    assert_eq!(ignore.fate("a.txt"), Fate::Ignored);
-    assert_eq!(ignore.fate("b.md"), Fate::Ignored);
-    assert_eq!(ignore.fate("c.txt"), Fate::Kept);
-    assert_eq!(ignore.fate(".gitignore"), Fate::Kept);
+    assert!(!kept(&ignore, "a.txt"));
+    assert!(!kept(&ignore, "b.md"));
+    assert!(kept(&ignore, "c.txt"));
+    assert!(kept(&ignore, ".gitignore"));
 }

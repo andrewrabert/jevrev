@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 
 use crate::lines::LineRange;
 use crate::rules::Language;
+use crate::source_path::SourcePath;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestMarker {
@@ -165,16 +166,12 @@ static SHEBANGS: LazyLock<Vec<(Language, Vec<regex::Regex>)>> = LazyLock::new(||
     ]
 });
 
-pub fn detect(name: &str, source: &str) -> BTreeSet<Language> {
-    let file_name = name.rsplit('/').next().unwrap_or(name);
+pub fn detect(path: &SourcePath, source: &str) -> BTreeSet<Language> {
     let mut found = BTreeSet::new();
-    if matches!(file_name, "justfile" | "Justfile" | ".justfile") {
+    if matches!(path.file_name(), "justfile" | "Justfile" | ".justfile") {
         found.insert(Language::Just);
     }
-    match std::path::Path::new(file_name)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
+    match path.extension() {
         Some("rs") => {
             found.insert(Language::Rust);
         }

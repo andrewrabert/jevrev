@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 
 use crate::Error;
+use crate::ignore_rules::Ignore;
+use crate::source_path::{SourcePath, SourcePathError};
 
-pub fn walk(root: &Path) -> Result<Vec<String>, Error> {
+pub fn walk(root: &Path, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
     let top = std::fs::canonicalize(root).with_context(|| root.display().to_string())?;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut found = Vec::new();
@@ -35,13 +37,11 @@ pub fn walk(root: &Path) -> Result<Vec<String>, Error> {
         if !seen.insert(real) {
             continue;
         }
-        let relative = entry.path().strip_prefix(root).with_context(|| {
-            format!("{} is not under {}", entry.path().display(), root.display())
-        })?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| anyhow!("{}: the path is not valid UTF-8", entry.path().display()))?;
-        found.push(relative.to_string());
+        match SourcePath::from_base(root, entry.path(), ignore) {
+            Ok(path) => found.push(path),
+            Err(SourcePathError::Ignored) => {}
+            Err(e) => return Err(Error::from(e).context(entry.path().display().to_string())),
+        }
     }
     found.sort();
     Ok(found)

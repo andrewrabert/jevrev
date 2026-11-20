@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ use crate::github::credentials::Token;
 use crate::github::pull_request::{GithubPullRequest, PullRequest, User};
 use crate::github::repo::{DEFAULT_HOST, GithubHost, GithubRepo};
 use crate::github::review;
+use crate::ignore_rules::Ignore;
+use crate::source_path::{SourcePath, SourcePathError};
 use crate::store::{Finding, Review};
 
 const DEFAULT_API: &str = "https://api.github.com";
@@ -66,11 +69,20 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    pub fn paths(&self) -> Vec<String> {
-        self.blobs.keys().cloned().collect()
+    pub fn paths(&self, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
+        let mut found = Vec::new();
+        for text in self.blobs.keys() {
+            match SourcePath::new(text, ignore) {
+                Ok(path) => found.push(path),
+                Err(SourcePathError::Ignored) => {}
+                Err(e) => return Err(Error::from(e).context(text.clone())),
+            }
+        }
+        Ok(found)
     }
 
-    pub async fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
+    pub async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
+        let path = path.to_str();
         let cached = self.cache()?.get(path).cloned();
         if let Some(found) = cached {
             return Ok(found);
@@ -344,14 +356,13 @@ impl Client {
             if !regular {
                 continue;
             }
-            let name = String::from_utf8(entry.path_bytes().into_owned())?;
-            let path = name
-                .split_once('/')
-                .map_or("", |(_, rest)| rest)
-                .to_string();
-            if path.is_empty() {
-                continue;
-            }
+            let entry_path = entry.path().map_err(broken)?.into_owned();
+            let archive_folder: PathBuf = entry_path.components().take(1).collect();
+            let path = match SourcePath::from_base(&archive_folder, &entry_path, None) {
+                Ok(path) => path,
+                Err(SourcePathError::InsideGitDirectory) => continue,
+                Err(e) => return Err(Error::from(e).context(entry_path.display().to_string())),
+            };
             let mut data = Vec::new();
             entry.read_to_end(&mut data).map_err(broken)?;
             contents.insert(path, data);
@@ -436,21 +447,28 @@ impl Client {
             Ok::<_, ReadTextError>(String::from_utf8(self.blob(repo, &sha).await?)?)
         };
         let read_pairs: Vec<_> = futures::stream::iter(changed)
-            .map(|(path, before, after)| async move {
-                let sides = futures::future::try_join(read(before), read_new(after)).await;
-                (path, sides)
+            .map(|(text, before, after)| async move {
+                let path = SourcePath::new(&text, None).map_err(|e| Error::from(e).context(text));
+                match path {
+                    Ok(path) => Ok((
+                        path,
+                        futures::future::try_join(read(before), read_new(after)).await,
+                    )),
+                    Err(e) => Err(e),
+                }
             })
             .buffered(BLOB_CONCURRENCY / 2)
             .collect()
             .await;
         let mut pairs = Vec::new();
-        for (path, sides) in read_pairs {
+        for read in read_pairs {
+            let (path, sides) = read?;
             match sides {
                 Ok((old, new)) => pairs.push(ContentPair { path, old, new }),
                 Err(ReadTextError::NotUtf8(e)) => {
                     tracing::debug!("skipping {path}: not UTF-8 text: {e}");
                 }
-                Err(ReadTextError::Read(e)) => return Err(e.context(path)),
+                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
             }
         }
         git::diff_contents(&pairs, context, inter_hunk_context)

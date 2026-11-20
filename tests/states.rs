@@ -9,6 +9,7 @@ use jevrev::lines::LineRange;
 use jevrev::non_empty::NonEmpty;
 use jevrev::rules::Language;
 use jevrev::scan::{Changes, IgnoreRules, ScanScope, scan};
+use jevrev::source_path::SourcePath;
 use jevrev::state::State;
 
 fn fixtures() -> std::path::PathBuf {
@@ -33,24 +34,25 @@ fn files_tile_into_the_captured_ranges() {
         let expected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join(format!("{name}.json"))).unwrap())
                 .unwrap();
-        let found: serde_json::Map<String, serde_json::Value> = languages::detect(name, &source)
-            .into_iter()
-            .map(|language| {
-                let languages::Syntax::Valid(ranges) =
-                    languages::ranges(language, source.as_bytes())
-                else {
-                    panic!("{name} is not valid {}", language_name(language));
-                };
-                let ranges = ranges
-                    .iter()
-                    .map(|r| serde_json::json!([r.start(), r.end()]))
-                    .collect();
-                (
-                    language_name(language).to_string(),
-                    serde_json::Value::Array(ranges),
-                )
-            })
-            .collect();
+        let found: serde_json::Map<String, serde_json::Value> =
+            languages::detect(&SourcePath::new(name, None).unwrap(), &source)
+                .into_iter()
+                .map(|language| {
+                    let languages::Syntax::Valid(ranges) =
+                        languages::ranges(language, source.as_bytes())
+                    else {
+                        panic!("{name} is not valid {}", language_name(language));
+                    };
+                    let ranges = ranges
+                        .iter()
+                        .map(|r| serde_json::json!([r.start(), r.end()]))
+                        .collect();
+                    (
+                        language_name(language).to_string(),
+                        serde_json::Value::Array(ranges),
+                    )
+                })
+                .collect();
         assert_eq!(serde_json::Value::Object(found), expected, "{name}");
     }
 }
@@ -95,14 +97,14 @@ fn diff_of(value: &serde_json::Value) -> Diff {
             .unwrap()
             .iter()
             .map(|file| FileDiff {
-                path: text(&file["path"]),
+                path: SourcePath::new(file["path"].as_str().unwrap(), None).unwrap(),
                 hunks: NonEmpty::from_vec(
                     file["hunks"]
                         .as_array()
                         .unwrap()
                         .iter()
                         .map(|hunk| Hunk {
-                            path: text(&file["path"]),
+                            path: SourcePath::new(file["path"].as_str().unwrap(), None).unwrap(),
                             old: side(
                                 number(&hunk["source_start"]),
                                 number(&hunk["source_length"]),
@@ -142,7 +144,12 @@ async fn changes_split_into_the_captured_states() {
             .as_object()
             .unwrap()
             .iter()
-            .map(|(path, text)| (path.clone(), text.as_str().unwrap().as_bytes().to_vec()))
+            .map(|(path, text)| {
+                (
+                    SourcePath::new(path, None).unwrap(),
+                    text.as_str().unwrap().as_bytes().to_vec(),
+                )
+            })
             .collect::<BTreeMap<_, _>>(),
     ));
     let changes = Changes {
@@ -151,7 +158,7 @@ async fn changes_split_into_the_captured_states() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap().to_string())
+            .map(|v| SourcePath::new(v.as_str().unwrap(), None).unwrap())
             .collect(),
     };
     let rules = tempfile::tempdir().unwrap();

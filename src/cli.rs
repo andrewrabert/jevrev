@@ -11,7 +11,7 @@ use clap::builder::{OsStringValueParser, TypedValueParser};
 use crate::files::{Files, OnDisk, OneFile};
 use crate::git::{
     AboveSource, CommitFiles, DiffBase, DiffRange, GitDiff, GitDiffSpec, GitRepo, GitRev,
-    GitRevision, IgnoredFiles, LocalSelection, ReadFrom,
+    GitRevision, LocalSelection, ReadFrom,
 };
 use crate::github::api;
 use crate::github::credentials::Token;
@@ -24,6 +24,7 @@ use crate::jev::{
     api::{ApiKey, BaseUrl, Model, Timeout},
 };
 use crate::scan::{self, Changes, Concurrency, IgnoreRules, ScanError, ScanScope};
+use crate::source_path::SourcePath;
 use crate::store::{self, Finding, GithubSelection, Judgment, Review, Source, Stored, Verdict};
 use crate::{Error, output};
 
@@ -608,17 +609,15 @@ async fn cmd_scan(scan: Scan<'_>, path: &Path, no_ignore: bool) -> Result<u8, Er
         (name, files, ignore)
     } else if path.is_file() {
         let absolute = std::path::absolute(path)?;
-        let name = absolute
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let parent = absolute.parent().unwrap_or(Path::new("/"));
-        let root = std::fs::canonicalize(parent)
-            .with_context(|| shown(path))?
-            .join(&name);
+        let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) else {
+            bail!("{}: not a file path", shown(path));
+        };
+        let directory = std::fs::canonicalize(parent).with_context(|| shown(path))?;
+        let root = directory.join(file_name);
+        let name = SourcePath::from_base(&directory, &root, None).with_context(|| shown(path))?;
         (
             utf8_root(path, &root)?,
-            Files::OneFile(OneFile::new(root, name)),
+            Files::OneFile(OneFile::new(root.clone(), name)),
             IgnoreRules::Off,
         )
     } else {
@@ -655,38 +654,27 @@ async fn cmd_scan_git(
         (None, Some(spec)) => repo.resolve_diff(spec)?,
         (None, None) => bail!("scan-git: give --rev or --diff"),
     };
-    let (files, changes, at) = match &selection {
+    let (files, at) = match &selection {
         LocalSelection::Rev(rev) => (
             Files::Commit(CommitFiles::new(repo.clone(), rev.commit.clone())),
-            None,
             ReadFrom::Commit(&rev.commit),
         ),
         LocalSelection::Diff(diff) => (
             Files::Commit(CommitFiles::new(repo.clone(), diff.head.clone())),
-            Some(Changes {
-                diff: repo.diff_commits(&diff.base, &diff.head, scan::DIFF_CONTEXT, 0)?,
-                untracked: Vec::new(),
-            }),
             ReadFrom::Commit(&diff.head),
         ),
-        LocalSelection::DiffToDisk(to_disk) => (
-            Files::OnDisk(OnDisk::new(root.clone())),
-            Some(Changes {
-                diff: repo.diff_work_tree(&to_disk.base, scan::DIFF_CONTEXT)?,
-                untracked: repo.untracked_files(if no_ignore {
-                    IgnoredFiles::Included
-                } else {
-                    IgnoredFiles::Excluded
-                })?,
-            }),
-            ReadFrom::Disk,
-        ),
+        LocalSelection::DiffToDisk(_) => (Files::OnDisk(OnDisk::new(root.clone())), ReadFrom::Disk),
     };
     let ignore = if no_ignore {
         IgnoreRules::Off
     } else {
         local_ignore(Some(&repo), &files, at).await?
     };
+    let rules = match &ignore {
+        IgnoreRules::Apply(ignore) => Some(ignore),
+        IgnoreRules::Off => None,
+    };
+    let changes = repo.changes(&selection, scan::DIFF_CONTEXT, rules)?;
     scan_and_save(
         scan,
         Source::LocalGitDir {

@@ -11,6 +11,7 @@ pub mod non_empty;
 pub mod output;
 pub mod rules;
 pub mod scan;
+pub mod source_path;
 pub mod state;
 pub mod store;
 pub mod templates;

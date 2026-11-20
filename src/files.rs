@@ -6,6 +6,8 @@ use std::string::FromUtf8Error;
 use crate::Error;
 use crate::git::CommitFiles;
 use crate::github::api::Blobs;
+use crate::ignore_rules::Ignore;
+use crate::source_path::{SourcePath, SourcePathError};
 use crate::walk::walk;
 
 #[derive(Debug, Clone)]
@@ -22,28 +24,23 @@ impl OnDisk {
 #[derive(Debug, Clone)]
 pub struct OneFile {
     path: PathBuf,
-    name: String,
+    name: SourcePath,
 }
 
 impl OneFile {
-    pub fn new(path: PathBuf, name: String) -> OneFile {
+    pub fn new(path: PathBuf, name: SourcePath) -> OneFile {
         OneFile { path, name }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemory {
-    contents: BTreeMap<String, Vec<u8>>,
+    contents: BTreeMap<SourcePath, Vec<u8>>,
 }
 
 impl InMemory {
-    pub fn new(contents: BTreeMap<String, Vec<u8>>) -> InMemory {
-        InMemory {
-            contents: contents
-                .into_iter()
-                .filter(|(path, _)| !path.split('/').any(|part| part == ".git"))
-                .collect(),
-        }
+    pub fn new(contents: BTreeMap<SourcePath, Vec<u8>>) -> InMemory {
+        InMemory { contents }
     }
 }
 
@@ -65,20 +62,29 @@ pub enum ReadTextError {
 }
 
 impl Files {
-    pub fn paths(&self) -> Result<Vec<String>, Error> {
-        match self {
-            Files::OnDisk(files) => walk(&files.root),
-            Files::OneFile(file) => Ok(vec![file.name.clone()]),
-            Files::Commit(files) => files.paths(),
-            Files::InMemory(files) => Ok(files.contents.keys().cloned().collect()),
-            Files::Blobs(blobs) => Ok(blobs.paths()),
+    pub fn paths(&self, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
+        let known: Vec<&SourcePath> = match self {
+            Files::OnDisk(files) => return walk(&files.root, ignore),
+            Files::Commit(files) => return files.paths(ignore),
+            Files::Blobs(blobs) => return blobs.paths(ignore),
+            Files::OneFile(file) => vec![&file.name],
+            Files::InMemory(files) => files.contents.keys().collect(),
+        };
+        let mut found = Vec::new();
+        for path in known {
+            match SourcePath::new(path.to_str(), ignore) {
+                Ok(path) => found.push(path),
+                Err(SourcePathError::Ignored) => {}
+                Err(e) => return Err(Error::from(e).context(path.to_string())),
+            }
         }
+        Ok(found)
     }
 
-    pub async fn read_text(&self, path: &str) -> Result<String, ReadTextError> {
+    pub async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
         match self {
             Files::OnDisk(files) => {
-                let contents = std::fs::read(files.root.join(path)).map_err(Error::from)?;
+                let contents = std::fs::read(path.on_disk(&files.root)).map_err(Error::from)?;
                 Ok(String::from_utf8(contents)?)
             }
             Files::OneFile(file) => {
