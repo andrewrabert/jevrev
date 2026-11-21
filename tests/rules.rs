@@ -49,7 +49,7 @@ fn every_example_rule_set_loads() {
     for (name, rules, threshold, languages, examples, flags) in expected {
         let set = RuleSet::load(&directory.join(name)).unwrap();
         assert_eq!(set.rules.len(), *rules, "{name}");
-        assert_eq!(set.error_threshold, *threshold, "{name}");
+        assert_eq!(set.error_threshold.into_inner(), *threshold, "{name}");
         let Conditions::Given(when) = &set.when else {
             panic!("{name} has no when");
         };
@@ -65,10 +65,10 @@ fn every_example_rule_set_loads() {
 #[test]
 fn rule_sets_are_validated() {
     let set = RuleSet::parse("error_threshold: 0.5\nrules: []\n").unwrap();
-    assert_eq!(set.error_threshold, 0.5);
+    assert_eq!(set.error_threshold.into_inner(), 0.5);
     assert!(matches!(set.when, Conditions::Absent));
     let set = RuleSet::parse("error_threshold: 1\nwhen: ~\nrules: [{flags: x}]\n").unwrap();
-    assert_eq!(set.error_threshold, 1.0);
+    assert_eq!(set.error_threshold.into_inner(), 1.0);
     assert!(matches!(set.when, Conditions::Absent));
     let set = RuleSet::parse(
         "error_threshold: 0.5\nrules: []\nwhen: [{language: [rust], matches: ['*.rs']}]\n",

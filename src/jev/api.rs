@@ -1,6 +1,5 @@
 use anyhow::{Context, anyhow, bail};
 use std::ffi::OsStr;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -9,14 +8,11 @@ use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 
 use crate::Error;
-use crate::jev::ask::Noul;
+use crate::jev::ask::{Criteria, Instructions};
+use crate::jev::cache::{Cache, CacheKey};
 
 const MAX_RETRIES: u32 = 2;
 const MAX_ERROR_BODY_LENGTH: usize = 200;
-const MAX_CONTEXT_TOKENS: usize = 32_000;
-
-static NON_BLANK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\S").expect("a valid pattern"));
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ApiKey(String);
@@ -117,9 +113,15 @@ impl Model {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AskRequest {
+    pub(crate) url: url::Url,
+    pub(crate) body: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NoulAnswer {
     pub question: String,
-    pub probability: f64,
+    pub probability: Probability,
 }
 
 #[derive(Clone)]
@@ -128,24 +130,100 @@ pub struct Client {
     api_key: ApiKey,
     url: url::Url,
     model: Model,
+    cache: Option<Cache>,
 }
 
-#[derive(serde::Serialize)]
-struct AskRequestBody<'r> {
-    state: &'r str,
-    model: &'r Model,
-    questions: &'r IndexMap<String, Noul>,
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SystemOneRequest {
+    pub model: Model,
+    pub state: String,
+    pub questions: Questions,
 }
 
-#[derive(serde::Deserialize)]
-struct Answers {
-    answers: IndexMap<String, Answer>,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Questions(IndexMap<String, Question>);
+
+impl Questions {
+    pub fn try_new(questions: IndexMap<String, Question>) -> Result<Questions, Error> {
+        if questions.is_empty() {
+            bail!("questions: none given");
+        }
+        Ok(Questions(questions))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
 }
 
-#[derive(serde::Deserialize)]
+impl PartialEq for Questions {
+    fn eq(&self, other: &Questions) -> bool {
+        self.0.iter().eq(other.0.iter())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum Answer {
-    Noul { noul: f64 },
+pub enum Question {
+    Noul {
+        instructions: Instructions,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        criteria: Option<Criteria>,
+    },
+}
+
+#[nutype::nutype(
+    validate(finite, greater_or_equal = 0.0, less_or_equal = 1.0),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+        Deserialize,
+        Into
+    )
+)]
+pub struct Probability(f64);
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemOneResponse {
+    model: String,
+    answers: IndexMap<String, Answer>,
+    usage: Usage,
+}
+
+impl SystemOneResponse {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn answers(&self) -> &IndexMap<String, Answer> {
+        &self.answers
+    }
+
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Answer {
+    Noul { noul: Probability },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl Client {
@@ -154,6 +232,7 @@ impl Client {
         base_url: &BaseUrl,
         model: Model,
         timeout: Timeout,
+        cache: Option<Cache>,
     ) -> Result<Client, Error> {
         let mut builder = reqwest::Client::builder()
             .user_agent(format!("{}/{}", crate::APP_NAME, crate::APP_VERSION))
@@ -172,57 +251,55 @@ impl Client {
             api_key,
             url: base_url.systemone(),
             model,
+            cache,
         })
     }
 
-    pub async fn ask(
-        &self,
-        questions: &IndexMap<String, Noul>,
-        state: &str,
-    ) -> Result<Vec<NoulAnswer>, Error> {
-        let mut problems = Vec::new();
-        if !NON_BLANK.is_match(state) {
-            problems.push("state: is blank".to_string());
-        }
-        if questions.is_empty() {
-            problems.push("questions: none given".into());
-        }
-        let body = serde_json::to_vec(&AskRequestBody {
+    pub async fn ask(&self, questions: Questions, state: String) -> Result<NoulAnswers, Error> {
+        let request = SystemOneRequest {
+            model: self.model.clone(),
             state,
-            model: &self.model,
             questions,
-        })
-        .expect("a request serializes");
-        if problems.is_empty() {
-            let tokens = body.len() / 4 + 1;
-            if tokens > MAX_CONTEXT_TOKENS {
-                problems.push(format!(
-                    "request: roughly {tokens} estimated tokens cannot fit the \
-                     {MAX_CONTEXT_TOKENS}-token limit; split the state, or drop rules that do \
-                     not need the full context"
-                ));
-            }
+        };
+        let ask_request = AskRequest {
+            url: self.url.clone(),
+            body: serde_json::to_string(&request).expect("a request serializes"),
+        };
+        let answers = |response: &SystemOneResponse| {
+            NoulAnswers::try_new(response, &request.questions)
+                .map_err(|e| anyhow!("POST {}: {e}", self.url))
+        };
+        let key = CacheKey::new(&ask_request, &request.questions);
+        if let Some(cache) = &self.cache
+            && let Some(answers) = cache.get(&key).await?
+        {
+            return Ok(answers);
         }
-        if !problems.is_empty() {
-            let count = problems.len();
-            let mut lines: Vec<String> = problems
-                .into_iter()
-                .map(|p| format!("error: {p}"))
-                .collect();
-            lines.push(format!(
-                "{count} problem(s) would cause a failed or wasted call; fix them"
-            ));
-            bail!(lines.join("\n"));
+        let response = self.ask_request(&ask_request).await?;
+        let answers = answers(&response)?;
+        if let Some(cache) = &self.cache {
+            cache.put(&key, &answers);
         }
-        let endpoint = format!("POST {}", self.url);
+        Ok(answers)
+    }
+
+    pub fn finish(&self) -> Result<(), Error> {
+        match &self.cache {
+            Some(cache) => cache.finish(),
+            None => Ok(()),
+        }
+    }
+
+    async fn ask_request(&self, request: &AskRequest) -> Result<SystemOneResponse, Error> {
+        let endpoint = format!("POST {}", request.url);
         let failed = |e: &dyn std::fmt::Display| anyhow!("{endpoint}: {e}");
         let response = self
             .http
-            .post(self.url.clone())
+            .post(request.url.clone())
             .bearer_auth(&self.api_key.0)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
+            .body(request.body.clone())
             .send()
             .await
             .map_err(|e| failed(&e))?;
@@ -233,14 +310,222 @@ impl Client {
             return Err(failed(&format!("{status} {body}")));
         }
         let body = response.bytes().await.map_err(|e| failed(&e))?;
-        let parsed: Answers = serde_json::from_slice(&body).map_err(|e| failed(&e))?;
-        Ok(parsed
-            .answers
-            .into_iter()
-            .map(|(question, Answer::Noul { noul })| NoulAnswer {
-                question,
-                probability: noul,
+        serde_json::from_slice(&body).map_err(|e| failed(&e))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoulAnswers(Vec<NoulAnswer>);
+
+impl NoulAnswers {
+    pub fn try_new(
+        response: &SystemOneResponse,
+        questions: &Questions,
+    ) -> Result<NoulAnswers, Error> {
+        if let Some(name) = response.answers.keys().find(|n| !questions.contains(n)) {
+            bail!("answers: {name:?} is not a question that was asked");
+        }
+        questions
+            .names()
+            .map(|name| match response.answers.get(name) {
+                Some(Answer::Noul { noul }) => Ok(NoulAnswer {
+                    question: name.to_string(),
+                    probability: *noul,
+                }),
+                None => bail!("answers: question {name:?} has no answer"),
             })
-            .collect())
+            .collect::<Result<_, _>>()
+            .map(NoulAnswers)
+    }
+
+    pub(crate) fn from_cached(
+        probabilities: Vec<Probability>,
+        questions: &Questions,
+    ) -> Result<NoulAnswers, Error> {
+        let count = questions.names().count();
+        if probabilities.len() != count {
+            bail!(
+                "answers: {} probabilities for {count} questions",
+                probabilities.len()
+            );
+        }
+        Ok(NoulAnswers(
+            questions
+                .names()
+                .zip(probabilities)
+                .map(|(name, probability)| NoulAnswer {
+                    question: name.to_string(),
+                    probability,
+                })
+                .collect(),
+        ))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &NoulAnswer> {
+        self.0.iter()
+    }
+
+    pub(crate) fn probabilities(&self) -> Vec<Probability> {
+        self.0.iter().map(|answer| answer.probability).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> serde_json::Result<SystemOneResponse> {
+        serde_json::from_str(body)
+    }
+
+    fn body(answers: &str) -> String {
+        format!(
+            r#"{{"model": "jev-1.14.0", "answers": {answers}, "usage": {{"input_tokens": 120, "output_tokens": 12}}}}"#
+        )
+    }
+
+    #[test]
+    fn parses_a_full_response() {
+        let response = parse(&body(r#"{"q1": {"type": "noul", "noul": 0.98}}"#)).unwrap();
+        assert_eq!(response.model(), "jev-1.14.0");
+        assert_eq!(
+            *response.answers(),
+            IndexMap::from([(
+                "q1".to_string(),
+                Answer::Noul {
+                    noul: Probability::try_new(0.98).unwrap()
+                }
+            )])
+        );
+        assert_eq!(
+            response.usage(),
+            Usage {
+                input_tokens: 120,
+                output_tokens: 12
+            }
+        );
+    }
+
+    #[test]
+    fn parses_the_probability_bounds() {
+        for noul in ["0", "1", "0.0", "1.0"] {
+            let answers = format!(r#"{{"q1": {{"type": "noul", "noul": {noul}}}}}"#);
+            assert!(parse(&body(&answers)).is_ok(), "{noul}");
+        }
+    }
+
+    #[test]
+    fn a_probability_out_of_range_fails_to_construct() {
+        for noul in ["-0.01", "1.01", "2"] {
+            let answers = format!(r#"{{"q1": {{"type": "noul", "noul": {noul}}}}}"#);
+            assert!(parse(&body(&answers)).is_err(), "{noul}");
+        }
+    }
+
+    #[test]
+    fn a_response_missing_a_field_fails_to_construct() {
+        for body in [
+            r#"{"answers": {"q1": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+            r#"{"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "noul", "noul": 0.5}}}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1}}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "noul"}}, "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+        ] {
+            assert!(parse(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_response_with_an_unknown_field_fails_to_construct() {
+        for body in [
+            r#"{"model": "m", "answers": {"q1": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1, "output_tokens": 1}, "fart": 1}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "noul", "noul": 0.5, "fart": 1}}, "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1, "output_tokens": 1, "fart": 1}}"#,
+            r#"{"model": "m", "answers": {"q1": {"type": "choice", "choice": "a"}}, "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+        ] {
+            assert!(parse(body).is_err(), "{body}");
+        }
+    }
+
+    fn written(request: &SystemOneRequest) -> serde_json::Value {
+        serde_json::to_value(request).unwrap()
+    }
+
+    fn noul(criteria: Option<Criteria>) -> Questions {
+        Questions::try_new(IndexMap::from([(
+            "q1".to_string(),
+            Question::Noul {
+                instructions: Instructions {
+                    task: "t".into(),
+                    flags: "f".into(),
+                },
+                criteria,
+            },
+        )]))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_request_serializes_as_documented() {
+        let request = SystemOneRequest {
+            model: Model::try_new("m").unwrap(),
+            state: "s".into(),
+            questions: noul(Some(Criteria {
+                when_true: "y".into(),
+                when_false: "n".into(),
+            })),
+        };
+        assert_eq!(
+            written(&request),
+            serde_json::json!({
+                "model": "m",
+                "state": "s",
+                "questions": {"q1": {
+                    "type": "noul",
+                    "instructions": {"task": "t", "flags": "f"},
+                    "criteria": {"true": "y", "false": "n"},
+                }},
+            })
+        );
+    }
+
+    #[test]
+    fn a_question_without_criteria_serializes_without_them() {
+        let request = SystemOneRequest {
+            model: Model::try_new("m").unwrap(),
+            state: "s".into(),
+            questions: noul(None),
+        };
+        assert_eq!(
+            written(&request)["questions"]["q1"],
+            serde_json::json!({"type": "noul", "instructions": {"task": "t", "flags": "f"}})
+        );
+    }
+
+    #[test]
+    fn no_questions_fail_to_construct() {
+        assert!(Questions::try_new(IndexMap::new()).is_err());
+    }
+
+    #[test]
+    fn questions_in_another_order_are_not_equal() {
+        let question = |flags: &str| Question::Noul {
+            instructions: Instructions {
+                task: "t".into(),
+                flags: flags.into(),
+            },
+            criteria: None,
+        };
+        let forward = Questions::try_new(IndexMap::from([
+            ("q1".to_string(), question("a")),
+            ("q2".to_string(), question("b")),
+        ]))
+        .unwrap();
+        let backward = Questions::try_new(IndexMap::from([
+            ("q2".to_string(), question("b")),
+            ("q1".to_string(), question("a")),
+        ]))
+        .unwrap();
+        assert_ne!(forward, backward);
     }
 }

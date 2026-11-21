@@ -1,5 +1,5 @@
-use indexmap::IndexMap;
-
+use crate::Error;
+use crate::jev::api::{Question, Questions};
 use crate::rules::{Rule, RuleSet};
 
 pub const TASK: &str =
@@ -19,20 +19,12 @@ pub struct Criteria {
     pub when_false: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "type", rename = "noul")]
-pub struct Noul {
-    pub instructions: Instructions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub criteria: Option<Criteria>,
-}
-
 pub fn question_name(position: usize) -> String {
     format!("q{position}")
 }
 
-fn noul(rule: &Rule) -> Noul {
-    Noul {
+fn noul(rule: &Rule) -> Question {
+    Question::Noul {
         instructions: Instructions {
             task: TASK.into(),
             flags: rule.flags.clone(),
@@ -44,11 +36,13 @@ fn noul(rule: &Rule) -> Noul {
     }
 }
 
-pub fn questions(rule_set: &RuleSet) -> IndexMap<String, Noul> {
-    rule_set
-        .rules
-        .iter()
-        .enumerate()
-        .map(|(n, rule)| (question_name(n + 1), noul(rule)))
-        .collect()
+pub fn questions(rule_set: &RuleSet) -> Result<Questions, Error> {
+    Questions::try_new(
+        rule_set
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(n, rule)| (question_name(n + 1), noul(rule)))
+            .collect(),
+    )
 }

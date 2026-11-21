@@ -22,6 +22,7 @@ use crate::ignore_rules::Ignore;
 use crate::jev::{
     self,
     api::{ApiKey, BaseUrl, Model, Timeout},
+    cache::{Cache, CacheFile},
 };
 use crate::scan::{self, Changes, Concurrency, IgnoreRules, ScanError, ScanScope};
 use crate::source_path::SourcePath;
@@ -39,6 +40,7 @@ const BASE_URL: &str = "TYPESAFE_BASE_URL";
 const MODEL: &str = "TYPESAFE_DEFAULT_MODEL";
 const TIMEOUT: &str = "TYPESAFE_TIMEOUT";
 const CONCURRENCY: &str = "JEVREV_CONCURRENCY";
+const CACHE: &str = "JEVREV_CACHE";
 const GITHUB_HOST: &str = "GITHUB_HOST";
 const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
@@ -243,6 +245,8 @@ struct ScanArgs {
     timeout: Option<Timeout>,
     #[arg(short, long, value_name = "N", value_parser = OsStringValueParser::new().try_map(Concurrency::try_new), help = format!("Most jev requests in flight at once [default: {}] [env: {CONCURRENCY}]", Concurrency::default()))]
     concurrency: Option<Concurrency>,
+    #[arg(long, value_name = "FILE", value_parser = OsStringValueParser::new().try_map(CacheFile::try_new), help = format!("Database file of the jev response cache, created as needed; without it, nothing is cached [env: {CACHE}]"))]
+    cache: Option<CacheFile>,
     /// Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
     #[arg(short = 'i', long, value_name = "PATTERN", action = clap::ArgAction::Append)]
     include: Vec<String>,
@@ -298,6 +302,10 @@ impl ScanArgs {
                 .or_else(|| environment.model.clone())
                 .unwrap_or_default(),
             self.timeout.or(environment.timeout).unwrap_or_default(),
+            self.cache
+                .or_else(|| environment.cache.clone())
+                .map(|file| Cache::open(&file))
+                .transpose()?,
         )?;
         Ok(Scan {
             review,
@@ -399,6 +407,7 @@ struct Environment {
     model: Option<Model>,
     timeout: Option<Timeout>,
     concurrency: Option<Concurrency>,
+    cache: Option<CacheFile>,
     github_host: Option<GithubHost>,
     github_token: Option<Token>,
 }
@@ -455,6 +464,12 @@ impl Environment {
             }
             .transpose()
             .context(CONCURRENCY)?,
+            cache: match std::env::var_os(CACHE) {
+                Some(value) => Some(CacheFile::try_new(value)),
+                None => file.remove(CACHE).map(CacheFile::try_new),
+            }
+            .transpose()
+            .context(CACHE)?,
             github_host: match std::env::var_os(GITHUB_HOST) {
                 Some(value) => Some(GithubHost::try_new(value)),
                 None => file.remove(GITHUB_HOST).map(GithubHost::try_new),
@@ -507,6 +522,7 @@ async fn run_jev_scan(
         Err(ScanError::Source(error)) => return Err(error),
         Ok(done) => done,
     };
+    scan.client.finish()?;
     if !reviewed.failures.is_empty() {
         bail!(
             "jev-scan: {} jev requests failed:\n{}",

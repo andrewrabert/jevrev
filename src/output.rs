@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 
 use anstyle::{AnsiColor, Color, Effects, Style};
 
+use crate::jev::api::Probability;
 use crate::state::StateKind;
 use crate::store::{Finding, Review, Source, Verdict};
 use crate::templates::{self, ReportRule, Template, by_rule};
@@ -12,7 +13,8 @@ const INDEX: Style = Style::new().effects(Effects::DIMMED);
 const RULE: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
 const STATE: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Cyan)));
 
-fn probability_style(probability: f64) -> Style {
+fn probability_style(probability: Probability) -> Style {
+    let probability = probability.into_inner();
     if probability >= 0.9 {
         Style::new()
             .effects(Effects::BOLD)
@@ -53,7 +55,7 @@ pub fn findings_listing(findings: &[Finding], summary: &str) -> String {
             f.finding.file,
             f.index,
             f.finding.rule,
-            f.finding.probability,
+            f.finding.probability.into_inner(),
             f.finding.state.as_ref(),
             f.finding.flags
         ));
@@ -73,7 +75,7 @@ struct PendingLine<'f> {
     file: &'f str,
     flags: &'f str,
     index: i64,
-    probability: f64,
+    probability: Probability,
     rule: &'f str,
     start: NonZeroUsize,
     state: StateKind,

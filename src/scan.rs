@@ -12,8 +12,7 @@ pub struct Finding {
     pub line_range: LineRange,
     #[validate(regex(path = *RULE_ID))]
     pub rule: String,
-    #[validate(range(min = 0.0, max = 1.0))]
-    pub probability: f64,
+    pub probability: Probability,
     pub flags: String,
     pub violation: String,
     pub accepted: String,
@@ -31,7 +30,7 @@ use crate::files::{Files, ReadTextError};
 use crate::git::{Diff, FileDiff, Line};
 use crate::gitignore::{Check, Pattern, Spec};
 use crate::ignore_rules::Ignore;
-use crate::jev::api::{Client, NoulAnswer};
+use crate::jev::api::{Client, NoulAnswers, Probability};
 use crate::jev::ask;
 use crate::languages::{self, Syntax, TestMarker};
 use crate::lines::LineRange;
@@ -570,9 +569,9 @@ async fn ask_one(
     state: &State,
     rule_set: &RuleSet,
     client: &Client,
-) -> Result<Vec<NoulAnswer>, String> {
-    client
-        .ask(&ask::questions(rule_set), &state.render())
+) -> Result<NoulAnswers, String> {
+    let asked = async { client.ask(ask::questions(rule_set)?, state.render()).await };
+    asked
         .await
         .map_err(|e| ask_failed(state, &format!("{e:#}")))
 }
@@ -618,7 +617,7 @@ pub async fn review(
         .enumerate()
         .flat_map(|(n, state)| state.sets.iter().map(move |set| (n, state, set)))
         .collect();
-    let results: Vec<Result<Vec<NoulAnswer>, String>> = futures::stream::iter(&asked)
+    let results: Vec<Result<NoulAnswers, String>> = futures::stream::iter(&asked)
         .map(|(_, state, set)| ask_one(state, &scanned.rule_sets[*set], client))
         .buffered(concurrency.get())
         .collect()
@@ -644,9 +643,10 @@ pub async fn review(
         for (n, rule) in rule_set.rules.iter().enumerate() {
             let position = n + 1;
             let name = ask::question_name(position);
-            let Some(answer) = answers.iter().find(|a| a.question == name) else {
-                continue;
-            };
+            let answer = answers
+                .iter()
+                .find(|a| a.question == name)
+                .expect("the response has an answer for every question asked");
             if answer.probability < rule_set.error_threshold {
                 continue;
             }
@@ -657,7 +657,10 @@ pub async fn review(
                 file: state.file.clone(),
                 line_range: state.line_range,
                 rule: format!("{}#{position}", file_name(set)),
-                probability: (answer.probability * 100.0).round() / 100.0,
+                probability: Probability::try_new(
+                    (answer.probability.into_inner() * 100.0).round() / 100.0,
+                )
+                .expect("a probability rounded to hundredths is from 0 to 1"),
                 flags: rule.flags.clone(),
                 violation: rule.bad.join(" "),
                 accepted: rule.good.join(" "),

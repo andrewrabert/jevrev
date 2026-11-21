@@ -1,6 +1,7 @@
 use crate::Error;
 use crate::gitignore::Pattern;
-use anyhow::{anyhow, bail};
+use crate::jev::api::Probability;
+use anyhow::anyhow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,7 +40,7 @@ pub enum Conditions {
 #[derive(Debug, Clone)]
 pub struct RuleSet {
     pub when: Conditions,
-    pub error_threshold: f64,
+    pub error_threshold: Probability,
     pub rules: Vec<Rule>,
 }
 
@@ -73,19 +74,13 @@ struct RawRuleSet {
     #[serde(rename = "description")]
     _description: Option<String>,
     when: Option<Vec<When>>,
-    error_threshold: f64,
+    error_threshold: Probability,
     rules: Vec<Rule>,
 }
 
 impl RuleSet {
     pub fn parse(text: &str) -> Result<RuleSet, Error> {
         let raw: RawRuleSet = serde_saphyr::from_str(text)?;
-        if !(0.0..=1.0).contains(&raw.error_threshold) {
-            bail!(
-                "error_threshold: {} is not between 0 and 1",
-                raw.error_threshold
-            );
-        }
         Ok(RuleSet {
             when: raw.when.map_or(Conditions::Absent, Conditions::Given),
             error_threshold: raw.error_threshold,
