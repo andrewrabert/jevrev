@@ -56,7 +56,7 @@ Each step in more detail:
 
 `-r` is a global flag, so it goes before the command. Every command other than a scan requires it. A command locks FILE while it runs, and a second command on the same FILE fails at once instead of waiting.
 
-The review file records the source and the commit ids the scan resolved. `submit-github` comments on the scanned commit even if someone has pushed to the pull request since. `--metadata KEY=VALUE` on the scan stores an extra key in the file, and `show` prints it. Repeat the flag for more keys.
+The review file records the source and the commit ids the scan resolved. `submit-github` comments on the scanned commit even if someone has pushed to the pull request since.
 
 `submit-github` works only on a review that `scan-github --pr` created. It requests changes on someone else's pull request. On your own, it only comments, because GitHub refuses a request for changes from a pull request's author. Findings on changed lines become inline comments. Findings in files the pull request didn't change go in the review's body. jevrev posts nothing when no finding was confirmed.
 
@@ -88,7 +88,6 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 | `-i`/`--include PATTERN` | | Scan only files PATTERN matches, in gitignore syntax. Repeat for more. |
 | `-e`/`--exclude PATTERN` | | Leave out files PATTERN matches. Repeat for more. Wins over `--include`. |
 | `--no-ignore` | | Also scan files that `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` match. `scan` given a single file scans it regardless. |
-| `--metadata KEY=VALUE` | | Store KEY in the review file. A later KEY wins. Requires `--review`. |
 | `--exit-zero` | | Exit 0 even with findings. |
 | `-q`/`--quiet` | | Print the findings and nothing else. |
 | `--api-key` | `TYPESAFE_API_KEY` | TypeSafe API key. Required. |

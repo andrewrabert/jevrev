@@ -1,5 +1,4 @@
 use anyhow::{Context, anyhow};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use std::fs::File;
@@ -119,7 +118,6 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Review {
     pub source: Source,
-    pub metadata: BTreeMap<String, String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub findings: Vec<Finding>,

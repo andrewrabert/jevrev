@@ -1,5 +1,5 @@
 use anyhow::{Context, anyhow, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -103,7 +103,7 @@ nothing. It fails when the review is not of a pull request, such as one of a --r
     after_help = after_help()
 )]
 struct Cli {
-    /// JSON file holding one review: its source, the version of it scanned, metadata, findings, and verdicts; a scan given it creates FILE, which must not exist (checked before any request), and leaves no FILE it created when the scan or its save fails; every other command requires it
+    /// JSON file holding one review: its source, the version of it scanned, findings, and verdicts; a scan given it creates FILE, which must not exist (checked before any request), and leaves no FILE it created when the scan or its save fails; every other command requires it
     #[arg(short, long, value_name = "FILE")]
     review: Option<PathBuf>,
     #[arg(long, value_name = "PATH", global = true, help = format!("Dotenv file of the variables the flags read [env: {ENV_FILE}]"))]
@@ -255,9 +255,6 @@ struct ScanArgs {
     /// Leave out files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns; wins over --include
     #[arg(short = 'e', long, value_name = "PATTERN", action = clap::ArgAction::Append)]
     exclude: Vec<String>,
-    /// Metadata stored with the review and printed by show; repeat for more keys, a later KEY winning; KEY is not empty; requires --review
-    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_metadata, action = clap::ArgAction::Append)]
-    metadata: Vec<(String, String)>,
     /// Exit 0 even when the scan has findings
     #[arg(long)]
     exit_zero: bool,
@@ -271,7 +268,6 @@ struct Scan<'a> {
     rules: Vec<PathBuf>,
     client: jev::api::Client,
     concurrency: Concurrency,
-    metadata: BTreeMap<String, String>,
     include: Vec<String>,
     exclude: Vec<String>,
     exit_zero: bool,
@@ -284,7 +280,7 @@ impl ScanArgs {
         review: Option<&'a Path>,
         environment: &Environment,
     ) -> Result<Scan<'a>, Error> {
-        ensure_new_review(review, &self.metadata)?;
+        ensure_new_review(review)?;
         let rules: Vec<PathBuf> = if self.rules.is_empty() {
             environment.rules.clone().unwrap_or_default()
         } else {
@@ -321,7 +317,6 @@ impl ScanArgs {
                 .concurrency
                 .or(environment.concurrency)
                 .unwrap_or_default(),
-            metadata: self.metadata.into_iter().collect(),
             include: self.include,
             exclude: self.exclude,
             exit_zero: self.exit_zero,
@@ -361,13 +356,6 @@ enum PendingFormat {
 enum Format {
     Json,
     Md,
-}
-
-fn parse_metadata(value: &str) -> Result<(String, String), String> {
-    match value.split_once('=') {
-        Some((key, value)) if !key.is_empty() => Ok((key.into(), value.into())),
-        _ => Err(format!("{value:?} is not KEY=VALUE with a KEY")),
-    }
 }
 
 fn parse_positive(value: &str) -> Result<NonZeroU64, String> {
@@ -500,14 +488,11 @@ impl Environment {
 }
 
 /// A scan's review file must not exist yet, checked before any request.
-fn ensure_new_review(file: Option<&Path>, metadata: &[(String, String)]) -> Result<(), Error> {
+fn ensure_new_review(file: Option<&Path>) -> Result<(), Error> {
     if let Some(file) = file
         && (file.exists() || std::fs::symlink_metadata(file).is_ok())
     {
         bail!("{} already exists", shown(file));
-    }
-    if file.is_none() && !metadata.is_empty() {
-        bail!("--metadata: give --review to store it in");
     }
     Ok(())
 }
@@ -590,7 +575,6 @@ async fn scan_and_save(
     let (found, summary) = run_jev_scan(&scan, files, &scope, changes, name).await?;
     let review = Review {
         source,
-        metadata: scan.metadata,
         include: scan.include,
         exclude: scan.exclude,
         findings: found

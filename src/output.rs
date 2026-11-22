@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use anstyle::{AnsiColor, Color, Effects, Style};
@@ -111,8 +110,6 @@ struct FrontMatter<'r> {
     findings: usize,
     confirmed: usize,
     rejected: usize,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    metadata: &'r BTreeMap<String, String>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     include: &'r [String],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
@@ -125,7 +122,6 @@ fn front_matter(review: &Review) -> String {
         findings: review.findings.len(),
         confirmed: review.count(Verdict::Confirmed),
         rejected: review.count(Verdict::Rejected),
-        metadata: &review.metadata,
         include: &review.include,
         exclude: &review.exclude,
     };
