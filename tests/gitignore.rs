@@ -150,7 +150,7 @@ fn patterns_match_as_git_does() {
         let spec = Spec::from_lines(patterns.iter().copied()).unwrap();
         for (path, check) in *expected {
             assert_eq!(
-                spec.check(&SourcePath::new(path, None).unwrap()),
+                spec.check(&SourcePath::new(path).unwrap()),
                 *check,
                 "{patterns:?} against {path:?}"
             );

@@ -106,8 +106,10 @@ A selector matches a file when all of the following hold:
 2. **`matches`**: the patterns, read together as one gitignore file relative to the top of the
    source, match the file's source path. A later `!` pattern MAY re-include a path an earlier
    pattern left out.
-3. **`exists`**: each pattern matches at least one source path of the source after ignore files,
-   whether or not that path is in scope.
+3. **`exists`**: each pattern matches at least one path of the source, whatever `--include` and
+   `--exclude` say: on disk, the files the walk finds, after the ignore files unless `--no-ignore`;
+   for a git commit, its tree; for a git working tree, what git has, tracked and untracked; for
+   GitHub, the tree GitHub has.
 
 `language` matches on detected languages only. A file matches a `language` selector whether or not
 the file is valid in that language; validity decides only its ranges (§7.4).

@@ -1,9 +1,8 @@
-use crate::files::ReadTextError;
-use crate::ignore_rules::Ignore;
+use crate::files::{ReadTextError, Source};
 use crate::scan::Changes;
 use crate::source_path::{SourcePath, SourcePathError};
 use anyhow::{Context, anyhow, bail};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -11,7 +10,6 @@ use std::sync::atomic::AtomicBool;
 use gix::diff::blob::unified_diff::{ConsumeHunk, DiffLineKind, HunkHeader};
 
 use crate::Error;
-use crate::gitignore::Spec;
 use crate::lines::LineRange;
 use crate::non_empty::NonEmpty;
 
@@ -245,22 +243,10 @@ pub struct ContentPair {
     pub new: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IgnoreFile {
-    pub directory: PathBuf,
-    pub contents: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AboveSource {
-    pub subfolder: Option<PathBuf>,
-    pub ignore_files: Vec<IgnoreFile>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadFrom<'commit> {
-    Disk,
-    Commit(&'commit GitObjectId),
+/// The files of a working tree, as git sees them.
+pub struct WorkingTree {
+    pub tracked: Vec<SourcePath>,
+    pub untracked: Vec<SourcePath>,
 }
 
 type TreeEntries = BTreeMap<Vec<u8>, (gix::objs::tree::EntryMode, gix::hash::ObjectId)>;
@@ -268,7 +254,6 @@ type TreeEntries = BTreeMap<Vec<u8>, (gix::objs::tree::EntryMode, gix::hash::Obj
 #[derive(Debug, Clone)]
 pub struct GitRepo {
     repo: gix::Repository,
-    top: PathBuf,
     subfolder: Option<PathBuf>,
     root: PathBuf,
 }
@@ -304,7 +289,6 @@ impl GitRepo {
         };
         Ok(Some(GitRepo {
             repo,
-            top,
             subfolder,
             root: resolved,
         }))
@@ -496,36 +480,53 @@ fn changed_file(
     }))
 }
 
+/// A scan's files from git: a commit's, or the working tree's as git sees it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub struct CommitFiles {
-    repo: GitRepo,
-    commit: GitObjectId,
+pub enum Git {
+    /// The files in `commit`'s tree under the scanned directory.
+    Commit { repo: GitRepo, commit: GitObjectId },
+    /// `paths` under `root`: the working tree's files as `GitRepo::working_tree` finds them.
+    WorkingTree {
+        root: PathBuf,
+        paths: Vec<SourcePath>,
+    },
 }
 
-impl CommitFiles {
-    pub fn new(repo: GitRepo, commit: GitObjectId) -> CommitFiles {
-        CommitFiles { repo, commit }
-    }
-
-    pub fn paths(&self, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
-        let entries = tree_entries(self.repo.root_tree(&self.commit)?.as_ref())?;
+impl Git {
+    fn commit_paths(repo: &GitRepo, commit: &GitObjectId) -> Result<Vec<SourcePath>, Error> {
+        let entries = tree_entries(repo.root_tree(commit)?.as_ref())?;
         let mut found = Vec::new();
         for (raw, (mode, _)) in entries {
             if !mode.is_blob() {
                 continue;
             }
             let text = std::str::from_utf8(&raw)?;
-            match SourcePath::new(text, ignore) {
-                Ok(path) => found.push(path),
-                Err(SourcePathError::Ignored) => {}
-                Err(e) => return Err(Error::from(e).context(text.to_string())),
-            }
+            found.push(SourcePath::new(text).with_context(|| text.to_string())?);
         }
         Ok(found)
     }
+}
 
-    pub fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
-        self.repo.read_file_text(&self.commit, path)
+impl Source for Git {
+    fn paths(&self) -> Box<dyn Iterator<Item = Result<SourcePath, Error>> + '_> {
+        match self {
+            Git::Commit { repo, commit } => match Git::commit_paths(repo, commit) {
+                Ok(paths) => Box::new(paths.into_iter().map(Ok)),
+                Err(e) => Box::new(std::iter::once(Err(e))),
+            },
+            Git::WorkingTree { paths, .. } => Box::new(paths.iter().cloned().map(Ok)),
+        }
+    }
+
+    async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
+        match self {
+            Git::Commit { repo, commit } => repo.read_file_text(commit, path),
+            Git::WorkingTree { root, .. } => {
+                let contents = std::fs::read(path.on_disk(root)).map_err(Error::from)?;
+                Ok(String::from_utf8(contents)?)
+            }
+        }
     }
 }
 
@@ -569,7 +570,6 @@ impl GitRepo {
         &self,
         selection: &LocalSelection,
         context: u32,
-        ignore: Option<&Ignore>,
     ) -> Result<Option<Changes>, Error> {
         Ok(match selection {
             LocalSelection::Rev(_) => None,
@@ -578,7 +578,7 @@ impl GitRepo {
                 untracked: Vec::new(),
             }),
             LocalSelection::DiffToDisk(to_disk) => {
-                Some(self.changes_on_disk_since(&to_disk.base, context, ignore)?)
+                Some(self.changes_on_disk_since(&to_disk.base, context)?)
             }
         })
     }
@@ -598,7 +598,7 @@ impl GitRepo {
                 continue;
             }
             let text = std::str::from_utf8(raw)?;
-            let path = SourcePath::new(text, None).with_context(|| text.to_string())?;
+            let path = SourcePath::new(text).with_context(|| text.to_string())?;
             let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
             let texts = (|| -> Result<(String, String), ReadTextError> {
                 let old_text = if in_base {
@@ -625,40 +625,77 @@ impl GitRepo {
         Ok(Diff { files })
     }
 
-    fn changes_on_disk_since(
-        &self,
-        base: &GitObjectId,
-        context: u32,
-        ignore: Option<&Ignore>,
-    ) -> Result<Changes, Error> {
-        let old = tree_entries(self.root_tree(base)?.as_ref())?;
+    /// The working tree's files under the scanned directory, as git sees them: each tracked
+    /// file the index lists that is a regular file on disk, ignore rules never applying to it,
+    /// and each untracked regular file git's ignore rules leave in. Git's rules are the
+    /// repository's `.gitignore` files, `.git/info/exclude` and `core.excludesFile` from its git
+    /// configuration, or `$XDG_CONFIG_HOME/git/ignore` when that is unset.
+    pub fn working_tree(&self) -> Result<WorkingTree, Error> {
         let index = self.repo.index_or_empty()?;
-        let mut tracked = BTreeSet::new();
+        let mut tracked = Vec::new();
         for entry in index.entries() {
             let text = std::str::from_utf8(entry.path(&index))?;
-            let built = match &self.subfolder {
-                Some(subfolder) => SourcePath::from_base(subfolder, Path::new(text), ignore),
-                None => SourcePath::new(text, ignore),
+            let Some(path) = self.in_scanned_directory(text)? else {
+                continue;
             };
-            match built {
-                Ok(path) => {
-                    tracked.insert(path);
-                }
-                Err(SourcePathError::Outside | SourcePathError::Ignored) => {}
-                Err(e) => return Err(Error::from(e).context(text.to_string())),
+            let file = path.on_disk(&self.root);
+            match std::fs::symlink_metadata(&file) {
+                Ok(metadata) if metadata.is_file() => tracked.push(path),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("{}: {e}", file.display())),
             }
         }
+        let options = self
+            .repo
+            .dirwalk_options()?
+            .emit_untracked(gix::dir::walk::EmissionMode::Matching)
+            .emit_ignored(None)
+            .emit_tracked(false);
+        let mut collect = gix::dir::walk::delegate::Collect::default();
+        self.repo.dirwalk(
+            &index,
+            std::iter::empty::<&gix::bstr::BStr>(),
+            &AtomicBool::new(false),
+            options,
+            &mut collect,
+        )?;
+        let mut untracked = Vec::new();
+        for (entry, _) in collect.into_entries_by_path() {
+            if !matches!(entry.status, gix::dir::entry::Status::Untracked)
+                || !matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File))
+            {
+                continue;
+            }
+            if let Some(path) = self.in_scanned_directory(std::str::from_utf8(&entry.rela_path)?)? {
+                untracked.push(path);
+            }
+        }
+        tracked.sort();
+        untracked.sort();
+        Ok(WorkingTree { tracked, untracked })
+    }
+
+    /// `text`, a path from the top of the repository, as a path in the scanned directory, or
+    /// `None` when it is outside it.
+    fn in_scanned_directory(&self, text: &str) -> Result<Option<SourcePath>, Error> {
+        let built = match &self.subfolder {
+            Some(subfolder) => SourcePath::from_base(subfolder, Path::new(text)),
+            None => SourcePath::new(text),
+        };
+        match built {
+            Ok(path) => Ok(Some(path)),
+            Err(SourcePathError::Outside) => Ok(None),
+            Err(e) => Err(Error::from(e).context(text.to_string())),
+        }
+    }
+
+    fn changes_on_disk_since(&self, base: &GitObjectId, context: u32) -> Result<Changes, Error> {
+        let old = tree_entries(self.root_tree(base)?.as_ref())?;
+        let WorkingTree { tracked, untracked } = self.working_tree()?;
         let mut files = Vec::new();
         for path in tracked {
             let file = path.on_disk(&self.root);
-            let metadata = match std::fs::symlink_metadata(&file) {
-                Ok(metadata) => metadata,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(anyhow!("{}: {e}", file.display())),
-            };
-            if !metadata.is_file() {
-                continue;
-            }
             let in_base = old
                 .get(path.to_str().as_bytes())
                 .is_some_and(|(old_mode, _)| old_mode.is_blob());
@@ -681,58 +718,6 @@ impl GitRepo {
                 Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
             }
         }
-
-        let mut untracked = Vec::new();
-        let mut add_untracked = |text: &str| -> Result<(), Error> {
-            let built = match &self.subfolder {
-                Some(subfolder) => SourcePath::from_base(subfolder, Path::new(text), ignore),
-                None => SourcePath::new(text, ignore),
-            };
-            match built {
-                Ok(path) => untracked.push(path),
-                Err(SourcePathError::Outside | SourcePathError::Ignored) => {}
-                Err(e) => return Err(Error::from(e).context(text.to_string())),
-            }
-            Ok(())
-        };
-        match ignore {
-            None => {
-                let in_index: HashSet<&[u8]> = index
-                    .entries()
-                    .iter()
-                    .map(|entry| &**entry.path(&index))
-                    .collect();
-                for full in crate::walk::walk(&self.top, None)? {
-                    if !in_index.contains(full.to_str().as_bytes()) {
-                        add_untracked(full.to_str())?;
-                    }
-                }
-            }
-            Some(_) => {
-                let options = self
-                    .repo
-                    .dirwalk_options()?
-                    .emit_untracked(gix::dir::walk::EmissionMode::Matching)
-                    .emit_ignored(None)
-                    .emit_tracked(false);
-                let mut collect = gix::dir::walk::delegate::Collect::default();
-                self.repo.dirwalk(
-                    &index,
-                    std::iter::empty::<&gix::bstr::BStr>(),
-                    &AtomicBool::new(false),
-                    options,
-                    &mut collect,
-                )?;
-                for (entry, _) in collect.into_entries_by_path() {
-                    if !matches!(entry.status, gix::dir::entry::Status::Untracked)
-                        || !matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File))
-                    {
-                        continue;
-                    }
-                    add_untracked(std::str::from_utf8(&entry.rela_path)?)?;
-                }
-            }
-        }
         let mut kept = Vec::new();
         for path in untracked {
             let joined = path.on_disk(&self.root);
@@ -747,68 +732,6 @@ impl GitRepo {
             diff: Diff { files },
             untracked: kept,
         })
-    }
-
-    pub fn ignore_files_above(&self, at: ReadFrom<'_>) -> Result<AboveSource, Error> {
-        let parts: Vec<&std::ffi::OsStr> = self.subfolder.iter().flat_map(|s| s.iter()).collect();
-        let tree = match at {
-            ReadFrom::Disk => None,
-            ReadFrom::Commit(commit) => Some(self.commit_tree(commit)?),
-        };
-        let mut ignore_files = Vec::new();
-        for n in 0..parts.len() {
-            let directory: PathBuf = parts[..n].iter().collect();
-            for name in [".gitignore", ".ignore"] {
-                let path = directory.join(name);
-                let contents = match &tree {
-                    None => {
-                        let file = self.top.join(&path);
-                        match std::fs::symlink_metadata(&file) {
-                            Ok(metadata) if metadata.is_file() => Some(std::fs::read(&file)?),
-                            Ok(_) => bail!(
-                                "{}: an ignore file must be a regular file, as git does not follow a symlink to one",
-                                file.display()
-                            ),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                            Err(e) => return Err(anyhow!("{}: {e}", file.display())),
-                        }
-                    }
-                    Some(tree) => match tree.lookup_entry_by_path(&path)? {
-                        None => None,
-                        Some(entry) if entry.mode().is_blob() => {
-                            Some(entry.object()?.try_into_blob()?.detach().data)
-                        }
-                        Some(entry) => bail!(
-                            "{} is a {}, not a file; an ignore file must be a file",
-                            path.display(),
-                            entry.mode().as_str()
-                        ),
-                    },
-                };
-                if let Some(contents) = contents {
-                    ignore_files.push(IgnoreFile {
-                        directory: directory.clone(),
-                        contents,
-                    });
-                }
-            }
-        }
-        Ok(AboveSource {
-            subfolder: self.subfolder.clone(),
-            ignore_files,
-        })
-    }
-
-    pub fn excludes(&self) -> Result<Vec<Spec>, Error> {
-        let mut found = vec![Spec::global()?];
-        let exclude = self.repo.git_dir().join("info").join("exclude");
-        match std::fs::read(&exclude) {
-            Ok(contents) => found
-                .push(Spec::from_bytes(&contents).with_context(|| exclude.display().to_string())?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(found)
     }
 }
 

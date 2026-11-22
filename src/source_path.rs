@@ -1,8 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use crate::ignore_rules::Ignore;
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePath(PathBuf);
 
@@ -18,12 +16,10 @@ pub enum SourcePathError {
     NotUtf8(OsString),
     #[error("inside a .git directory")]
     InsideGitDirectory,
-    #[error("ignored")]
-    Ignored,
 }
 
 impl SourcePath {
-    pub fn new(path: &str, ignore: Option<&Ignore>) -> Result<SourcePath, SourcePathError> {
+    pub fn new(path: &str) -> Result<SourcePath, SourcePathError> {
         let mut built = PathBuf::new();
         for segment in path.split('/') {
             if segment.is_empty() || segment == "." || segment == ".." {
@@ -34,17 +30,10 @@ impl SourcePath {
             }
             built.push(segment);
         }
-        if ignore.is_some_and(|ignore| ignore.ignores(&built)) {
-            return Err(SourcePathError::Ignored);
-        }
         Ok(SourcePath(built))
     }
 
-    pub fn from_base(
-        base: &Path,
-        path: &Path,
-        ignore: Option<&Ignore>,
-    ) -> Result<SourcePath, SourcePathError> {
+    pub fn from_base(base: &Path, path: &Path) -> Result<SourcePath, SourcePathError> {
         let inside = path
             .strip_prefix(base)
             .map_err(|_| SourcePathError::Outside)?;
@@ -66,9 +55,6 @@ impl SourcePath {
         }
         if built.as_os_str().is_empty() {
             return Err(SourcePathError::Empty);
-        }
-        if ignore.is_some_and(|ignore| ignore.ignores(&built)) {
-            return Err(SourcePathError::Ignored);
         }
         Ok(SourcePath(built))
     }

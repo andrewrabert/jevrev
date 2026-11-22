@@ -48,18 +48,7 @@ impl Spec {
         Ok(Spec(builder.build()?))
     }
 
-    pub fn from_bytes(contents: &[u8]) -> Result<Spec, Error> {
-        Spec::from_lines(std::str::from_utf8(contents)?.lines())
-    }
-
-    pub fn global() -> Result<Spec, Error> {
-        match Gitignore::global() {
-            (spec, None) => Ok(Spec(spec)),
-            (_, Some(e)) => Err(Error::new(e).context("the global git excludes file")),
-        }
-    }
-
-    pub fn check_entry(&self, path: &Path, is_dir: bool) -> Check {
+    fn check_entry(&self, path: &Path, is_dir: bool) -> Check {
         match self.0.matched(path, is_dir) {
             Match::None => Check::Unmatched,
             Match::Ignore(_) => Check::Included,

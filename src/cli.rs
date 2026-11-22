@@ -8,23 +8,22 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::builder::{OsStringValueParser, TypedValueParser};
 
-use crate::files::{Files, OnDisk, OneFile};
+use crate::disk::{Disk, IgnoreFiles};
+use crate::files;
 use crate::git::{
-    AboveSource, CommitFiles, DiffBase, DiffRange, GitDiff, GitDiffSpec, GitRepo, GitRev,
-    GitRevision, LocalSelection, ReadFrom,
+    DiffBase, DiffRange, Git, GitDiff, GitDiffSpec, GitRepo, GitRev, GitRevision, LocalSelection,
+    WorkingTree,
 };
 use crate::github::api;
 use crate::github::credentials::Token;
 use crate::github::pull_request::GithubPullRequest;
 use crate::github::repo::{GithubHost, GithubRepo, GithubRepoName};
-use crate::gitignore::Spec;
-use crate::ignore_rules::Ignore;
 use crate::jev::{
     self,
     api::{ApiKey, BaseUrl, Model, Timeout},
     cache::{Cache, CacheFile},
 };
-use crate::scan::{self, Changes, Concurrency, IgnoreRules, ScanError, ScanScope};
+use crate::scan::{self, Changes, Concurrency, ScanError, ScanScope};
 use crate::source_path::SourcePath;
 use crate::store::{self, Finding, GithubSelection, Judgment, Review, Source, Stored, Verdict};
 use crate::{Error, output};
@@ -119,13 +118,13 @@ struct Cli {
 enum Command {
     /// Run jev over a file, or a directory's files, on disk, whether or not it is in a git repository; print its findings and summary, and save them to a new review file given --review
     Scan {
-        /// File or directory to scan, symlinks followed; findings are relative to the directory, or the file's own; a file is scanned even when an ignore file matches it
+        /// File or directory to scan; in a directory only regular files are scanned, symlinks not followed; findings are relative to the directory, or the file's own; a file is scanned even when an ignore file matches it
         #[arg(value_name = "PATH")]
         path: PathBuf,
-        /// Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
+        /// Leave out every entry .ignore files match, and inside a git repository every entry its .gitignore files, .git/info/exclude or the global excludes file match [default]; the last of --ignore and --no-ignore wins
         #[arg(long, overrides_with = "no_ignore")]
         ignore: bool,
-        /// Scan files an ignore file matches too
+        /// Leave nothing out for an ignore file
         #[arg(long, overrides_with = "ignore")]
         no_ignore: bool,
         #[command(flatten)]
@@ -145,12 +144,6 @@ enum Command {
         /// Scan a diff, in git diff's syntax: REV, the changes from REV to the files on disk; A..B, from A to B; A...B, from merge-base(A, B) to B; an empty side of A..B or A...B is HEAD
         #[arg(long, value_name = "DIFF", value_parser = GitDiffSpec::parse)]
         diff: Option<GitDiffSpec>,
-        /// Leave out every file .gitignore, .ignore, .git/info/exclude or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
-        #[arg(long, overrides_with = "no_ignore")]
-        ignore: bool,
-        /// Scan files an ignore file matches too
-        #[arg(long, overrides_with = "ignore")]
-        no_ignore: bool,
         #[command(flatten)]
         scan: ScanArgs,
     },
@@ -175,12 +168,6 @@ enum Command {
         /// Scan pull request N's changes; conflicts with --rev and --diff
         #[arg(long, value_name = "N", value_parser = parse_positive)]
         pr: Option<NonZeroU64>,
-        /// Leave out every file .gitignore, .ignore or core.excludesFile matches [default]; the last of --ignore and --no-ignore wins
-        #[arg(long, overrides_with = "no_ignore")]
-        ignore: bool,
-        /// Scan files an ignore file matches too
-        #[arg(long, overrides_with = "ignore")]
-        no_ignore: bool,
         #[command(flatten)]
         scan: ScanArgs,
     },
@@ -249,7 +236,7 @@ struct ScanArgs {
     concurrency: Option<Concurrency>,
     #[arg(long, value_name = "FILE", value_parser = OsStringValueParser::new().try_map(CacheFile::try_new), help = format!("Database file of the jev response cache, created as needed; without it, nothing is cached [env: {CACHE}]"))]
     cache: Option<CacheFile>,
-    /// Scan only files PATTERN matches, in gitignore syntax relative to the source, of those the ignore files leave; repeat for more patterns, any of which may match
+    /// Scan only files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns, any of which may match
     #[arg(short = 'i', long, value_name = "PATTERN", action = clap::ArgAction::Append)]
     include: Vec<String>,
     /// Leave out files PATTERN matches, in gitignore syntax relative to the source; repeat for more patterns; wins over --include
@@ -505,7 +492,7 @@ fn utf8_root(path: &Path, root: &Path) -> Result<String, Error> {
 
 async fn run_jev_scan(
     scan: &Scan<'_>,
-    files: &Files,
+    files: &impl files::Source,
     scope: &ScanScope,
     changes: Option<&Changes>,
     name: &str,
@@ -562,13 +549,11 @@ fn save_new(path: &Path, review: &Review) -> Result<(), Error> {
 async fn scan_and_save(
     scan: Scan<'_>,
     source: Source,
-    files: &Files,
-    ignore: IgnoreRules,
+    files: &impl files::Source,
     changes: Option<&Changes>,
     name: &str,
 ) -> Result<u8, Error> {
     let scope = ScanScope {
-        ignore,
         include: scan.include.clone(),
         exclude: scan.exclude.clone(),
     };
@@ -600,32 +585,15 @@ async fn scan_and_save(
     })
 }
 
-async fn local_ignore(
-    repo: Option<&GitRepo>,
-    files: &Files,
-    at: ReadFrom<'_>,
-) -> Result<IgnoreRules, Error> {
-    let (above, excludes) = match repo {
-        Some(repo) => (repo.ignore_files_above(at)?, repo.excludes()?),
-        None => (AboveSource::default(), vec![Spec::global()?]),
-    };
-    Ok(IgnoreRules::Apply(
-        Ignore::load(files, excludes, &above).await?,
-    ))
-}
-
 async fn cmd_scan(scan: Scan<'_>, path: &Path, no_ignore: bool) -> Result<u8, Error> {
-    let (name, files, ignore) = if path.is_dir() {
+    let (name, files) = if path.is_dir() {
         let root = std::fs::canonicalize(path).with_context(|| shown(path))?;
-        let name = utf8_root(path, &root)?;
-        let files = Files::OnDisk(OnDisk::new(root.clone()));
         let ignore = if no_ignore {
-            IgnoreRules::Off
+            IgnoreFiles::Off
         } else {
-            let repo = GitRepo::discover(&root)?;
-            local_ignore(repo.as_ref(), &files, ReadFrom::Disk).await?
+            IgnoreFiles::Apply
         };
-        (name, files, ignore)
+        (utf8_root(path, &root)?, Disk::Directory { root, ignore })
     } else if path.is_file() {
         let absolute = std::path::absolute(path)?;
         let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) else {
@@ -633,11 +601,13 @@ async fn cmd_scan(scan: Scan<'_>, path: &Path, no_ignore: bool) -> Result<u8, Er
         };
         let directory = std::fs::canonicalize(parent).with_context(|| shown(path))?;
         let root = directory.join(file_name);
-        let name = SourcePath::from_base(&directory, &root, None).with_context(|| shown(path))?;
+        let name = SourcePath::from_base(&directory, &root).with_context(|| shown(path))?;
         (
             utf8_root(path, &root)?,
-            Files::OneFile(OneFile::new(root.clone(), name)),
-            IgnoreRules::Off,
+            Disk::File {
+                path: root.clone(),
+                name,
+            },
         )
     } else {
         bail!("{}: no such file or directory", shown(path));
@@ -646,7 +616,6 @@ async fn cmd_scan(scan: Scan<'_>, path: &Path, no_ignore: bool) -> Result<u8, Er
         scan,
         Source::LocalDir { path: name.clone() },
         &files,
-        ignore,
         None,
         &name,
     )
@@ -658,7 +627,6 @@ async fn cmd_scan_git(
     dir: &Path,
     rev: Option<&GitRevision>,
     diff: Option<&GitDiffSpec>,
-    no_ignore: bool,
 ) -> Result<u8, Error> {
     let root = std::fs::canonicalize(dir).with_context(|| shown(dir))?;
     if !root.is_dir() {
@@ -673,27 +641,29 @@ async fn cmd_scan_git(
         (None, Some(spec)) => repo.resolve_diff(spec)?,
         (None, None) => bail!("scan-git: give --rev or --diff"),
     };
-    let (files, at) = match &selection {
-        LocalSelection::Rev(rev) => (
-            Files::Commit(CommitFiles::new(repo.clone(), rev.commit.clone())),
-            ReadFrom::Commit(&rev.commit),
-        ),
-        LocalSelection::Diff(diff) => (
-            Files::Commit(CommitFiles::new(repo.clone(), diff.head.clone())),
-            ReadFrom::Commit(&diff.head),
-        ),
-        LocalSelection::DiffToDisk(_) => (Files::OnDisk(OnDisk::new(root.clone())), ReadFrom::Disk),
+    let files = match &selection {
+        LocalSelection::Rev(rev) => Git::Commit {
+            repo: repo.clone(),
+            commit: rev.commit.clone(),
+        },
+        LocalSelection::Diff(diff) => Git::Commit {
+            repo: repo.clone(),
+            commit: diff.head.clone(),
+        },
+        LocalSelection::DiffToDisk(_) => {
+            let WorkingTree {
+                mut tracked,
+                untracked,
+            } = repo.working_tree()?;
+            tracked.extend(untracked);
+            tracked.sort();
+            Git::WorkingTree {
+                root: root.clone(),
+                paths: tracked,
+            }
+        }
     };
-    let ignore = if no_ignore {
-        IgnoreRules::Off
-    } else {
-        local_ignore(Some(&repo), &files, at).await?
-    };
-    let rules = match &ignore {
-        IgnoreRules::Apply(ignore) => Some(ignore),
-        IgnoreRules::Off => None,
-    };
-    let changes = repo.changes(&selection, scan::DIFF_CONTEXT, rules)?;
+    let changes = repo.changes(&selection, scan::DIFF_CONTEXT)?;
     scan_and_save(
         scan,
         Source::LocalGitDir {
@@ -701,7 +671,6 @@ async fn cmd_scan_git(
             git: selection,
         },
         &files,
-        ignore,
         changes.as_ref(),
         &name,
     )
@@ -747,7 +716,6 @@ async fn cmd_scan_github(
     rev: Option<&GitRevision>,
     diff: Option<&GitDiffSpec>,
     pr: Option<NonZeroU64>,
-    no_ignore: bool,
 ) -> Result<u8, Error> {
     let diff = match diff {
         Some(GitDiffSpec::Range(range)) => Some(range),
@@ -759,12 +727,12 @@ async fn cmd_scan_github(
     let selection = github_selection(pr, rev, diff, github, repo).await?;
     let (files, changes) = match &selection {
         GithubSelection::Rev(rev) => (
-            Files::InMemory(github.tarball(repo, &rev.commit).await?),
+            api::Github::Tarball(github.tarball(repo, &rev.commit).await?),
             None,
         ),
         GithubSelection::Diff(GitDiff { base, head })
         | GithubSelection::PullRequest(GithubPullRequest { base, head, .. }) => {
-            let files = Files::Blobs(github.tree(repo, head).await?);
+            let files = api::Github::Tree(github.tree(repo, head).await?);
             let diff = github.diff(repo, base, head, scan::DIFF_CONTEXT, 0).await?;
             (
                 files,
@@ -775,13 +743,6 @@ async fn cmd_scan_github(
             )
         }
     };
-    let ignore = if no_ignore {
-        IgnoreRules::Off
-    } else {
-        IgnoreRules::Apply(
-            Ignore::load(&files, vec![Spec::global()?], &AboveSource::default()).await?,
-        )
-    };
     let name = format!("{}/{}", repo.host(), repo.name());
     scan_and_save(
         scan,
@@ -790,7 +751,6 @@ async fn cmd_scan_github(
             git: selection,
         },
         &files,
-        ignore,
         changes.as_ref(),
         &name,
     )
@@ -893,12 +853,10 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             dir,
             rev,
             diff,
-            no_ignore,
             scan,
-            ..
         } => {
             let scan = scan.resolve(file, &environment)?;
-            cmd_scan_git(scan, &dir, rev.as_ref(), diff.as_ref(), no_ignore).await
+            cmd_scan_git(scan, &dir, rev.as_ref(), diff.as_ref()).await
         }
         Command::ScanGithub {
             github,
@@ -907,9 +865,7 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             rev,
             diff,
             pr,
-            no_ignore,
             scan,
-            ..
         } => {
             let scan = scan.resolve(file, &environment)?;
             let client = api::Client::new(
@@ -917,16 +873,7 @@ async fn run(cli: Cli) -> Result<u8, Error> {
                 &github_token(token)?,
             )?;
             let repo = GithubRepo::new(client.host().clone(), github);
-            cmd_scan_github(
-                scan,
-                &repo,
-                &client,
-                rev.as_ref(),
-                diff.as_ref(),
-                pr,
-                no_ignore,
-            )
-            .await
+            cmd_scan_github(scan, &repo, &client, rev.as_ref(), diff.as_ref(), pr).await
         }
         Command::Pending { format, quiet } => cmd_pending(file, format, quiet).map(|()| EXIT_CLEAN),
         Command::Confirm { index, reason } => {

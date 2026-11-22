@@ -1,9 +1,9 @@
 pub mod cli;
+pub mod disk;
 pub mod files;
 pub mod git;
 pub mod github;
 pub mod gitignore;
-pub mod ignore_rules;
 pub mod jev;
 pub mod languages;
 pub mod lines;
@@ -15,7 +15,6 @@ pub mod source_path;
 pub mod state;
 pub mod store;
 pub mod templates;
-pub mod walk;
 
 pub use anyhow::Error;
 

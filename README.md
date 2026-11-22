@@ -78,6 +78,8 @@ A rule set's `when` selects the files it reviews. Each selected file is reviewed
 
 No scan writes to the code it reads. `scan-git` reads files from the git repository without checking anything out, and `scan-github` reads them through the GitHub API without cloning.
 
+`scan-git --diff REV` takes the files on disk as git does: every tracked file, and the untracked files that the repository's `.gitignore` files, `.git/info/exclude` and the `core.excludesFile` of your git configuration leave in. Every other `scan-git` scan, and every `scan-github` scan, reads committed files only, so no ignore rules apply to it.
+
 ## Reference
 
 ### Scan flags
@@ -87,7 +89,7 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 | `--rules DIR` | `JEVREV_RULES` | Directory of rule sets. Repeat for more. Any `--rules` replaces `JEVREV_RULES`. |
 | `-i`/`--include PATTERN` | | Scan only files PATTERN matches, in gitignore syntax. Repeat for more. |
 | `-e`/`--exclude PATTERN` | | Leave out files PATTERN matches. Repeat for more. Wins over `--include`. |
-| `--no-ignore` | | Also scan files that `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` match. `scan` given a single file scans it regardless. |
+| `--no-ignore` | | `scan` only. Also scan files that `.ignore` files match, and inside a git repository files that its `.gitignore` files, `.git/info/exclude` or the global excludes file match. `scan` given a single file scans it regardless. |
 | `--exit-zero` | | Exit 0 even with findings. |
 | `-q`/`--quiet` | | Print the findings and nothing else. |
 | `--api-key` | `TYPESAFE_API_KEY` | TypeSafe API key. Required. |

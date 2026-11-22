@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use jevrev::files::{Files, InMemory};
 use jevrev::git::{Diff, FileDiff, Hunk, Line};
+use jevrev::github::api::{Github, Tarball};
 use jevrev::languages;
 use jevrev::lines::LineRange;
 use jevrev::non_empty::NonEmpty;
 use jevrev::rules::Language;
-use jevrev::scan::{Changes, IgnoreRules, ScanScope, scan};
+use jevrev::scan::{Changes, ScanScope, scan};
 use jevrev::source_path::SourcePath;
 use jevrev::state::State;
 
@@ -35,7 +35,7 @@ fn files_tile_into_the_captured_ranges() {
             serde_json::from_slice(&std::fs::read(directory.join(format!("{name}.json"))).unwrap())
                 .unwrap();
         let found: serde_json::Map<String, serde_json::Value> =
-            languages::detect(&SourcePath::new(name, None).unwrap(), &source)
+            languages::detect(&SourcePath::new(name).unwrap(), &source)
                 .into_iter()
                 .map(|language| {
                     let languages::Syntax::Valid(ranges) =
@@ -97,14 +97,14 @@ fn diff_of(value: &serde_json::Value) -> Diff {
             .unwrap()
             .iter()
             .map(|file| FileDiff {
-                path: SourcePath::new(file["path"].as_str().unwrap(), None).unwrap(),
+                path: SourcePath::new(file["path"].as_str().unwrap()).unwrap(),
                 hunks: NonEmpty::from_vec(
                     file["hunks"]
                         .as_array()
                         .unwrap()
                         .iter()
                         .map(|hunk| Hunk {
-                            path: SourcePath::new(file["path"].as_str().unwrap(), None).unwrap(),
+                            path: SourcePath::new(file["path"].as_str().unwrap()).unwrap(),
                             old: side(
                                 number(&hunk["source_start"]),
                                 number(&hunk["source_length"]),
@@ -139,14 +139,14 @@ async fn changes_split_into_the_captured_states() {
         serde_json::from_slice(&std::fs::read(directory.join("diff.json")).unwrap()).unwrap();
     let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("states.json")).unwrap()).unwrap();
-    let files = Files::InMemory(InMemory::new(
+    let files = Github::Tarball(Tarball::new(
         spec["files"]
             .as_object()
             .unwrap()
             .iter()
             .map(|(path, text)| {
                 (
-                    SourcePath::new(path, None).unwrap(),
+                    SourcePath::new(path).unwrap(),
                     text.as_str().unwrap().as_bytes().to_vec(),
                 )
             })
@@ -158,7 +158,7 @@ async fn changes_split_into_the_captured_states() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| SourcePath::new(v.as_str().unwrap(), None).unwrap())
+            .map(|v| SourcePath::new(v.as_str().unwrap()).unwrap())
             .collect(),
     };
     let rules = tempfile::tempdir().unwrap();
@@ -173,7 +173,6 @@ async fn changes_split_into_the_captured_states() {
     )
     .unwrap();
     let scope = ScanScope {
-        ignore: IgnoreRules::Off,
         include: Vec::new(),
         exclude: Vec::new(),
     };

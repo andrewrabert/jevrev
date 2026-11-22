@@ -26,10 +26,9 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::files::{Files, ReadTextError};
+use crate::files::{ReadTextError, Source};
 use crate::git::{Diff, FileDiff, Line};
 use crate::gitignore::{Check, Pattern, Spec};
-use crate::ignore_rules::Ignore;
 use crate::jev::api::{Client, NoulAnswers, Probability};
 use crate::jev::ask;
 use crate::languages::{self, Syntax, TestMarker};
@@ -39,13 +38,7 @@ use crate::rules::{Conditions, Language, RuleSet};
 use crate::source_path::SourcePath;
 use crate::state::{Body, DiffHunk, Extent, State, StateKind};
 
-pub enum IgnoreRules {
-    Apply(Ignore),
-    Off,
-}
-
 pub struct ScanScope {
-    pub ignore: IgnoreRules,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
 }
@@ -107,12 +100,6 @@ struct Condition {
 }
 
 impl Condition {
-    fn holds_among(&self, paths: &[SourcePath]) -> bool {
-        self.exists
-            .iter()
-            .all(|spec| paths.iter().any(|path| spec.check(path) == Check::Included))
-    }
-
     fn matches(&self, file: &File) -> bool {
         let language =
             self.languages.is_empty() || file.languages.iter().any(|l| self.languages.contains(l));
@@ -192,18 +179,23 @@ fn rule_sets(
     Ok(sets)
 }
 
-fn sets_among(sets: Vec<SetConditions>, paths: &[SourcePath]) -> Vec<SetConditions> {
-    sets.into_iter()
-        .map(|set| SetConditions {
-            path: set.path,
-            conditions: set
-                .conditions
-                .into_iter()
-                .filter(|c| c.holds_among(paths))
-                .collect(),
-        })
-        .filter(|set| !set.conditions.is_empty())
-        .collect()
+fn sets_in(sets: Vec<SetConditions>, source: &impl Source) -> Result<Vec<SetConditions>, Error> {
+    let mut found = Vec::new();
+    for set in sets {
+        let mut conditions = Vec::new();
+        for condition in set.conditions {
+            if source.exists(&condition.exists)? {
+                conditions.push(condition);
+            }
+        }
+        if !conditions.is_empty() {
+            found.push(SetConditions {
+                path: set.path,
+                conditions,
+            });
+        }
+    }
+    Ok(found)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -431,24 +423,19 @@ fn states_of(
     states
 }
 
-pub struct ScanRun<'s> {
-    source: &'s Files,
+pub struct ScanRun<'s, S: Source> {
+    source: &'s S,
     rule_sets: BTreeMap<PathBuf, RuleSet>,
     selection: BTreeMap<File, NonEmpty<PathBuf>>,
 }
 
-impl<'s> ScanRun<'s> {
+impl<'s, S: Source> ScanRun<'s, S> {
     async fn select(
         rules: &[PathBuf],
-        source: &'s Files,
+        source: &'s S,
         scope: &ScanScope,
-        candidates: &[&SourcePath],
-    ) -> Result<ScanRun<'s>, ScanError> {
-        let ignore = match &scope.ignore {
-            IgnoreRules::Apply(ignore) => Some(ignore),
-            IgnoreRules::Off => None,
-        };
-        let paths = source.paths(ignore)?;
+        candidates: impl Iterator<Item = Result<SourcePath, Error>>,
+    ) -> Result<ScanRun<'s, S>, ScanError> {
         let included = if scope.include.is_empty() {
             PathFilter::Any
         } else {
@@ -458,18 +445,15 @@ impl<'s> ScanRun<'s> {
         };
         let excluded =
             Spec::from_lines(scope.exclude.iter().map(String::as_str)).context("--exclude")?;
-        let in_scope: HashSet<&SourcePath> = paths
-            .iter()
-            .filter(|path| included.admits(path) && excluded.check(path) != Check::Included)
-            .collect();
         let mut rule_sets = BTreeMap::new();
-        let sets = sets_among(self::rule_sets(rules, &mut rule_sets)?, &paths);
+        let sets = sets_in(self::rule_sets(rules, &mut rule_sets)?, source)?;
         let mut selection = BTreeMap::new();
         for path in candidates {
-            if !in_scope.contains(path) {
+            let path = path?;
+            if !included.admits(&path) || excluded.check(&path) == Check::Included {
                 continue;
             }
-            let text = match source.read_text(path).await {
+            let text = match source.read_text(&path).await {
                 Ok(text) => text,
                 Err(ReadTextError::NotUtf8(e)) => {
                     tracing::debug!("skipping {path}: not UTF-8 text: {e}");
@@ -478,8 +462,8 @@ impl<'s> ScanRun<'s> {
                 Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string()).into()),
             };
             let file = File {
-                path: (*path).clone(),
-                languages: languages::detect(path, &text),
+                languages: languages::detect(&path, &text),
+                path,
             };
             let selecting = sets
                 .iter()
@@ -510,7 +494,7 @@ impl<'s> ScanRun<'s> {
 
 pub async fn scan(
     rules: &[PathBuf],
-    source: &Files,
+    source: &impl Source,
     scope: &ScanScope,
     changes: Option<&Changes>,
 ) -> Result<Scanned, ScanError> {
@@ -519,19 +503,18 @@ pub async fn scan(
         .flat_map(|changes| &changes.diff.files)
         .map(|file_diff| (&file_diff.path, file_diff))
         .collect();
-    let paths;
-    let candidates: Vec<&SourcePath> = match changes {
-        None => {
-            paths = source.paths(None)?;
-            paths.iter().collect()
-        }
-        Some(changes) => changed
-            .keys()
-            .copied()
-            .chain(changes.untracked.iter())
-            .collect(),
+    let candidates: Box<dyn Iterator<Item = Result<SourcePath, Error>> + '_> = match changes {
+        None => source.paths(),
+        Some(changes) => Box::new(
+            changed
+                .keys()
+                .copied()
+                .chain(changes.untracked.iter())
+                .cloned()
+                .map(Ok),
+        ),
     };
-    let run = ScanRun::select(rules, source, scope, &candidates).await?;
+    let run = ScanRun::select(rules, source, scope, candidates).await?;
     let mut states = Vec::new();
     for (file, sets) in &run.selection {
         let text = run

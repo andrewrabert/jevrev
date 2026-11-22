@@ -13,13 +13,12 @@ use http_body_util::combinators::BoxBody;
 use octocrab::Octocrab;
 
 use crate::Error;
-use crate::files::{InMemory, ReadTextError};
+use crate::files::{ReadTextError, Source};
 use crate::git::{self, ContentPair, Diff, GitObjectId, GitRevision, Side};
 use crate::github::credentials::Token;
 use crate::github::pull_request::{GithubPullRequest, PullRequest, User};
 use crate::github::repo::{GithubHost, GithubRepo};
 use crate::github::review;
-use crate::ignore_rules::Ignore;
 use crate::source_path::{SourcePath, SourcePathError};
 use crate::store::{Finding, Review};
 
@@ -63,6 +62,50 @@ pub struct Client {
     rest_base: url::Url,
 }
 
+/// A scan's files from GitHub: a commit's tree, read blob by blob, or a commit's tarball.
+#[allow(clippy::large_enum_variant)]
+pub enum Github {
+    Tree(Blobs),
+    Tarball(Tarball),
+}
+
+impl Source for Github {
+    fn paths(&self) -> Box<dyn Iterator<Item = Result<SourcePath, Error>> + '_> {
+        match self {
+            Github::Tree(blobs) => match blobs.paths() {
+                Ok(paths) => Box::new(paths.into_iter().map(Ok)),
+                Err(e) => Box::new(std::iter::once(Err(e))),
+            },
+            Github::Tarball(tarball) => Box::new(tarball.contents.keys().cloned().map(Ok)),
+        }
+    }
+
+    async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
+        match self {
+            Github::Tree(blobs) => blobs.read_text(path).await,
+            Github::Tarball(tarball) => {
+                let contents = tarball
+                    .contents
+                    .get(path)
+                    .ok_or_else(|| anyhow!("no such file"))?;
+                Ok(String::from_utf8(contents.clone())?)
+            }
+        }
+    }
+}
+
+/// The files of a commit's tarball, each path with its contents.
+#[derive(Debug, Clone, Default)]
+pub struct Tarball {
+    contents: BTreeMap<SourcePath, Vec<u8>>,
+}
+
+impl Tarball {
+    pub fn new(contents: BTreeMap<SourcePath, Vec<u8>>) -> Tarball {
+        Tarball { contents }
+    }
+}
+
 pub struct Blobs {
     client: Client,
     repo: GithubRepo,
@@ -71,19 +114,18 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    pub fn paths(&self, ignore: Option<&Ignore>) -> Result<Vec<SourcePath>, Error> {
+    fn paths(&self) -> Result<Vec<SourcePath>, Error> {
         let mut found = Vec::new();
         for text in self.blobs.keys() {
-            match SourcePath::new(text, ignore) {
+            match SourcePath::new(text) {
                 Ok(path) => found.push(path),
-                Err(SourcePathError::Ignored) => {}
                 Err(e) => return Err(Error::from(e).context(text.clone())),
             }
         }
         Ok(found)
     }
 
-    pub async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
+    async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
         let path = path.to_str();
         let cached = self.cache()?.get(path).cloned();
         if let Some(found) = cached {
@@ -343,11 +385,7 @@ impl Client {
         sha(&what, &compared.merge_base_commit.sha)
     }
 
-    pub async fn tarball(
-        &self,
-        repo: &GithubRepo,
-        commit: &GitObjectId,
-    ) -> Result<InMemory, Error> {
+    pub async fn tarball(&self, repo: &GithubRepo, commit: &GitObjectId) -> Result<Tarball, Error> {
         let what = format!("tarball at {commit}");
         let response = self
             .rest
@@ -369,7 +407,7 @@ impl Client {
             }
             let entry_path = entry.path().map_err(broken)?.into_owned();
             let archive_folder: PathBuf = entry_path.components().take(1).collect();
-            let path = match SourcePath::from_base(&archive_folder, &entry_path, None) {
+            let path = match SourcePath::from_base(&archive_folder, &entry_path) {
                 Ok(path) => path,
                 Err(SourcePathError::InsideGitDirectory) => continue,
                 Err(e) => return Err(Error::from(e).context(entry_path.display().to_string())),
@@ -378,7 +416,7 @@ impl Client {
             entry.read_to_end(&mut data).map_err(broken)?;
             contents.insert(path, data);
         }
-        Ok(InMemory::new(contents))
+        Ok(Tarball::new(contents))
     }
 
     async fn blob_shas(
@@ -459,7 +497,7 @@ impl Client {
         };
         let read_pairs: Vec<_> = futures::stream::iter(changed)
             .map(|(text, before, after)| async move {
-                let path = SourcePath::new(&text, None).map_err(|e| Error::from(e).context(text));
+                let path = SourcePath::new(&text).map_err(|e| Error::from(e).context(text));
                 match path {
                     Ok(path) => Ok((
                         path,
