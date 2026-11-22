@@ -48,16 +48,11 @@ fn after_help() -> String {
     format!(
         "\
 REVIEW FLOW:
-  1. jevrev --review FILE scan|scan-git|scan-github ...
-     Scan, and save the findings to FILE, a new review file.
-  2. jevrev --review FILE pending
-     Print the findings without a verdict.
-  3. jevrev --review FILE confirm|reject INDEX REASON
-     Record one finding's verdict; repeat until pending prints nothing.
-  4. jevrev --review FILE show [--format json|md]
-     Print the review; or, for a scan-github --pr review:
-     jevrev --review FILE submit-github
-     Post the confirmed findings on the pull request.
+  1. Scan into a new review file       jevrev -r FILE scan|scan-git|scan-github ...
+  2. List findings without a verdict   jevrev -r FILE pending
+  3. Confirm or reject each finding    jevrev -r FILE confirm|reject INDEX REASON
+  4. Print the review                  jevrev -r FILE show
+     or post it on the pull request    jevrev -r FILE submit-github
 
 Run `jevrev COMMAND --help` for each command's options.
 
@@ -74,7 +69,7 @@ EXIT STATUS:
 }
 
 const PENDING_FIELDS: &str = "\
-FIELDS OF EACH LINE:
+FIELDS OF EACH --format json LINE:
   index        the finding's INDEX for confirm and reject, from 1
   file         the finding's file, relative to the scanned source
   start, end   the finding's first and last lines
@@ -189,9 +184,16 @@ enum Command {
         #[command(flatten)]
         scan: ScanArgs,
     },
-    /// Print each finding without a verdict as a line of JSON, its file relative to the source
+    /// Print the findings without a verdict
     #[command(after_help = PENDING_FIELDS)]
-    Pending,
+    Pending {
+        /// Print a listing, or each finding as a line of JSON [default: text]
+        #[arg(long, value_enum, default_value_t = PendingFormat::Text, hide_default_value = true)]
+        format: PendingFormat,
+        /// Print nothing when no finding is pending
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Confirm one finding without a verdict
     #[command(after_help = JUDGE_NOTES)]
     Confirm {
@@ -259,6 +261,9 @@ struct ScanArgs {
     /// Exit 0 even when the scan has findings
     #[arg(long)]
     exit_zero: bool,
+    /// Print the findings and nothing else
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 struct Scan<'a> {
@@ -270,6 +275,7 @@ struct Scan<'a> {
     include: Vec<String>,
     exclude: Vec<String>,
     exit_zero: bool,
+    quiet: bool,
 }
 
 impl ScanArgs {
@@ -319,6 +325,7 @@ impl ScanArgs {
             include: self.include,
             exclude: self.exclude,
             exit_zero: self.exit_zero,
+            quiet: self.quiet,
         })
     }
 }
@@ -342,6 +349,12 @@ impl From<LogLevel> for tracing::Level {
             LogLevel::Trace => tracing::Level::TRACE,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PendingFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -589,7 +602,13 @@ async fn scan_and_save(
     if let Some(file) = scan.review {
         save_new(file, &review)?;
     }
-    anstream::print!("{}", output::findings_listing(&review.findings, &summary));
+    anstream::print!("{}", output::findings_listing(&review.findings));
+    if !scan.quiet {
+        if !review.findings.is_empty() {
+            anstream::println!();
+        }
+        anstream::println!("{summary}");
+    }
     Ok(if !review.findings.is_empty() && !scan.exit_zero {
         EXIT_FINDINGS
     } else {
@@ -809,9 +828,25 @@ async fn cmd_submit_github(file: Option<&Path>, token: &Token) -> Result<(), Err
     Ok(())
 }
 
-fn cmd_pending(file: Option<&Path>) -> Result<(), Error> {
+fn cmd_pending(file: Option<&Path>, format: PendingFormat, quiet: bool) -> Result<(), Error> {
     let review = with_review(review_path(file, "pending")?, |_, review| Ok(review))?;
-    write!(std::io::stdout(), "{}", output::pending_lines(&review))?;
+    match format {
+        PendingFormat::Text => {
+            let pending: Vec<&Finding> = review
+                .findings
+                .iter()
+                .filter(|f| f.judgment.is_none())
+                .collect();
+            if pending.is_empty() {
+                if !quiet {
+                    anstream::println!("No findings without a verdict.");
+                }
+            } else {
+                anstream::print!("{}", output::findings_listing(pending));
+            }
+        }
+        PendingFormat::Json => write!(std::io::stdout(), "{}", output::pending_lines(&review))?,
+    }
     Ok(())
 }
 
@@ -909,7 +944,7 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             )
             .await
         }
-        Command::Pending => cmd_pending(file).map(|()| EXIT_CLEAN),
+        Command::Pending { format, quiet } => cmd_pending(file, format, quiet).map(|()| EXIT_CLEAN),
         Command::Confirm { index, reason } => {
             judge(file, "confirm", index, &reason, Verdict::Confirmed).map(|()| EXIT_CLEAN)
         }

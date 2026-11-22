@@ -34,6 +34,14 @@ fn review_outputs_equal_the_captured_ones() {
             |label: &str, part: &str| read(&directory.join(format!("{name}.{label}.{part}")));
         assert_eq!(expected("pending", "status"), "0\n");
         assert_eq!(pending_lines(&review), expected("pending", "out"), "{name}");
+        assert_eq!(
+            anstream::adapter::strip_str(&findings_listing(
+                review.findings.iter().filter(|f| f.judgment.is_none())
+            ))
+            .to_string(),
+            expected("pending-text", "out"),
+            "{name}"
+        );
         if name == "pending" {
             assert_eq!(expected("show-json", "status"), "2\n");
             assert_eq!(
@@ -62,8 +70,7 @@ fn the_findings_listing_equals_the_captured_one() {
     let directory = fixtures().join("output");
     let findings: Vec<Finding> =
         serde_json::from_str(&read(&directory.join("findings.json"))).unwrap();
-    let summary = "3 states reviewed in /srv/jevrev fixtures/dir, 6 findings, 0 failures";
-    let listing = findings_listing(&findings, summary);
+    let listing = findings_listing(&findings);
     assert_eq!(listing, read(&directory.join("findings-colour.txt")));
     assert_eq!(
         anstream::adapter::strip_str(&listing).to_string(),

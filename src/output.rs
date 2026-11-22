@@ -26,8 +26,8 @@ fn probability_style(probability: Probability) -> Style {
     }
 }
 
-pub fn findings_listing(findings: &[Finding], summary: &str) -> String {
-    let mut sorted: Vec<&Finding> = findings.iter().collect();
+pub fn findings_listing<'f>(findings: impl IntoIterator<Item = &'f Finding>) -> String {
+    let mut sorted: Vec<&Finding> = findings.into_iter().collect();
     sorted.sort_by(|a, b| {
         (
             a.finding.file.as_str(),
@@ -60,11 +60,6 @@ pub fn findings_listing(findings: &[Finding], summary: &str) -> String {
             f.finding.flags
         ));
     }
-    if !findings.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(summary);
-    out.push('\n');
     out
 }
 

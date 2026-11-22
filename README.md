@@ -35,7 +35,7 @@ Some of jev's findings are false positives. The review workflow lets you, or an 
 # 1. Scan the pull request and create the review file. The file must not already exist.
 jevrev -r pr12.json scan-github ORG/NAME --pr 12
 
-# 2. List the findings that still need a verdict, one JSON object per line.
+# 2. List the findings that still need a verdict.
 jevrev -r pr12.json pending
 
 # 3. Confirm or reject each finding by its [index], with a one-sentence reason.
@@ -50,7 +50,7 @@ jevrev -r pr12.json submit-github      # post them as a pull request review with
 Each step in more detail:
 
 1. **Scan with `-r`/`--review FILE`.** The scan creates FILE and saves its findings there. FILE must not exist, and jevrev checks this before it sends any request. If the scan fails, jevrev leaves no FILE behind. To scan again, delete FILE or choose another name.
-2. **List the undecided findings with `pending`.** It prints each finding without a verdict as a line of JSON.
+2. **List the undecided findings with `pending`.**
 3. **Give each finding a verdict with `confirm INDEX REASON` or `reject INDEX REASON`.** INDEX is the number in brackets in the scan's output. You can't change a verdict once you give it. A confirmed finding's reason becomes the text of its comment on the pull request, so write it for the pull request's author.
 4. **Publish with `show` or `submit-github`.** `show` prints the review as JSON, or with `--format md` as markdown of the confirmed findings grouped by rule. `submit-github` posts the confirmed findings as a review on the pull request and prints the review's URL. Both fail while any finding has no verdict.
 
@@ -90,6 +90,7 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 | `--no-ignore` | | Also scan files that `.gitignore`, `.ignore`, `.git/info/exclude` or `core.excludesFile` match. `scan` given a single file scans it regardless. |
 | `--metadata KEY=VALUE` | | Store KEY in the review file. A later KEY wins. Requires `--review`. |
 | `--exit-zero` | | Exit 0 even with findings. |
+| `-q`/`--quiet` | | Print the findings and nothing else. |
 | `--api-key` | `TYPESAFE_API_KEY` | TypeSafe API key. Required. |
 | `--base-url` | `TYPESAFE_BASE_URL` | TypeSafe API URL. |
 | `--model` | `TYPESAFE_DEFAULT_MODEL` | Jev model to ask. |

@@ -11,5 +11,3 @@ of flags.
     Flags with a tab	here.
 [1m日本/ü.rs:5-6[0m [2m[5][0m [33mstandards.yaml#10[0m [33m0.70[0m [36mlanguage[0m
     Unicode é ü 日本	tab after wide text.
-
-3 states reviewed in /srv/jevrev fixtures/dir, 6 findings, 0 failures
