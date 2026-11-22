@@ -1,6 +1,7 @@
 ---
 source:
-  path: /srv/jevrev fixtures/dir
+  LocalDir:
+    path: /srv/jevrev fixtures/dir
 findings: 4
 confirmed: 3
 rejected: 1

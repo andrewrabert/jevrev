@@ -1,11 +1,14 @@
 ---
 source:
-  host: github.com
-  name: andrewrabert/jevrev
-  git:
-    base: 0123456789abcdef0123456789abcdef01234567
-    head: 89abcdef0123456789abcdef0123456789abcdef
-    number: 12
+  GithubRepo:
+    repo:
+      host: github.com
+      name: andrewrabert/jevrev
+    git:
+      PullRequest:
+        base: 0123456789abcdef0123456789abcdef01234567
+        head: 89abcdef0123456789abcdef0123456789abcdef
+        number: 12
 findings: 4
 confirmed: 3
 rejected: 1

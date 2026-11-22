@@ -1,10 +1,13 @@
 ---
 source:
-  host: ghe.example.com:8443
-  name: my-org/repo.name
-  git:
-    base: 0123456789abcdef0123456789abcdef01234567
-    head: 89abcdef0123456789abcdef0123456789abcdef
+  GithubRepo:
+    repo:
+      host: ghe.example.com:8443
+      name: my-org/repo.name
+    git:
+      Diff:
+        base: 0123456789abcdef0123456789abcdef01234567
+        head: 89abcdef0123456789abcdef0123456789abcdef
 findings: 4
 confirmed: 3
 rejected: 1

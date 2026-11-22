@@ -8,7 +8,6 @@ static RULE_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
 pub struct Finding {
     #[validate(length(min = 1))]
     pub file: String,
-    #[serde(flatten)]
     pub line_range: LineRange,
     #[validate(regex(path = *RULE_ID))]
     pub rule: String,

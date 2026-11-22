@@ -6,8 +6,7 @@ const FRONT_MATTER: &str = "---\n{{ model.front_matter }}\n---\n\n";
 
 const TRAILER: &str = "\n\n---\n<sub>Posted by an agent</sub>\n";
 
-const FINDING_LINES: &str =
-    "{{ f.file }}:{{ f.start }}{% if f.start != f.end %}-{{ f.end }}{% endif %}";
+const FINDING_LINES: &str = "{{ f.finding.file }}:{{ f.finding.line_range.start }}{% if f.finding.line_range.start != f.finding.line_range.end %}-{{ f.finding.line_range.end }}{% endif %}";
 
 const PR_COMMENT: &str = "{{ model.reason }}
 
@@ -28,7 +27,7 @@ In files this pull request does not change:
 
 ### {{{{ rule.flags }}}}
 {{% for f in rule.findings %}}
-- `{FINDING_LINES}`: {{{{ f.reason or \"\" }}}}
+- `{FINDING_LINES}`: {{{{ f.judgment.reason if f.judgment else \"\" }}}}
 {{%- endfor %}}
 {{%- endfor %}}
 {{%- if model.left_out %}}

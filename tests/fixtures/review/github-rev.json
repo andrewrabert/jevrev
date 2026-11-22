@@ -1,1 +1,1 @@
-{"source":{"host":"github.com","name":"andrewrabert/jevrev","git":{"commit":"0123456789abcdef0123456789abcdef01234567"}},"include":[],"exclude":[],"findings":[]}
+{"source":{"GithubRepo":{"repo":{"host":"github.com","name":"andrewrabert/jevrev"},"git":{"Rev":{"commit":"0123456789abcdef0123456789abcdef01234567"}}}},"include":[],"exclude":[],"findings":[]}

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use jevrev::output::{findings_listing, pending_lines, review_json, review_markdown};
-use jevrev::store::{Finding, Stored, open};
+use jevrev::store::{Finding, Review};
 
 fn fixtures() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -14,7 +14,6 @@ fn read(path: &Path) -> String {
 #[test]
 fn review_outputs_equal_the_captured_ones() {
     let directory = fixtures().join("review");
-    let scratch = tempfile::tempdir().unwrap();
     for name in [
         "github-diff",
         "github-pr",
@@ -25,11 +24,8 @@ fn review_outputs_equal_the_captured_ones() {
         "local-git-rev",
         "pending",
     ] {
-        let copy = scratch.path().join(format!("{name}.json"));
-        std::fs::copy(directory.join(format!("{name}.json")), &copy).unwrap();
-        let Stored::Review(review) = open(&copy, |store| store.load()).unwrap() else {
-            panic!("{name} holds no review");
-        };
+        let review: Review =
+            serde_json::from_str(&read(&directory.join(format!("{name}.json")))).unwrap();
         let expected =
             |label: &str, part: &str| read(&directory.join(format!("{name}.{label}.{part}")));
         assert_eq!(expected("pending", "status"), "0\n");

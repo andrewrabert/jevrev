@@ -1,9 +1,11 @@
 ---
 source:
-  path: /srv/repo
-  git:
-    base: 0123456789abcdef0123456789abcdef01234567
-    head: 89abcdef0123456789abcdef0123456789abcdef
+  LocalGitDir:
+    path: /srv/repo
+    git:
+      Diff:
+        base: 0123456789abcdef0123456789abcdef01234567
+        head: 89abcdef0123456789abcdef0123456789abcdef
 findings: 4
 confirmed: 3
 rejected: 1

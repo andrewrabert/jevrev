@@ -33,18 +33,18 @@ Some of jev's findings are false positives. The review workflow lets you, or an 
 
 ```sh
 # 1. Scan the pull request and create the review file. The file must not already exist.
-jevrev -r pr12.json scan-github ORG/NAME --pr 12
+jevrev -r pr12.redb scan-github ORG/NAME --pr 12
 
 # 2. List the findings that still need a verdict.
-jevrev -r pr12.json pending
+jevrev -r pr12.redb pending
 
 # 3. Confirm or reject each finding by its [index], with a one-sentence reason.
-jevrev -r pr12.json confirm 1 "The handler returns an error response instead of raising"
-jevrev -r pr12.json reject 2 "The error return is on an unchanged line"
+jevrev -r pr12.redb confirm 1 "The handler returns an error response instead of raising"
+jevrev -r pr12.redb reject 2 "The error return is on an unchanged line"
 
 # 4. Publish. Both commands refuse to run until every finding has a verdict.
-jevrev -r pr12.json show --format md   # print the confirmed findings as markdown
-jevrev -r pr12.json submit-github      # post them as a pull request review with inline comments
+jevrev -r pr12.redb show --format md   # print the confirmed findings as markdown
+jevrev -r pr12.redb submit-github      # post them as a pull request review with inline comments
 ```
 
 Each step in more detail:

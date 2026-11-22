@@ -1,8 +1,10 @@
 ---
 source:
-  path: "/srv/repo: colon"
-  git:
-    commit: "0123456789012345678901234567890123456789"
+  LocalGitDir:
+    path: "/srv/repo: colon"
+    git:
+      Rev:
+        commit: "0123456789012345678901234567890123456789"
 findings: 2
 confirmed: 1
 rejected: 1

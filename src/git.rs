@@ -78,7 +78,6 @@ pub struct GitDiffToDisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
 pub enum LocalSelection {
     Diff(GitDiff),
     DiffToDisk(GitDiffToDisk),

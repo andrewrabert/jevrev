@@ -1,8 +1,7 @@
 use anyhow::{Context, anyhow};
 use std::path::Path;
 
-use std::fs::File;
-use std::io::{Read, Seek, Write};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::git::{GitDiff, GitRev, LocalSelection};
 use crate::github::pull_request::GithubPullRequest;
@@ -20,7 +19,7 @@ pub enum Verdict {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Judgment {
     pub verdict: Verdict,
     pub reason: String,
@@ -28,52 +27,10 @@ pub struct Judgment {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 pub struct Finding {
-    #[serde(flatten)]
     pub finding: scan::Finding,
     #[validate(range(min = 1))]
     pub index: i64,
-    #[serde(flatten, with = "judgment_fields")]
     pub judgment: Option<Judgment>,
-}
-
-mod judgment_fields {
-    use super::{Judgment, Verdict};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    #[derive(Serialize, Deserialize)]
-    struct Fields {
-        verdict: Option<Verdict>,
-        reason: Option<String>,
-    }
-
-    pub fn serialize<S: Serializer>(
-        judgment: &Option<Judgment>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let (verdict, reason) = match judgment {
-            Some(j) => (Some(j.verdict), Some(j.reason.clone())),
-            None => (None, None),
-        };
-        Fields { verdict, reason }.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<Judgment>, D::Error> {
-        match Fields::deserialize(deserializer)? {
-            Fields {
-                verdict: Some(verdict),
-                reason: Some(reason),
-            } => Ok(Some(Judgment { verdict, reason })),
-            Fields {
-                verdict: None,
-                reason: None,
-            } => Ok(None),
-            _ => Err(serde::de::Error::custom(
-                "verdict and reason are both null or both given",
-            )),
-        }
-    }
 }
 
 impl Finding {
@@ -91,7 +48,6 @@ impl Finding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
 pub enum GithubSelection {
     PullRequest(GithubPullRequest),
     Diff(GitDiff),
@@ -99,10 +55,8 @@ pub enum GithubSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
 pub enum Source {
     GithubRepo {
-        #[serde(flatten)]
         repo: GithubRepo,
         git: GithubSelection,
     },
@@ -146,53 +100,192 @@ pub enum Stored {
     Empty,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Header {
+    source: Source,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+macro_rules! postcard_value {
+    ($type:ty, $name:literal) => {
+        impl redb::Value for $type {
+            type SelfType<'a> = $type;
+            type AsBytes<'a> = Vec<u8>;
+
+            fn fixed_width() -> Option<usize> {
+                None
+            }
+
+            fn from_bytes<'a>(data: &'a [u8]) -> $type
+            where
+                Self: 'a,
+            {
+                postcard::from_bytes(data).expect(concat!("a stored ", $name, " decodes"))
+            }
+
+            fn as_bytes<'a, 'b: 'a>(value: &'a $type) -> Vec<u8>
+            where
+                Self: 'b,
+            {
+                postcard::to_stdvec(value).expect(concat!("a ", $name, " encodes"))
+            }
+
+            fn type_name() -> redb::TypeName {
+                redb::TypeName::new(concat!("jevrev::", $name))
+            }
+        }
+    };
+}
+
+postcard_value!(Header, "Header");
+postcard_value!(scan::Finding, "Finding");
+postcard_value!(Judgment, "Judgment");
+
+const REVIEW: TableDefinition<(), Header> = TableDefinition::new("review");
+const FINDINGS: TableDefinition<u64, scan::Finding> = TableDefinition::new("findings");
+const VERDICTS: TableDefinition<u64, Judgment> = TableDefinition::new("verdicts");
+
 pub struct Store {
-    file: File,
+    db: Database,
 }
 
 impl Store {
     pub fn load(&self) -> Result<Stored, Error> {
-        let mut text = String::new();
-        (&self.file)
-            .rewind()
-            .and_then(|()| (&self.file).read_to_string(&mut text))
-            .context("review file")?;
-        if text.is_empty() {
-            return Ok(Stored::Empty);
-        }
-        let review: Review = serde_json::from_str(&text).context("review file")?;
-        for finding in &review.findings {
+        self.read().context("review file")
+    }
+
+    fn read(&self) -> Result<Stored, Error> {
+        let read = self.db.begin_read()?;
+        let review = match read.open_table(REVIEW) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Stored::Empty),
+            Err(e) => return Err(e.into()),
+        };
+        let Header {
+            source,
+            include,
+            exclude,
+        } = review
+            .get(())?
+            .ok_or_else(|| anyhow!("the review table has no header"))?
+            .value();
+        let verdicts = read.open_table(VERDICTS)?;
+        let mut findings = Vec::new();
+        for (position, entry) in read.open_table(FINDINGS)?.iter()?.enumerate() {
+            let (index, finding) = entry?;
+            let index = index.value();
+            if index != position as u64 + 1 {
+                return Err(anyhow!("finding {index} follows finding {position}"));
+            }
+            let finding = Finding {
+                finding: finding.value(),
+                index: i64::try_from(index)?,
+                judgment: verdicts.get(index)?.map(|judgment| judgment.value()),
+            };
             finding
                 .finding
                 .validate()
                 .and_then(|()| finding.validate())
                 .map_err(|e| anyhow!("finding: {e}"))?;
+            findings.push(finding);
         }
-        Ok(Stored::Review(review))
+        if let Some(entry) = verdicts.iter()?.next_back() {
+            let index = entry?.0.value();
+            if index > findings.len() as u64 {
+                return Err(anyhow!("verdict for finding {index}, which does not exist"));
+            }
+        }
+        Ok(Stored::Review(Review {
+            source,
+            include,
+            exclude,
+            findings,
+        }))
     }
 
+    /// Replaces the stored review with `review`.
     pub fn save(&self, review: &Review) -> Result<(), Error> {
-        let text = serde_json::to_string(review).expect("a review serializes");
-        let mut file = &self.file;
-        file.set_len(0)
-            .and_then(|()| file.rewind())
-            .and_then(|()| file.write_all(text.as_bytes()))
-            .and_then(|()| file.sync_all())
-            .context("review file")
+        self.write(review).context("review file")
+    }
+
+    fn write(&self, review: &Review) -> Result<(), Error> {
+        let header = Header {
+            source: review.source.clone(),
+            include: review.include.clone(),
+            exclude: review.exclude.clone(),
+        };
+        let write = self.db.begin_write()?;
+        write.delete_table(REVIEW)?;
+        write.delete_table(FINDINGS)?;
+        write.delete_table(VERDICTS)?;
+        write.open_table(REVIEW)?.insert((), &header)?;
+        {
+            let mut findings = write.open_table(FINDINGS)?;
+            let mut verdicts = write.open_table(VERDICTS)?;
+            for finding in &review.findings {
+                let index = u64::try_from(finding.index)?;
+                findings.insert(index, &finding.finding)?;
+                if let Some(judgment) = &finding.judgment {
+                    verdicts.insert(index, judgment)?;
+                }
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Records `judgment` as the verdict of finding `index`.
+    pub fn judge(&self, index: u64, judgment: &Judgment) -> Result<(), JudgeError> {
+        let write = self.db.begin_write().map_err(stored)?;
+        if write
+            .open_table(REVIEW)
+            .map_err(stored)?
+            .get(())
+            .map_err(stored)?
+            .is_none()
+        {
+            return Err(JudgeError::NoReview);
+        }
+        {
+            let findings = write.open_table(FINDINGS).map_err(stored)?;
+            if findings.get(index).map_err(stored)?.is_none() {
+                let count = findings.len().map_err(stored)?;
+                return Err(JudgeError::NoFinding { index, count });
+            }
+            let mut verdicts = write.open_table(VERDICTS).map_err(stored)?;
+            if let Some(judged) = verdicts.get(index).map_err(stored)? {
+                return Err(JudgeError::Judged {
+                    index,
+                    verdict: judged.value().verdict,
+                });
+            }
+            verdicts.insert(index, judgment).map_err(stored)?;
+        }
+        write.commit().map_err(stored)
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum JudgeError {
+    #[error("The review file holds no review.")]
+    NoReview,
+    #[error("index: {index} is not in 1..{count}")]
+    NoFinding { index: u64, count: u64 },
+    #[error("index: finding {index} is already {verdict}")]
+    Judged { index: u64, verdict: Verdict },
+    #[error("review file: {0:#}")]
+    Store(Error),
+}
+
+fn stored(error: impl Into<Error>) -> JudgeError {
+    JudgeError::Store(error.into())
+}
+
 pub fn open<T>(path: &Path, run: impl FnOnce(&Store) -> Result<T, Error>) -> Result<T, Error> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("{}", path.display()))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => anyhow!("the review file is locked"),
-        std::fs::TryLockError::Error(e) => anyhow!("{}: {e}", path.display()),
+    let db = Database::create(path).map_err(|e| match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => anyhow!("the review file is locked"),
+        e => anyhow!("{}: {e}", path.display()),
     })?;
-    run(&Store { file })
+    run(&Store { db })
 }

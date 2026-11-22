@@ -102,7 +102,7 @@ nothing. It fails when the review is not of a pull request, such as one of a --r
     after_help = after_help()
 )]
 struct Cli {
-    /// JSON file holding one review: its source, the version of it scanned, findings, and verdicts; a scan given it creates FILE, which must not exist (checked before any request), and leaves no FILE it created when the scan or its save fails; every other command requires it
+    /// redb file holding one review: its source, the version of it scanned, and its findings, with their verdicts in a table of their own; a scan given it creates FILE, which must not exist (checked before any request), and leaves no FILE it created when the scan or its save fails; every other command requires it
     #[arg(short, long, value_name = "FILE")]
     review: Option<PathBuf>,
     #[arg(long, value_name = "PATH", global = true, help = format!("Dotenv file of the variables the flags read [env: {ENV_FILE}]"))]
@@ -802,21 +802,15 @@ fn judge(
     verdict: Verdict,
 ) -> Result<(), Error> {
     let index = index.get();
-    with_review(review_path(file, command)?, |store, mut review| {
-        let count = review.findings.len() as u64;
-        if index > count {
-            bail!("index: {index} is not in 1..{count}");
-        }
-        let finding = &mut review.findings[index as usize - 1];
-        if let Some(judgment) = &finding.judgment {
-            bail!("index: finding {index} is already {}", judgment.verdict);
-        }
-        finding.judgment = Some(Judgment {
-            verdict,
-            reason: reason.to_string(),
-        });
-        store.save(&review)
-    })?;
+    let path = review_path(file, command)?;
+    if !path.is_file() {
+        bail!("{}: no such review file", shown(path));
+    }
+    let judgment = Judgment {
+        verdict,
+        reason: reason.to_string(),
+    };
+    store::open(path, |store| Ok(store.judge(index, &judgment)?))?;
     writeln!(std::io::stdout(), "Finding {index} {verdict}")?;
     Ok(())
 }
