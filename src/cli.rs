@@ -4,6 +4,7 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
 use clap::builder::{OsStringValueParser, TypedValueParser};
@@ -11,18 +12,19 @@ use clap::builder::{OsStringValueParser, TypedValueParser};
 use crate::disk::{Disk, IgnoreFiles};
 use crate::files;
 use crate::git::{
-    DiffBase, DiffRange, Git, GitDiff, GitDiffSpec, GitRepo, GitRev, GitRevision, LocalSelection,
-    WorkingTree,
+    Commits as _, DiffBase, DiffRange, GitDiff, GitDiffSpec, GitDiffToDisk, GitFiles, GitObjectId,
+    GitRepo, GitRev, GitRevision, LocalSelection, PackedCommits, ResolvedDiff,
 };
-use crate::github::api;
 use crate::github::credentials::Token;
 use crate::github::pull_request::GithubPullRequest;
 use crate::github::repo::{GithubHost, GithubRepo, GithubRepoName};
+use crate::github::{api, fetch};
 use crate::jev::{
     self,
     api::{ApiKey, BaseUrl, Model, Timeout},
     cache::{Cache, CacheFile},
 };
+use crate::memgit::{Objects, Pack};
 use crate::scan::{self, Changes, Concurrency, ScanError, ScanScope};
 use crate::source_path::SourcePath;
 use crate::store::{self, Finding, GithubSelection, Judgment, Review, Source, Stored, Verdict};
@@ -147,7 +149,6 @@ enum Command {
         #[command(flatten)]
         scan: ScanArgs,
     },
-    /// Run jev over a GitHub repo, through the GitHub API; print its findings and summary, and save them to a new review file given --review
     #[command(
         group(clap::ArgGroup::new("selection").multiple(false).args(["rev", "diff", "pr"]))
     )]
@@ -375,6 +376,11 @@ fn with_review<T>(
 
 fn judged_review(file: Option<&Path>, command: &str) -> Result<Review, Error> {
     let review = with_review(review_path(file, command)?, |_, review| Ok(review))?;
+    ensure_judged(&review)?;
+    Ok(review)
+}
+
+fn ensure_judged(review: &Review) -> Result<(), Error> {
     let unjudged: Vec<String> = review
         .findings
         .iter()
@@ -384,7 +390,7 @@ fn judged_review(file: Option<&Path>, command: &str) -> Result<Review, Error> {
     if !unjudged.is_empty() {
         bail!("Findings without a verdict: {}", unjudged.join(", "));
     }
-    Ok(review)
+    Ok(())
 }
 
 /// The variables jevrev reads; one the process environment sets wins over the env file's.
@@ -524,7 +530,7 @@ async fn run_jev_scan(
     Ok((reviewed.findings, summary))
 }
 
-fn save_new(path: &Path, review: &Review) -> Result<(), Error> {
+fn save_new(path: &Path, review: &Review, pack: Option<&[u8]>) -> Result<(), Error> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -535,14 +541,16 @@ fn save_new(path: &Path, review: &Review) -> Result<(), Error> {
             }
             _ => anyhow!("{}: {e}", shown(path)),
         })?;
-    store::open(path, |store| store.save(review)).map_err(|error| {
-        match std::fs::remove_file(path) {
-            Ok(()) => error,
-            Err(e) => error.context(format!(
-                "the save failed, and removing the partial {} failed too: {e}",
-                shown(path)
-            )),
-        }
+    let saved = store::open(path, |store| {
+        store.save(review)?;
+        pack.map_or(Ok(()), |pack| store.save_pack(pack))
+    });
+    saved.map_err(|error| match std::fs::remove_file(path) {
+        Ok(()) => error,
+        Err(e) => error.context(format!(
+            "the save failed, and removing the partial {} failed too: {e}",
+            shown(path)
+        )),
     })
 }
 
@@ -551,6 +559,7 @@ async fn scan_and_save(
     source: Source,
     files: &impl files::Source,
     changes: Option<&Changes>,
+    pack: Option<&[u8]>,
     name: &str,
 ) -> Result<u8, Error> {
     let scope = ScanScope {
@@ -569,7 +578,7 @@ async fn scan_and_save(
             .collect(),
     };
     if let Some(file) = scan.review {
-        save_new(file, &review)?;
+        save_new(file, &review, pack)?;
     }
     anstream::print!("{}", output::findings_listing(&review.findings));
     if !scan.quiet {
@@ -617,6 +626,7 @@ async fn cmd_scan(scan: Scan<'_>, path: &Path, no_ignore: bool) -> Result<u8, Er
         Source::LocalDir { path: name.clone() },
         &files,
         None,
+        None,
         &name,
     )
     .await
@@ -636,34 +646,44 @@ async fn cmd_scan_git(
     let Ok(repo) = GitRepo::open(&root) else {
         bail!("{name} is not in a git repository");
     };
-    let selection = match (rev, diff) {
-        (Some(rev), _) => LocalSelection::Rev(repo.resolve_rev(rev)?),
-        (None, Some(spec)) => repo.resolve_diff(spec)?,
+    let (selection, commits, id, changes) = match (rev, diff) {
+        (Some(rev), _) => {
+            let rev = repo.resolve_rev(rev)?;
+            let commits = repo.pack(&[&rev.commit])?;
+            let id = rev.commit.clone();
+            (LocalSelection::Rev(rev), commits, id, None)
+        }
+        (None, Some(spec)) => match repo.resolve_diff(spec)? {
+            ResolvedDiff::Commits(diff) => {
+                let commits = repo.pack(&[&diff.base, &diff.head])?;
+                let changes = Changes {
+                    diff: commits.changes_between_commits(
+                        &diff.base,
+                        &diff.head,
+                        scan::DIFF_CONTEXT,
+                        0,
+                    )?,
+                    untracked: Vec::new(),
+                };
+                let id = diff.head.clone();
+                (LocalSelection::Diff(diff), commits, id, Some(changes))
+            }
+            ResolvedDiff::ToDisk { base } => {
+                let (commits, tree, changes) = repo.pack_working_tree(&base, scan::DIFF_CONTEXT)?;
+                let selection = LocalSelection::DiffToDisk(GitDiffToDisk {
+                    base,
+                    tree: tree.clone(),
+                });
+                (selection, commits, tree, Some(changes))
+            }
+        },
         (None, None) => bail!("scan-git: give --rev or --diff"),
     };
-    let files = match &selection {
-        LocalSelection::Rev(rev) => Git::Commit {
-            repo: repo.clone(),
-            commit: rev.commit.clone(),
-        },
-        LocalSelection::Diff(diff) => Git::Commit {
-            repo: repo.clone(),
-            commit: diff.head.clone(),
-        },
-        LocalSelection::DiffToDisk(_) => {
-            let WorkingTree {
-                mut tracked,
-                untracked,
-            } = repo.working_tree()?;
-            tracked.extend(untracked);
-            tracked.sort();
-            Git::WorkingTree {
-                root: root.clone(),
-                paths: tracked,
-            }
-        }
+    let files = GitFiles {
+        commits: Arc::new(commits),
+        id,
     };
-    let changes = repo.changes(&selection, scan::DIFF_CONTEXT)?;
+    let pack = files.commits.pack().clone();
     scan_and_save(
         scan,
         Source::LocalGitDir {
@@ -672,6 +692,7 @@ async fn cmd_scan_git(
         },
         &files,
         changes.as_ref(),
+        Some(pack.as_bytes()),
         &name,
     )
     .await
@@ -709,10 +730,20 @@ async fn github_selection(
     Ok(GithubSelection::Rev(GitRev { commit }))
 }
 
+async fn fetched(
+    repo: &GithubRepo,
+    token: &Token,
+    commits: &[&GitObjectId],
+) -> Result<Arc<PackedCommits>, Error> {
+    let pack = fetch::fetch(repo, Some(token), commits).await?;
+    Ok(Arc::new(PackedCommits::new(Objects::new(pack)?, None)))
+}
+
 async fn cmd_scan_github(
     scan: Scan<'_>,
     repo: &GithubRepo,
     github: &api::Client,
+    token: &Token,
     rev: Option<&GitRevision>,
     diff: Option<&GitDiffSpec>,
     pr: Option<NonZeroU64>,
@@ -726,16 +757,25 @@ async fn cmd_scan_github(
     };
     let selection = github_selection(pr, rev, diff, github, repo).await?;
     let (files, changes) = match &selection {
-        GithubSelection::Rev(rev) => (
-            api::Github::Tarball(github.tarball(repo, &rev.commit).await?),
-            None,
-        ),
+        GithubSelection::Rev(rev) => {
+            let commits = fetched(repo, token, &[&rev.commit]).await?;
+            (
+                GitFiles {
+                    commits,
+                    id: rev.commit.clone(),
+                },
+                None,
+            )
+        }
         GithubSelection::Diff(GitDiff { base, head })
         | GithubSelection::PullRequest(GithubPullRequest { base, head, .. }) => {
-            let files = api::Github::Tree(github.tree(repo, head).await?);
-            let diff = github.diff(repo, base, head, scan::DIFF_CONTEXT, 0).await?;
+            let commits = fetched(repo, token, &[base, head]).await?;
+            let diff = commits.changes_between_commits(base, head, scan::DIFF_CONTEXT, 0)?;
             (
-                files,
+                GitFiles {
+                    commits,
+                    id: head.clone(),
+                },
                 Some(Changes {
                     diff,
                     untracked: Vec::new(),
@@ -743,6 +783,7 @@ async fn cmd_scan_github(
             )
         }
     };
+    let pack = files.commits.pack().clone();
     let name = format!("{}/{}", repo.host(), repo.name());
     scan_and_save(
         scan,
@@ -752,13 +793,17 @@ async fn cmd_scan_github(
         },
         &files,
         changes.as_ref(),
+        Some(pack.as_bytes()),
         &name,
     )
     .await
 }
 
 async fn cmd_submit_github(file: Option<&Path>, token: &Token) -> Result<(), Error> {
-    let review = judged_review(file, "submit-github")?;
+    let (review, pack) = with_review(review_path(file, "submit-github")?, |store, review| {
+        Ok((review, store.load_pack()?))
+    })?;
+    ensure_judged(&review)?;
     let Source::GithubRepo {
         repo,
         git: GithubSelection::PullRequest(pr),
@@ -767,7 +812,13 @@ async fn cmd_submit_github(file: Option<&Path>, token: &Token) -> Result<(), Err
         bail!("The review is not of a GitHub pull request.");
     };
     let client = api::Client::new(Some(repo.host().clone()), token)?;
-    let url = client.submit_review(repo, pr, &review).await?;
+    let diff = PackedCommits::new(Objects::new(Pack::from(pack))?, None).changes_between_commits(
+        &pr.base,
+        &pr.head,
+        api::REVIEW_DIFF_CONTEXT,
+        api::REVIEW_INTER_HUNK_CONTEXT,
+    )?;
+    let url = client.submit_review(repo, pr, &review, &diff).await?;
     writeln!(std::io::stdout(), "{url}")?;
     Ok(())
 }
@@ -862,12 +913,22 @@ async fn run(cli: Cli) -> Result<u8, Error> {
             scan,
         } => {
             let scan = scan.resolve(file, &environment)?;
+            let token = github_token(token)?;
             let client = api::Client::new(
                 github_host.or_else(|| environment.github_host.clone()),
-                &github_token(token)?,
+                &token,
             )?;
             let repo = GithubRepo::new(client.host().clone(), github);
-            cmd_scan_github(scan, &repo, &client, rev.as_ref(), diff.as_ref(), pr).await
+            cmd_scan_github(
+                scan,
+                &repo,
+                &client,
+                &token,
+                rev.as_ref(),
+                diff.as_ref(),
+                pr,
+            )
+            .await
         }
         Command::Pending { format, quiet } => cmd_pending(file, format, quiet).map(|()| EXIT_CLEAN),
         Command::Confirm { index, reason } => {

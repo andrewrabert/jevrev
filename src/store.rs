@@ -145,6 +145,7 @@ postcard_value!(Judgment, "Judgment");
 const REVIEW: TableDefinition<(), Header> = TableDefinition::new("review");
 const FINDINGS: TableDefinition<u64, scan::Finding> = TableDefinition::new("findings");
 const VERDICTS: TableDefinition<u64, Judgment> = TableDefinition::new("verdicts");
+const PACK: TableDefinition<(), &[u8]> = TableDefinition::new("pack");
 
 pub struct Store {
     db: Database,
@@ -219,6 +220,7 @@ impl Store {
         write.delete_table(REVIEW)?;
         write.delete_table(FINDINGS)?;
         write.delete_table(VERDICTS)?;
+        write.delete_table(PACK)?;
         write.open_table(REVIEW)?.insert((), &header)?;
         {
             let mut findings = write.open_table(FINDINGS)?;
@@ -233,6 +235,26 @@ impl Store {
         }
         write.commit()?;
         Ok(())
+    }
+
+    pub fn save_pack(&self, pack: &[u8]) -> Result<(), Error> {
+        (|| -> Result<(), Error> {
+            let write = self.db.begin_write()?;
+            write.open_table(PACK)?.insert((), pack)?;
+            write.commit()?;
+            Ok(())
+        })()
+        .context("review file")
+    }
+
+    pub fn load_pack(&self) -> Result<Vec<u8>, Error> {
+        (|| -> Result<Vec<u8>, Error> {
+            let read = self.db.begin_read()?;
+            let table = read.open_table(PACK)?;
+            let pack = table.get(())?.ok_or_else(|| anyhow!("no pack"))?;
+            Ok(pack.value().to_vec())
+        })()
+        .context("review file")
     }
 
     /// Records `judgment` as the verdict of finding `index`.

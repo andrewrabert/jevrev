@@ -76,7 +76,7 @@ The review file records the source and the commit ids the scan resolved. `submit
 
 A rule set's `when` selects the files it reviews. Each selected file is reviewed whole. A diff scan also reviews each changed hunk, and all of a changed file's hunks together. Each of the file's languages also yields its ranges, such as each function: every range, or in a diff scan only the ranges the diff touches. A file that a language cannot parse gets no ranges in it. Every rule set that selects a file is asked about all of its states; `when` only selects files.
 
-No scan writes to the code it reads. `scan-git` reads files from the git repository without checking anything out, and `scan-github` reads them through the GitHub API without cloning.
+No scan writes to the code it reads. `scan-git` and `scan-github` read the code they scan as git objects held in memory, neither checking anything out nor running `git`. `scan-git` packs the commits it scans from the git repository; with `--diff REV`, it also packs a snapshot of the files on disk, whose blobs and trees exist only in memory. `scan-github` fetches the commits it scans. Given a review file (`-r FILE`), either scan stores the pack in it.
 
 `scan-git --diff REV` takes the files on disk as git does: every tracked file, and the untracked files that the repository's `.gitignore` files, `.git/info/exclude` and the `core.excludesFile` of your git configuration leave in. Every other `scan-git` scan, and every `scan-github` scan, reads committed files only, so no ignore rules apply to it.
 
@@ -101,6 +101,8 @@ No scan writes to the code it reads. `scan-git` reads files from the git reposit
 `--env-file` or `JEVREV_ENV_FILE` names a dotenv file of the variables above. A flag wins over the environment, and a variable set in the environment wins over the file.
 
 ### GitHub
+
+`scan-github` fetches the commits it scans from GitHub, each at depth 1 so with none of its history, and holds them in memory; it needs no `git` and no clone. Given a review file (`-r FILE`), it stores them there, and `submit-github` reads the pull request's diff from there, so it fetches nothing and works after the pull request's commits are gone from GitHub. A review file made before jevrev stored commits holds none, and `submit-github` asks to scan again.
 
 jevrev reaches GitHub on the host `--github-host` or `GITHUB_HOST` names, or `github.com` when neither is set, with the token in `--github-token` or `GITHUB_TOKEN`. A review file records its host, and `submit-github` posts there.
 

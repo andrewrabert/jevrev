@@ -11,6 +11,7 @@ use gix::diff::blob::unified_diff::{ConsumeHunk, DiffLineKind, HunkHeader};
 
 use crate::Error;
 use crate::lines::LineRange;
+use crate::memgit;
 use crate::non_empty::NonEmpty;
 
 #[nutype::nutype(
@@ -75,6 +76,7 @@ pub struct GitDiff {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GitDiffToDisk {
     pub base: GitObjectId,
+    pub tree: GitObjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +84,26 @@ pub enum LocalSelection {
     Diff(GitDiff),
     DiffToDisk(GitDiffToDisk),
     Rev(GitRev),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedDiff {
+    Commits(GitDiff),
+    ToDisk { base: GitObjectId },
+}
+
+fn is_executable(path: &Path) -> Result<bool, Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = std::fs::metadata(path).with_context(|| path.display().to_string())?;
+        Ok(metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,26 +251,97 @@ pub struct Diff {
     pub files: Vec<FileDiff>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Side {
-    Absent,
-    Present(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentPair {
-    pub path: SourcePath,
-    pub old: Side,
-    pub new: String,
-}
-
 /// The files of a working tree, as git sees them.
 pub struct WorkingTree {
     pub tracked: Vec<SourcePath>,
     pub untracked: Vec<SourcePath>,
 }
 
-type TreeEntries = BTreeMap<Vec<u8>, (gix::objs::tree::EntryMode, gix::hash::ObjectId)>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Other,
+}
+
+impl EntryKind {
+    pub(crate) fn of(mode: gix::objs::tree::EntryMode) -> EntryKind {
+        if mode.is_blob() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        }
+    }
+}
+
+pub type CommitFiles = BTreeMap<Vec<u8>, EntryKind>;
+
+pub trait Commits {
+    fn files(&self, commit: &GitObjectId) -> Result<CommitFiles, Error>;
+
+    fn read_file(&self, commit: &GitObjectId, path: &SourcePath) -> Result<Vec<u8>, Error>;
+
+    fn read_file_text(
+        &self,
+        commit: &GitObjectId,
+        path: &SourcePath,
+    ) -> Result<String, ReadTextError> {
+        Ok(String::from_utf8(self.read_file(commit, path)?)?)
+    }
+
+    fn changes_between_commits(
+        &self,
+        base: &GitObjectId,
+        head: &GitObjectId,
+        context: u32,
+        inter_hunk_context: u32,
+    ) -> Result<Diff, Error> {
+        let old = self.files(base)?;
+        let new = self.files(head)?;
+        let mut files = Vec::new();
+        for (raw, &kind) in &new {
+            if kind != EntryKind::File {
+                continue;
+            }
+            let text = std::str::from_utf8(raw)?;
+            let path = SourcePath::new(text).with_context(|| text.to_string())?;
+            let in_base = old.get(raw) == Some(&EntryKind::File);
+            let texts = (|| -> Result<(String, String), ReadTextError> {
+                let old_text = if in_base {
+                    self.read_file_text(base, &path)?
+                } else {
+                    String::new()
+                };
+                Ok((old_text, self.read_file_text(head, &path)?))
+            })();
+            match texts {
+                Ok((old_text, new_text)) => files.extend(changed_file(
+                    &path,
+                    &old_text,
+                    &new_text,
+                    context,
+                    inter_hunk_context,
+                )?),
+                Err(ReadTextError::NotUtf8(e)) => {
+                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
+                }
+                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
+            }
+        }
+        Ok(Diff { files })
+    }
+}
+
+fn commit_paths(commits: &impl Commits, commit: &GitObjectId) -> Result<Vec<SourcePath>, Error> {
+    let mut found = Vec::new();
+    for (raw, kind) in commits.files(commit)? {
+        if kind != EntryKind::File {
+            continue;
+        }
+        let text = std::str::from_utf8(&raw)?;
+        found.push(SourcePath::new(text).with_context(|| text.to_string())?);
+    }
+    Ok(found)
+}
 
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -300,61 +393,105 @@ impl GitRepo {
             .and_then(|object| object.peel_to_commit())
             .with_context(|| format!("{:?} is not a commit", revision))
     }
+}
 
-    fn commit_tree(&self, commit: &GitObjectId) -> Result<gix::Tree<'_>, Error> {
-        Ok(self.repo.find_commit(commit)?.tree()?)
+#[derive(Debug)]
+pub struct PackedCommits {
+    objects: memgit::Objects,
+    subfolder: Option<PathBuf>,
+}
+
+impl PackedCommits {
+    pub fn new(objects: memgit::Objects, subfolder: Option<PathBuf>) -> PackedCommits {
+        PackedCommits { objects, subfolder }
     }
 
-    fn root_tree(&self, commit: &GitObjectId) -> Result<Option<gix::Tree<'_>>, Error> {
-        let tree = self.commit_tree(commit)?;
-        let Some(subfolder) = &self.subfolder else {
-            return Ok(Some(tree));
+    pub fn pack(&self) -> &memgit::Pack {
+        self.objects.pack()
+    }
+
+    fn root(&self, id: &GitObjectId) -> Result<Option<gix::hash::ObjectId>, Error> {
+        use gix::objs::{Find as _, FindExt as _};
+        let oid = gix::hash::ObjectId::from(id);
+        let mut buffer = Vec::new();
+        let data = self
+            .objects
+            .try_find(&oid, &mut buffer)?
+            .ok_or_else(|| anyhow!("{id} is not in the pack"))?;
+        let top = match data.kind {
+            gix::objs::Kind::Commit => {
+                gix::objs::CommitRefIter::from_bytes(data.data, data.object_hash)
+                    .tree_id()
+                    .with_context(|| format!("commit {id}"))?
+            }
+            gix::objs::Kind::Tree => oid,
+            kind => bail!("{id} is a {kind}, not a commit or a tree"),
         };
-        let Some(entry) = tree.lookup_entry_by_path(subfolder)? else {
+        let Some(subfolder) = &self.subfolder else {
+            return Ok(Some(top));
+        };
+        let mut lookup = Vec::new();
+        let Some(entry) = self
+            .objects
+            .find_tree_iter(&top, &mut buffer)?
+            .lookup_entry_by_path(&self.objects, &mut lookup, subfolder)?
+        else {
             return Ok(None);
         };
-        if !entry.mode().is_tree() {
+        if !entry.mode.is_tree() {
             bail!(
-                "{} is a {} in {commit}, not a directory",
+                "{} is a {} in {id}, not a directory",
                 subfolder.display(),
-                entry.mode().as_str()
+                entry.mode.as_str()
             );
         }
-        Ok(Some(entry.object()?.try_into_tree()?))
-    }
-
-    pub fn read_file_text(
-        &self,
-        commit: &GitObjectId,
-        path: &SourcePath,
-    ) -> Result<String, ReadTextError> {
-        let contents = (|| -> Result<Vec<u8>, Error> {
-            let missing = || anyhow!("no such file in {commit}");
-            let tree = self.root_tree(commit)?.ok_or_else(missing)?;
-            let entry = tree
-                .lookup_entry_by_path(path.to_str())?
-                .ok_or_else(missing)?;
-            if !entry.mode().is_blob() {
-                bail!("a {} in {commit}, not a file", entry.mode().as_str());
-            }
-            Ok(entry.object()?.try_into_blob()?.detach().data)
-        })()?;
-        Ok(String::from_utf8(contents)?)
+        Ok(Some(entry.oid))
     }
 }
 
-fn tree_entries(tree: Option<&gix::Tree<'_>>) -> Result<TreeEntries, Error> {
-    let Some(tree) = tree else {
-        return Ok(TreeEntries::new());
-    };
-    Ok(tree
-        .traverse()
-        .breadthfirst
-        .files()?
-        .into_iter()
-        .filter(|entry| !entry.mode.is_tree())
-        .map(|entry| (Vec::from(entry.filepath), (entry.mode, entry.oid)))
-        .collect())
+impl Commits for PackedCommits {
+    fn files(&self, commit: &GitObjectId) -> Result<CommitFiles, Error> {
+        use gix::objs::FindExt as _;
+        let Some(root) = self.root(commit)? else {
+            return Ok(CommitFiles::new());
+        };
+        let mut buffer = Vec::new();
+        let tree = self.objects.find_tree_iter(&root, &mut buffer)?;
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        gix::traverse::tree::breadthfirst(
+            tree,
+            gix::traverse::tree::breadthfirst::State::default(),
+            &self.objects,
+            &mut recorder,
+        )?;
+        Ok(recorder
+            .records
+            .into_iter()
+            .filter(|entry| !entry.mode.is_tree())
+            .map(|entry| (Vec::from(entry.filepath), EntryKind::of(entry.mode)))
+            .collect())
+    }
+
+    fn read_file(&self, commit: &GitObjectId, path: &SourcePath) -> Result<Vec<u8>, Error> {
+        use gix::objs::FindExt as _;
+        let missing = || anyhow!("no such file in {commit}");
+        let root = self.root(commit)?.ok_or_else(missing)?;
+        let mut buffer = Vec::new();
+        let mut lookup = Vec::new();
+        let entry = self
+            .objects
+            .find_tree_iter(&root, &mut buffer)?
+            .lookup_entry_by_path(&self.objects, &mut lookup, path.to_str())?
+            .ok_or_else(missing)?;
+        if !entry.mode.is_blob() {
+            bail!("a {} in {commit}, not a file", entry.mode.as_str());
+        }
+        Ok(self
+            .objects
+            .find_blob(&entry.oid, &mut lookup)?
+            .data
+            .to_vec())
+    }
 }
 
 fn is_git_space(byte: u8) -> bool {
@@ -479,53 +616,22 @@ fn changed_file(
     }))
 }
 
-/// A scan's files from git: a commit's, or the working tree's as git sees it.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub enum Git {
-    /// The files in `commit`'s tree under the scanned directory.
-    Commit { repo: GitRepo, commit: GitObjectId },
-    /// `paths` under `root`: the working tree's files as `GitRepo::working_tree` finds them.
-    WorkingTree {
-        root: PathBuf,
-        paths: Vec<SourcePath>,
-    },
+pub struct GitFiles {
+    pub commits: std::sync::Arc<PackedCommits>,
+    pub id: GitObjectId,
 }
 
-impl Git {
-    fn commit_paths(repo: &GitRepo, commit: &GitObjectId) -> Result<Vec<SourcePath>, Error> {
-        let entries = tree_entries(repo.root_tree(commit)?.as_ref())?;
-        let mut found = Vec::new();
-        for (raw, (mode, _)) in entries {
-            if !mode.is_blob() {
-                continue;
-            }
-            let text = std::str::from_utf8(&raw)?;
-            found.push(SourcePath::new(text).with_context(|| text.to_string())?);
-        }
-        Ok(found)
-    }
-}
-
-impl Source for Git {
+impl Source for GitFiles {
     fn paths(&self) -> Box<dyn Iterator<Item = Result<SourcePath, Error>> + '_> {
-        match self {
-            Git::Commit { repo, commit } => match Git::commit_paths(repo, commit) {
-                Ok(paths) => Box::new(paths.into_iter().map(Ok)),
-                Err(e) => Box::new(std::iter::once(Err(e))),
-            },
-            Git::WorkingTree { paths, .. } => Box::new(paths.iter().cloned().map(Ok)),
+        match commit_paths(self.commits.as_ref(), &self.id) {
+            Ok(paths) => Box::new(paths.into_iter().map(Ok)),
+            Err(e) => Box::new(std::iter::once(Err(e))),
         }
     }
 
     async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
-        match self {
-            Git::Commit { repo, commit } => repo.read_file_text(commit, path),
-            Git::WorkingTree { root, .. } => {
-                let contents = std::fs::read(path.on_disk(root)).map_err(Error::from)?;
-                Ok(String::from_utf8(contents)?)
-            }
-        }
+        self.commits.read_file_text(&self.id, path)
     }
 }
 
@@ -536,13 +642,12 @@ impl GitRepo {
         })
     }
 
-    pub fn resolve_diff(&self, spec: &GitDiffSpec) -> Result<LocalSelection, Error> {
+    pub fn resolve_diff(&self, spec: &GitDiffSpec) -> Result<ResolvedDiff, Error> {
         let spec = match spec {
             GitDiffSpec::ToDisk { base } => {
-                let base = self.commit(base.as_str())?.id;
-                return Ok(LocalSelection::DiffToDisk(GitDiffToDisk {
-                    base: base.into(),
-                }));
+                return Ok(ResolvedDiff::ToDisk {
+                    base: self.commit(base.as_str())?.id.into(),
+                });
             }
             GitDiffSpec::Range(range) => range,
         };
@@ -559,69 +664,10 @@ impl GitRepo {
                 .map(|id| id.detach())
                 .ok_or_else(|| anyhow!("{} and {head} have no merge base", spec.base))?,
         };
-        Ok(LocalSelection::Diff(GitDiff {
+        Ok(ResolvedDiff::Commits(GitDiff {
             base: base.into(),
             head: head_id.into(),
         }))
-    }
-
-    pub fn changes(
-        &self,
-        selection: &LocalSelection,
-        context: u32,
-    ) -> Result<Option<Changes>, Error> {
-        Ok(match selection {
-            LocalSelection::Rev(_) => None,
-            LocalSelection::Diff(diff) => Some(Changes {
-                diff: self.changes_between_commits(&diff.base, &diff.head, context, 0)?,
-                untracked: Vec::new(),
-            }),
-            LocalSelection::DiffToDisk(to_disk) => {
-                Some(self.changes_on_disk_since(&to_disk.base, context)?)
-            }
-        })
-    }
-
-    fn changes_between_commits(
-        &self,
-        base: &GitObjectId,
-        head: &GitObjectId,
-        context: u32,
-        inter_hunk_context: u32,
-    ) -> Result<Diff, Error> {
-        let old = tree_entries(self.root_tree(base)?.as_ref())?;
-        let new = tree_entries(self.root_tree(head)?.as_ref())?;
-        let mut files = Vec::new();
-        for (raw, &(mode, _)) in &new {
-            if !mode.is_blob() {
-                continue;
-            }
-            let text = std::str::from_utf8(raw)?;
-            let path = SourcePath::new(text).with_context(|| text.to_string())?;
-            let in_base = old.get(raw).is_some_and(|(old_mode, _)| old_mode.is_blob());
-            let texts = (|| -> Result<(String, String), ReadTextError> {
-                let old_text = if in_base {
-                    self.read_file_text(base, &path)?
-                } else {
-                    String::new()
-                };
-                Ok((old_text, self.read_file_text(head, &path)?))
-            })();
-            match texts {
-                Ok((old_text, new_text)) => files.extend(changed_file(
-                    &path,
-                    &old_text,
-                    &new_text,
-                    context,
-                    inter_hunk_context,
-                )?),
-                Err(ReadTextError::NotUtf8(e)) => {
-                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
-                }
-                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
-            }
-        }
-        Ok(Diff { files })
     }
 
     /// The working tree's files under the scanned directory, as git sees them: each tracked
@@ -689,34 +735,21 @@ impl GitRepo {
         }
     }
 
-    fn changes_on_disk_since(&self, base: &GitObjectId, context: u32) -> Result<Changes, Error> {
-        let old = tree_entries(self.root_tree(base)?.as_ref())?;
+    pub fn pack(&self, commits: &[&GitObjectId]) -> Result<PackedCommits, Error> {
+        let ids: Vec<gix::hash::ObjectId> = commits.iter().map(|&c| c.into()).collect();
+        let pack = memgit::pack(&self.repo, &ids)?;
+        Ok(PackedCommits::new(
+            memgit::Objects::new(pack)?,
+            self.subfolder.clone(),
+        ))
+    }
+
+    pub fn pack_working_tree(
+        &self,
+        base: &GitObjectId,
+        context: u32,
+    ) -> Result<(PackedCommits, GitObjectId, Changes), Error> {
         let WorkingTree { tracked, untracked } = self.working_tree()?;
-        let mut files = Vec::new();
-        for path in tracked {
-            let file = path.on_disk(&self.root);
-            let in_base = old
-                .get(path.to_str().as_bytes())
-                .is_some_and(|(old_mode, _)| old_mode.is_blob());
-            let texts = (|| -> Result<(String, String), ReadTextError> {
-                let old_text = if in_base {
-                    self.read_file_text(base, &path)?
-                } else {
-                    String::new()
-                };
-                let new = std::fs::read(&file).map_err(Error::from)?;
-                Ok((old_text, String::from_utf8(new)?))
-            })();
-            match texts {
-                Ok((old_text, new_text)) => {
-                    files.extend(changed_file(&path, &old_text, &new_text, context, 0)?)
-                }
-                Err(ReadTextError::NotUtf8(e)) => {
-                    tracing::debug!("skipping {path}: not UTF-8 text: {e}");
-                }
-                Err(ReadTextError::Read(e)) => return Err(e.context(path.to_string())),
-            }
-        }
         let mut kept = Vec::new();
         for path in untracked {
             let joined = path.on_disk(&self.root);
@@ -727,31 +760,186 @@ impl GitRepo {
                 Err(e) => return Err(anyhow!("{}: {e}", joined.display())),
             }
         }
-        Ok(Changes {
-            diff: Diff { files },
-            untracked: kept,
-        })
+        let repo = self.repo.clone().with_object_memory();
+        let mut editor = repo.edit_tree(repo.empty_tree().id)?;
+        let prefix = match &self.subfolder {
+            Some(subfolder) => {
+                let text = subfolder
+                    .to_str()
+                    .ok_or_else(|| anyhow!("{}: not UTF-8", subfolder.display()))?;
+                format!("{text}/")
+            }
+            None => String::new(),
+        };
+        for path in tracked.iter().chain(&kept) {
+            let file = path.on_disk(&self.root);
+            let contents = std::fs::read(&file).with_context(|| file.display().to_string())?;
+            let blob = repo.write_blob(contents)?;
+            let kind = if is_executable(&file)? {
+                gix::object::tree::EntryKind::BlobExecutable
+            } else {
+                gix::object::tree::EntryKind::Blob
+            };
+            editor.upsert(format!("{prefix}{path}"), kind, blob)?;
+        }
+        let snapshot = editor.write()?.detach();
+        let pack = memgit::pack(&repo, &[gix::hash::ObjectId::from(base), snapshot])?;
+        let commits = PackedCommits::new(memgit::Objects::new(pack)?, self.subfolder.clone());
+        let snapshot = GitObjectId::from(snapshot);
+        let mut diff = commits.changes_between_commits(base, &snapshot, context, 0)?;
+        diff.files.retain(|file| !kept.contains(&file.path));
+        Ok((
+            commits,
+            snapshot,
+            Changes {
+                diff,
+                untracked: kept,
+            },
+        ))
     }
 }
 
-pub fn diff_contents(
-    pairs: &[ContentPair],
-    context: u32,
-    inter_hunk_context: u32,
-) -> Result<Diff, Error> {
-    let mut files = Vec::new();
-    for pair in pairs {
-        let old = match &pair.old {
-            Side::Absent => "",
-            Side::Present(old) => old.as_str(),
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Commits as _, GitObjectId, GitRepo};
+    use crate::source_path::SourcePath;
+
+    fn committed(dir: &Path, files: &[(&str, &str)]) -> GitObjectId {
+        let repo = gix::init(dir).unwrap();
+        let mut editor = repo.edit_tree(repo.empty_tree().id).unwrap();
+        for (path, text) in files {
+            let on_disk = dir.join(path);
+            std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+            std::fs::write(&on_disk, text).unwrap();
+            let blob = repo.write_blob(text).unwrap();
+            editor
+                .upsert(*path, gix::object::tree::EntryKind::Blob, blob)
+                .unwrap();
+        }
+        let tree = editor.write().unwrap().detach();
+        repo.index_from_tree(&tree)
+            .unwrap()
+            .write(Default::default())
+            .unwrap();
+        let signature = gix::actor::SignatureRef {
+            name: "t".into(),
+            email: "t@t".into(),
+            time: "0 +0000",
         };
-        files.extend(changed_file(
-            &pair.path,
-            old,
-            &pair.new,
-            context,
-            inter_hunk_context,
-        )?);
+        repo.commit_as(
+            signature,
+            signature,
+            "HEAD",
+            "commit",
+            tree,
+            std::iter::empty::<gix::hash::ObjectId>(),
+        )
+        .unwrap()
+        .detach()
+        .into()
     }
-    Ok(Diff { files })
+
+    fn path(text: &str) -> SourcePath {
+        SourcePath::new(text).unwrap()
+    }
+
+    fn object_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.join(".git/objects")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap().path();
+                if entry.is_dir() {
+                    pending.push(entry);
+                } else {
+                    found.push(entry);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_commit_is_read_from_its_pack_under_the_scanned_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let commit = committed(&root, &[("top.txt", "top\n"), ("sub/a.txt", "a\n")]);
+        let commits = GitRepo::open(&root.join("sub"))
+            .unwrap()
+            .pack(&[&commit])
+            .unwrap();
+        drop(dir);
+
+        let files: Vec<Vec<u8>> = commits.files(&commit).unwrap().into_keys().collect();
+        assert_eq!(files, [b"a.txt".to_vec()]);
+        assert_eq!(commits.read_file(&commit, &path("a.txt")).unwrap(), b"a\n");
+    }
+
+    #[test]
+    fn the_working_tree_is_snapshotted_into_the_pack_without_writing_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let base = committed(
+            &root,
+            &[
+                ("same.txt", "same\n"),
+                ("edited.txt", "old\n"),
+                ("gone.txt", "gone\n"),
+            ],
+        );
+        std::fs::write(root.join("edited.txt"), "new\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::fs::write(root.join("added.txt"), "added\n").unwrap();
+        let before = object_files(&root);
+
+        let (commits, tree, changes) = GitRepo::open(&root)
+            .unwrap()
+            .pack_working_tree(&base, 3)
+            .unwrap();
+
+        assert_eq!(object_files(&root), before);
+        drop(dir);
+        let files: Vec<Vec<u8>> = commits.files(&tree).unwrap().into_keys().collect();
+        assert_eq!(
+            files,
+            [
+                b"added.txt".to_vec(),
+                b"edited.txt".to_vec(),
+                b"same.txt".to_vec()
+            ]
+        );
+        assert_eq!(
+            commits.read_file(&tree, &path("edited.txt")).unwrap(),
+            b"new\n"
+        );
+        assert_eq!(
+            commits.read_file(&base, &path("edited.txt")).unwrap(),
+            b"old\n"
+        );
+        let changed: Vec<&str> = changes.diff.files.iter().map(|f| f.path.to_str()).collect();
+        assert_eq!(changed, ["edited.txt"]);
+        assert_eq!(changes.untracked, [path("added.txt")]);
+    }
+
+    #[test]
+    fn a_snapshot_of_a_subdirectory_holds_only_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let base = committed(&root, &[("top.txt", "top\n"), ("sub/a.txt", "a\n")]);
+        std::fs::write(root.join("sub/a.txt"), "edited\n").unwrap();
+        std::fs::write(root.join("top.txt"), "edited\n").unwrap();
+
+        let (commits, tree, changes) = GitRepo::open(&root.join("sub"))
+            .unwrap()
+            .pack_working_tree(&base, 3)
+            .unwrap();
+
+        let files: Vec<Vec<u8>> = commits.files(&tree).unwrap().into_keys().collect();
+        assert_eq!(files, [b"a.txt".to_vec()]);
+        let changed: Vec<&str> = changes.diff.files.iter().map(|f| f.path.to_str()).collect();
+        assert_eq!(changed, ["a.txt"]);
+    }
 }

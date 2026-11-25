@@ -9,14 +9,11 @@ publish = false
 anstream = { version = "1", default-features = false, features = ["auto"] }
 anstyle = "1"
 anyhow = "1"
-bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
-flate2 = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-gix = { version = "0.90", default-features = false, features = ["blob-diff", "dirwalk", "revision", "sha1"] }
-http = "1"
-http-body-util = "0.1"
+gix = { version = "0.90", default-features = false, features = ["blob-diff", "blocking-http-transport-reqwest", "dirwalk", "revision", "sha1"] }
+gix-pack = { version = "0.77", default-features = false, features = ["generate"] }
 ignore = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 minijinja = { version = "3", features = ["serde"] }
@@ -34,7 +31,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "serialize"] }
 sha2 = "0.11"
 strum = { version = "0.28", features = ["derive"] }
-tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "process", "rt", "sync", "time"] }
 tracing = "0.1"
@@ -47,6 +43,7 @@ url = { version = "2", features = ["serde"] }
 validator = { version = "0.21", features = ["derive"] }
 
 [dev-dependencies]
+http = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
 

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+use jevrev::files::{ReadTextError, Source};
 use jevrev::git::{Diff, FileDiff, Hunk, Line};
-use jevrev::github::api::{Github, Tarball};
 use jevrev::languages;
 use jevrev::lines::LineRange;
 use jevrev::non_empty::NonEmpty;
@@ -132,6 +132,22 @@ fn diff_of(value: &serde_json::Value) -> Diff {
     }
 }
 
+struct Memory(BTreeMap<SourcePath, Vec<u8>>);
+
+impl Source for Memory {
+    fn paths(&self) -> Box<dyn Iterator<Item = Result<SourcePath, jevrev::Error>> + '_> {
+        Box::new(self.0.keys().cloned().map(Ok))
+    }
+
+    async fn read_text(&self, path: &SourcePath) -> Result<String, ReadTextError> {
+        let contents = self
+            .0
+            .get(path)
+            .ok_or_else(|| jevrev::Error::msg("no such file"))?;
+        Ok(String::from_utf8(contents.clone())?)
+    }
+}
+
 #[tokio::test]
 async fn changes_split_into_the_captured_states() {
     let directory = fixtures().join("change");
@@ -139,7 +155,7 @@ async fn changes_split_into_the_captured_states() {
         serde_json::from_slice(&std::fs::read(directory.join("diff.json")).unwrap()).unwrap();
     let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("states.json")).unwrap()).unwrap();
-    let files = Github::Tarball(Tarball::new(
+    let files = Memory(
         spec["files"]
             .as_object()
             .unwrap()
@@ -151,7 +167,7 @@ async fn changes_split_into_the_captured_states() {
                 )
             })
             .collect::<BTreeMap<_, _>>(),
-    ));
+    );
     let changes = Changes {
         diff: diff_of(&spec["diff"]),
         untracked: spec["untracked"]

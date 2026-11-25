@@ -7,6 +7,7 @@ pub mod gitignore;
 pub mod jev;
 pub mod languages;
 pub mod lines;
+pub mod memgit;
 pub mod non_empty;
 pub mod output;
 pub mod rules;

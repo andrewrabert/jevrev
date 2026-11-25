@@ -1,17 +1,23 @@
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use jevrev::git::GitRepo;
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .status()
+fn stage(repo: &gix::Repository, root: &Path, paths: &[&str]) {
+    let mut editor = repo.edit_tree(repo.empty_tree().id).unwrap();
+    for path in paths {
+        let blob = repo
+            .write_blob(std::fs::read(root.join(path)).unwrap())
+            .unwrap();
+        editor
+            .upsert(*path, gix::object::tree::EntryKind::Blob, blob)
+            .unwrap();
+    }
+    let tree = editor.write().unwrap();
+    repo.index_from_tree(&tree)
+        .unwrap()
+        .write(Default::default())
         .unwrap();
-    assert!(status.success(), "git {args:?}");
 }
 
 fn write(root: &Path, path: &str, text: &str) {
@@ -28,13 +34,16 @@ fn names(paths: &[jevrev::source_path::SourcePath]) -> Vec<String> {
 fn uncommitted_files_follow_only_git_rules() {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
-    git(&root, &["init", "-q"]);
+    let repo = gix::init(&root).unwrap();
     write(&root, ".gitignore", "build/\n*.log\n");
     write(&root, ".ignore", "new.py\n");
     write(&root, "tracked.py", "");
     write(&root, "forced.log", "");
-    git(&root, &["add", ".gitignore", ".ignore", "tracked.py"]);
-    git(&root, &["add", "-f", "forced.log"]);
+    stage(
+        &repo,
+        &root,
+        &[".gitignore", ".ignore", "tracked.py", "forced.log"],
+    );
     write(&root, "new.py", "");
     write(&root, "excluded.py", "");
     write(&root, ".git/info/exclude", "excluded.py\n");
@@ -44,14 +53,15 @@ fn uncommitted_files_follow_only_git_rules() {
     write(&root, "configured.py", "");
     let excludes = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(excludes.path(), "configured.py\n").unwrap();
-    git(
-        &root,
-        &[
-            "config",
-            "core.excludesFile",
-            excludes.path().to_str().unwrap(),
-        ],
-    );
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".git/config"))
+            .unwrap(),
+        "[core]\n\texcludesFile = {}",
+        excludes.path().display()
+    )
+    .unwrap();
 
     let tree = GitRepo::open(&root).unwrap().working_tree().unwrap();
 
