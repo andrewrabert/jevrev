@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 flate2 = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-gix = { version = "0.90", default-features = false, features = ["blob-diff", "dirwalk", "revision", "sha1"] }
+gix = { version = "0.91", default-features = false, features = ["blob-diff", "dirwalk", "revision", "sha1"] }
 http = "1"
 http-body-util = "0.1"
 ignore = "0.4"
